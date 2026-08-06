@@ -3,9 +3,10 @@
 Usage:
     python3 scripts/fitness/run.py [--json] [--stage pre-commit|ci]
 
-Tiers (GUARDRAILS.md §1): S = static architecture checks (stdlib, always run),
-H = behavioral harnesses (pytest markers), B = benchmarks/evals, G = hygiene.
-Checks whose prerequisites don't exist yet SKIP with the reason. Exit 1 on FAIL.
+Tiers (GUARDRAILS.md §1): S = static architecture checks (some stdlib-only, some
+tool-backed via uv), H = behavioral harnesses (pytest markers), B = benchmarks/evals,
+G = hygiene. Checks whose prerequisites don't exist yet SKIP with the reason (tool
+checks SKIP when the project isn't installed). Exit 1 on FAIL.
 """
 from __future__ import annotations
 
@@ -18,12 +19,9 @@ from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import check_boundaries
 import check_filegraph
 import check_loc_budget
 import check_prompt_hygiene
-import check_secrets
-import check_sql_safety
 from common import CheckResult, repo_root
 
 PYTEST_NO_TESTS_COLLECTED = 5
@@ -40,6 +38,44 @@ def _tool_check(check_id: str, name: str, cmd: List[str], skip_reason: str = "",
         return CheckResult(check_id, name, "SKIP", [], skip_exits[proc.returncode])
     tail = (proc.stdout + proc.stderr).strip().splitlines()[-15:]
     return CheckResult(check_id, name, "FAIL", [], " ".join(cmd) + "\n    " + "\n    ".join(tail))
+
+
+def _check_s1(not_installed: str) -> CheckResult:
+    """S1 -- boundaries & containment (I2, I4, I9): import-linter contracts for
+    layers/edges/schemas-independence, ruff TID251 for framework containment, and an
+    isolated import proving steward-schemas pulls in nothing but pydantic + stdlib."""
+    if not_installed:
+        return CheckResult("S1", "import boundaries", "SKIP", [], not_installed)
+    steps = [
+        ("lint-imports", ["uv", "run", "lint-imports"]),
+        ("ruff TID251", ["uv", "run", "ruff", "check", "--select", "TID251", "."]),
+        ("schemas isolation", ["uv", "run", "--isolated", "--package", "steward-schemas",
+                                "--no-default-groups", "python3", "-c", "import steward_schemas"]),
+    ]
+    tails = []
+    for label, cmd in steps:
+        proc = subprocess.run(cmd, cwd=repo_root(), capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = (proc.stdout + proc.stderr).strip().splitlines()[-8:]
+            tails.append(f"{label} ({' '.join(cmd)}):\n    " + "\n    ".join(tail))
+    if tails:
+        return CheckResult("S1", "import boundaries", "FAIL", [], "\n  ".join(tails))
+    return CheckResult("S1", "import boundaries", "PASS", [],
+                        "lint-imports + ruff TID251 + isolated steward-schemas import")
+
+
+def _check_g4() -> CheckResult:
+    """G4 -- secret scan. gitleaks is the hard gate in CI (full history); here we run it
+    when available locally too, and skip honestly (never PASS) when it isn't installed."""
+    if shutil.which("gitleaks") is None:
+        return CheckResult("G4", "secret scan", "SKIP", [],
+                           "gitleaks not installed locally; CI enforces (full history)")
+    proc = subprocess.run(["gitleaks", "detect", "--no-banner"],
+                          cwd=repo_root(), capture_output=True, text=True)
+    if proc.returncode == 0:
+        return CheckResult("G4", "secret scan", "PASS", [], "gitleaks detect")
+    tail = (proc.stdout + proc.stderr).strip().splitlines()[-15:]
+    return CheckResult("G4", "secret scan", "FAIL", [], "gitleaks detect\n    " + "\n    ".join(tail))
 
 
 def _script_or_pending(check_id: str, name: str, script: str) -> CheckResult:
@@ -69,9 +105,10 @@ def main() -> int:
 
     results: List[CheckResult] = [
         # Tier S — static architecture checks
-        check_boundaries.run(),          # S1
+        _check_s1(not_installed),        # S1
         check_loc_budget.run(),          # S2
-        check_sql_safety.run(),          # S3
+        _tool_check("S3", "sql safety", ["uv", "run", "ruff", "check", "--select", "S608", "."],
+                    not_installed),
         check_prompt_hygiene.run(),      # S4
         _script_or_pending("S5", "public-surface lock", "check_surface.py"),
         _script_or_pending("S6", "contract compatibility", "check_contracts.py"),
@@ -92,7 +129,7 @@ def main() -> int:
                     ["uv", "run", "pytest", "-q", "-m", "not acceptance",
                      "--cov=packages", "--cov-branch", "--cov-fail-under=85"],
                     not_installed or ("" if has_tests else "no tests yet")),
-        check_secrets.run(),             # G4 (bootstrap until gitleaks wiring lands)
+        _check_g4(),                     # G4
     ]
     if not installed and stage == "ci" and (root / "pyproject.toml").exists():
         # uv missing in CI would silently skip real gates — that is a failure, not a skip.

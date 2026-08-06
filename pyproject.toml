@@ -8,19 +8,95 @@ dev = [
     "pytest>=8.3",
     "pytest-cov>=5.0",
     "pytest-asyncio>=0.24",
+    "import-linter>=2.0",
 ]
 
 [tool.ruff]
 line-length = 110
 target-version = "py312"
 src = ["packages", "services"]
-# scripts/fitness predates this config and is off-limits to edit for this issue;
-# it stays stdlib-only by its own design (GUARDRAILS.md), not lint-gated here.
 # Root docs are prose, not lint/format targets (ruff format touches embedded code fences).
-extend-exclude = ["scripts/fitness", "*.md"]
+extend-exclude = ["*.md"]
+
+[tool.ruff.format]
+# scripts/fitness stays hand-formatted (GUARDRAILS.md build-vs-buy rule); only linting
+# (S608 below) applies to it, not reformatting.
+exclude = ["scripts/fitness/*.py"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "S608", "TID251"]
+
+[tool.ruff.lint.per-file-ignores]
+# scripts/fitness stays stdlib-only for Python 3.9+ (GUARDRAILS.md build-vs-buy rule) --
+# style/upgrade rules don't apply there, but S608 (S3, SQL safety) still scans it,
+# matching the bootstrap check it replaces.
+"scripts/fitness/*.py" = ["E", "F", "I", "UP", "B"]
+
+# S1 containment (I2, I9): kitchen-sink frameworks banned everywhere, contained modules
+# (langgraph, litellm, provider SDKs) banned by default and unbanned only inside their
+# home package's own pyproject.toml, which extends this file and replaces this table
+# (Ruff config tables don't merge across an `extend` chain -- the override must restate
+# the full dict minus the modules that package owns). Keep the two package overrides
+# (packages/steward-agents, packages/steward-llm) in sync with this list.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"langchain" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"langchain_community" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"crewai" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"llama_index" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"autogen" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"semantic_kernel" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"pydantic_ai" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"haystack" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"langgraph" = { msg = "contained: steward-agents only (I2/I9)" }
+"langchain_core" = { msg = "contained: steward-agents, steward-llm only (I2/I9)" }
+"langchain_openai" = { msg = "contained: steward-llm only (I2/I9)" }
+"litellm" = { msg = "contained: steward-llm only (I2/I9)" }
+"openai" = { msg = "contained: steward-llm only (I2/I9)" }
+"anthropic" = { msg = "contained: steward-llm only (I2/I9)" }
+"google" = { msg = "contained: steward-llm only (I2/I9)" }
+"mistralai" = { msg = "contained: steward-llm only (I2/I9)" }
+"cohere" = { msg = "contained: steward-llm only (I2/I9)" }
+"boto3" = { msg = "contained: steward-llm only (I2/I9)" }
+
+# S1 boundaries (I4): one-way flow services -> packages, declared package edges,
+# steward-schemas independence. Contract semantics: scripts/fitness/boundaries.json
+# used to own this; it's now expressed natively here (see GUARDRAILS.md S1 row for the
+# one-source-of-truth rationale) and boundaries.json is slimmed to contained_modules,
+# which S5 (issue #6) consumes.
+[tool.importlinter]
+root_packages = [
+    "steward_agents",
+    "steward_llm",
+    "steward_retrieval",
+    "steward_schemas",
+    "steward_sdk",
+    "steward_api",
+    "steward_workers",
+]
+
+[[tool.importlinter.contracts]]
+name = "services import packages, never the reverse (I4)"
+type = "forbidden"
+source_modules = ["steward_agents", "steward_llm", "steward_retrieval", "steward_schemas", "steward_sdk"]
+forbidden_modules = ["steward_api", "steward_workers"]
+
+[[tool.importlinter.contracts]]
+name = "steward-agents depends only on its declared edges (I4)"
+type = "forbidden"
+source_modules = ["steward_agents"]
+forbidden_modules = ["steward_retrieval", "steward_sdk"]
+
+[[tool.importlinter.contracts]]
+name = "leaf packages depend only on steward-schemas (I4)"
+type = "forbidden"
+source_modules = ["steward_llm", "steward_retrieval", "steward_sdk"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_retrieval", "steward_sdk"]
+
+[[tool.importlinter.contracts]]
+name = "steward-schemas is independent: pydantic + stdlib only (I4)"
+type = "forbidden"
+source_modules = ["steward_schemas"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_retrieval", "steward_sdk"]
 
 [tool.mypy]
 python_version = "3.12"

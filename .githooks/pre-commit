@@ -1,3 +1,13 @@
 #!/bin/sh
 # Fitness gate (GUARDRAILS.md §1). Install with: make hooks
+
+# G4 secret scan pass-through: fast local feedback on staged changes. gitleaks in CI
+# (full history) is the hard gate; this is a courtesy that never blocks a dev without
+# gitleaks installed.
+if command -v gitleaks >/dev/null 2>&1; then
+    gitleaks protect --staged --no-banner || exit 1
+else
+    echo "gitleaks not installed — skipping local secret scan (CI still enforces): https://github.com/gitleaks/gitleaks#installing"
+fi
+
 exec python3 scripts/fitness/run.py --stage pre-commit

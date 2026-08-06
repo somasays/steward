@@ -20,9 +20,9 @@ Checks are tiered by *how* they measure, because different properties fail at di
 
 | ID | Fitness function | Protects | Measurement | Status |
 |----|------------------|----------|-------------|--------|
-| S1 | Boundaries & containment | I2, I4, I9, N9 | import-linter contracts (layers `services → packages`, declared package edges, schemas independence) + ruff TID251 banned-api (kitchen-sink frameworks banned everywhere; `langgraph`/`litellm`/provider SDKs unbanned only in their home packages). Schemas purity additionally enforced by dependency declaration, verified by isolated `uv run --package` import | bootstrap `check_boundaries.py` active; tool wiring: issue #9 |
+| S1 | Boundaries & containment | I2, I4, I9, N9 | import-linter contracts (layers `services → packages`, declared package edges, schemas independence — `pyproject.toml` `[tool.importlinter]`) + ruff TID251 banned-api (kitchen-sink frameworks banned everywhere; `langgraph`/`litellm`/provider SDKs unbanned only in their home package's own `pyproject.toml`, which overrides the root banned-api table). Schemas purity additionally enforced by isolated `uv run --isolated --package steward-schemas` import | active (issue #9) |
 | S2 | Runtime size budget | I9 | `check_loc_budget.py` — effective LOC of `packages/steward-agents` ≤ 2,000 (custom: no tool does per-package budgets) | active |
-| S3 | SQL string-assembly ban | I5, N7 | ruff S608 | bootstrap `check_sql_safety.py` active |
+| S3 | SQL string-assembly ban | I5, N7 | ruff S608, selected globally (including `scripts/fitness`, which is otherwise style-exempt) | active (issue #9) |
 | S4 | Prompt literal ban | I10 | `check_prompt_hygiene.py` — prompt-shaped literals outside `prompts/` (custom: domain-specific) | active |
 | S5 | Public-surface lock | I9, I3 | `check_surface.py` — no contained-module type in any package's public signatures, class bases, or re-exports | active |
 | S6 | Contract compatibility | I3, N9 | JSON Schema snapshots of published Pydantic contracts (pytest + `contracts/`) and oasdiff on the exported OpenAPI spec; breaking change fails, additive requires snapshot update in the same commit | issue #7 |
@@ -79,10 +79,10 @@ Datasets live in Langfuse; runnable identically on a laptop and CI (`steward eva
 | G1 | Lint & format | ruff check + format --check |
 | G2 | Strict types | mypy --strict on `packages/` (this is also what turns typed-contract conventions (I3, I6-by-construction) into compile-time enforcement) |
 | G3 | Tests & coverage | pytest, branch coverage ≥ 85% on `packages/` |
-| G4 | Secret scan | gitleaks (full history in CI, staged diff pre-commit) — bootstrap `check_secrets.py` until wired |
+| G4 | Secret scan | gitleaks — full history in the CI `gitleaks` job (hard gate); staged diff (`gitleaks protect --staged`) as a pre-commit pass-through when gitleaks is installed locally, otherwise the hook prints an install hint and continues. `make fitness` runs a repo-wide `gitleaks detect` when the binary is available, and reports `SKIP` (never a false `PASS`) when it isn't |
 | G5 | Commit discipline | commit-msg hook: Conventional Commits; feat/fix/refactor/perf must reference an issue (custom: issue-ref rule is project policy) |
 
-Build-vs-buy rule: a check is hand-rolled only when no maintained tool has the semantics (S2, S4, S5, G5). Bootstrap stdlib implementations of S1/S3/G4 enforce the same rules until tool wiring lands; they get deleted, not maintained.
+Build-vs-buy rule: a check is hand-rolled only when no maintained tool has the semantics (S2, S4, S5, G5). S1/S3/G4 are tool-backed (import-linter, ruff, gitleaks); their bootstrap stdlib implementations were deleted once parity was proven (issue #9, `PROOFS.md`).
 
 ## 2. Coverage matrix
 
@@ -142,7 +142,7 @@ Not everything reduces to a check. The `architecture-guardian` subagent and huma
 
 ## 5. Enforcement status
 
-Active now: S1–S4 (bootstrap), S7, G1–G3 (workspace), G4 (bootstrap + gitleaks in CI), G5. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced invariants (I6 until M1, I7/I8 until their harnesses) are the `architecture-guardian`'s explicit responsibility in the meantime.
+Active now: S1–S4 (S1/S3 tool-backed: import-linter + ruff; S2/S4 stdlib), S7, G1–G3 (workspace), G4 (gitleaks: CI hard gate + local pre-commit/`make fitness` pass-through), G5. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced invariants (I6 until M1, I7/I8 until their harnesses) are the `architecture-guardian`'s explicit responsibility in the meantime.
 
 ## 6. Amendment process
 
