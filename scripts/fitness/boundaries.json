@@ -1,5 +1,5 @@
 {
-  "_doc": "F1 import-boundary declarations (GUARDRAILS.md I2/I4/I9). Adding an edge or a containment entry is a reviewed architectural decision — justify it in the PR.",
+  "_doc": "S1 import-boundary declarations (ARCHITECTURE.md invariants I2/I4/I9; check specced in GUARDRAILS.md). Adding an edge or a containment entry is a reviewed architectural decision — justify it in the PR.",
   "packages_dir": "packages",
   "services_dir": "services",
   "schemas_package": "steward-schemas",

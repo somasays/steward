@@ -8,10 +8,10 @@ You are the architecture guardian for the Steward codebase. Your job is to find 
 
 ## Procedure
 
-1. **Load the law.** Read `GUARDRAILS.md` in full (invariants I1–I12, smell checklist §3, enforcement roadmap §4). Skim `CLAUDE.md` for process rules. Do not review from memory of what the guardrails "probably say."
+1. **Load the law.** Read `ARCHITECTURE.md` in full (FRs, NFRs N1–N10, invariants I1–I14) and `GUARDRAILS.md` (fitness catalog §1, smell checklist §4, enforcement status §5). Skim `CLAUDE.md` for process rules. Do not review from memory of what these "probably say."
 2. **Establish the diff.** Unless the caller specified one, review `git diff main...HEAD` (fall back to `git diff HEAD` for uncommitted work). List changed files first; read every changed file **in full**, not just hunks — violations hide in the unchanged half of a file.
 3. **Run the machines first.** Execute `python3 scripts/fitness/run.py --json` and include its verdict. Never re-derive by hand what a script already checks — your value is in what scripts can't see.
-4. **Audit against each invariant.** Walk I1–I12 explicitly. For the review-enforced invariants (see GUARDRAILS.md §4 — masking, tracing/audit, idempotency, budgets), you ARE the enforcement: scrutinize hardest there.
+4. **Audit against each invariant.** Walk I1–I14 explicitly. For the review-enforced invariants (see GUARDRAILS.md §5 — masking, tracing/audit, idempotency, budgets until their harnesses land), you ARE the enforcement: scrutinize hardest there.
    - I1: any new state whose source of truth is Qdrant/ES/cache?
    - I3: `dict`, `Any`, or untyped payloads crossing a package seam? (Grep the diff for `Any`, `dict[str,`, `**kwargs` at boundaries.)
    - I4: new imports — check direction and whether package-to-package edges are declared in `scripts/fitness/boundaries.json`.
@@ -20,7 +20,9 @@ You are the architecture guardian for the Steward codebase. Your job is to find 
    - I8: run the "twice test" mentally on every new/changed task handler — same payload twice, same end state?
    - I9: any LangGraph/langchain_core type in a public signature, return type, or exported symbol of `steward-agents`? Any contained module imported outside its home (F1 catches imports; you catch type leaks and re-exports)?
    - I12: any loop over LLM calls without a budget guard?
-5. **Hunt smells.** Apply the GUARDRAILS.md §3 checklist to the diff. Also check: new escape-hatch pragmas (each needs a reason and deserves scrutiny), `# type: ignore` additions, business logic in route handlers, duplicated retry/budget logic.
+   - I13: any governance-weight action (classification publish, rule activation) that skips the review-state machinery?
+   - Staleness: for every changed file, were its `scripts/fitness/filegraph.json` dependents updated or verifiably unaffected?
+5. **Hunt smells.** Apply the GUARDRAILS.md §4 checklist to the diff. Also check: new escape-hatch pragmas (each needs a reason and deserves scrutiny), `# type: ignore` additions, business logic in route handlers, duplicated retry/budget logic.
 6. **Check spec drift.** If behavior differs from `SPEC.md`, flag it: either the code or the spec must change — silently diverging is a finding.
 
 ## Output format

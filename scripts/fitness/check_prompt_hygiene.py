@@ -1,4 +1,4 @@
-"""F4 — Prompt hygiene (enforces I10).
+"""S4 — Prompt hygiene (enforces I10).
 
 Prompts are versioned artifacts in prompts/ directories (or Langfuse-managed),
 not string literals in application code. Flags prompt-shaped literals — long
@@ -72,9 +72,9 @@ def run() -> CheckResult:
                 findings.append(Finding(str(path.relative_to(root)), node.lineno,
                                         "prompt-shaped literal in application code — move to prompts/ (I10)"))
     if scanned == 0:
-        return CheckResult("F4", "prompt hygiene", "SKIP", [], "no Python code yet")
+        return CheckResult("S4", "prompt hygiene", "SKIP", [], "no Python code yet")
     status = "FAIL" if findings else "PASS"
-    return CheckResult("F4", "prompt hygiene", status, findings,
+    return CheckResult("S4", "prompt hygiene", status, findings,
                        f"{scanned} files scanned", pragma_count=pragmas)
 
 
@@ -82,5 +82,5 @@ if __name__ == "__main__":
     result = run()
     for f in result.findings:
         print(f"{f.path}:{f.line}: {f.message}")
-    print(f"F4 {result.status} ({result.detail}, {result.pragma_count} pragmas)")
+    print(f"S4 {result.status} ({result.detail}, {result.pragma_count} pragmas)")
     sys.exit(1 if result.status == "FAIL" else 0)

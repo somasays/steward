@@ -1,4 +1,4 @@
-"""F1 — Import boundaries (enforces I2, I4, I9).
+"""S1 — Import boundaries (enforces I2, I4, I9).
 
 Rules, from scripts/fitness/boundaries.json:
   1. Banned modules (kitchen-sink frameworks) may not be imported anywhere,
@@ -115,14 +115,14 @@ def run() -> CheckResult:
                                                 f"banned framework in dependencies (I9): {line.strip()}"))
 
     if scanned == 0 and not findings:
-        return CheckResult("F1", "import boundaries", "SKIP", [], "no packages/ or services/ code yet")
+        return CheckResult("S1", "import boundaries", "SKIP", [], "no packages/ or services/ code yet")
     status = "FAIL" if findings else "PASS"
-    return CheckResult("F1", "import boundaries", status, findings, f"{scanned} files scanned")
+    return CheckResult("S1", "import boundaries", status, findings, f"{scanned} files scanned")
 
 
 if __name__ == "__main__":
     result = run()
     for f in result.findings:
         print(f"{f.path}:{f.line}: {f.message}")
-    print(f"F1 {result.status} ({result.detail})")
+    print(f"S1 {result.status} ({result.detail})")
     sys.exit(1 if result.status == "FAIL" else 0)

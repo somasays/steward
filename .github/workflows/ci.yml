@@ -35,3 +35,14 @@ jobs:
         with:
           name: fitness-report
           path: fitness-report.json
+
+  gitleaks:
+    name: secret scan (G4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

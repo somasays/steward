@@ -1,4 +1,4 @@
-"""H4 — Secret scan.
+"""G4 — Secret scan.
 
 High-signal credential patterns only (low-noise by design; gitleaks can be
 layered on in CI later). Scans all tracked-ish text files.
@@ -47,12 +47,12 @@ def run() -> CheckResult:
                     findings.append(Finding(str(path.relative_to(root)), lineno,
                                             f"possible {label} committed to the repo"))
     status = "FAIL" if findings else "PASS"
-    return CheckResult("H4", "secret scan", status, findings, f"{scanned} files scanned")
+    return CheckResult("G4", "secret scan", status, findings, f"{scanned} files scanned")
 
 
 if __name__ == "__main__":
     result = run()
     for f in result.findings:
         print(f"{f.path}:{f.line}: {f.message}")
-    print(f"H4 {result.status} ({result.detail})")
+    print(f"G4 {result.status} ({result.detail})")
     sys.exit(1 if result.status == "FAIL" else 0)

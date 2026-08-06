@@ -4,8 +4,11 @@ Steward is a multi-agent data management platform (catalog, classify, quality-mo
 
 ## Source-of-truth documents (read before designing anything)
 
-1. **`GUARDRAILS.md`** — binding architectural invariants (I1–I12) and fitness functions (F1–F10). Nothing here overrides it; if this file and GUARDRAILS.md ever conflict, GUARDRAILS.md wins.
-2. **`SPEC.md`** — full technical specification and roadmap (M0–M6). Implement toward the spec; if implementation reveals the spec is wrong, update the spec in the same PR and say why in its description.
+1. **`ARCHITECTURE.md`** — the system definition: functional requirements, quantified NFRs (N1–N10), technology decisions, invariants (I1–I14). Highest authority.
+2. **`GUARDRAILS.md`** — the fitness functions derived from ARCHITECTURE.md (tiers S/H/B/P + hygiene G), the smell checklist, and enforcement status.
+3. **`SPEC.md`** — component-level design and roadmap (M0–M6). Implement toward the spec; if implementation reveals the spec is wrong, update the spec in the same PR and say why.
+
+If documents conflict: ARCHITECTURE > GUARDRAILS > SPEC > this file.
 
 ## The development loop (issue-driven, no exceptions)
 
@@ -14,31 +17,23 @@ Every change follows this cycle:
 1. **Start from a GitHub issue.** No issue → create one first (`gh issue create`, or the `issue-planner` subagent for milestone breakdowns). Issues carry acceptance criteria including which invariants they touch.
 2. **Branch** from `main`: `m<milestone>/<issue-number>-<slug>` (e.g. `m0/12-task-queue`).
 3. **Implement in vertical slices** — each commit leaves the system working and the fitness gate green. Prefer several small commits over one large one.
+   **No stale files:** before committing, look up every changed file in `scripts/fitness/filegraph.json` and update (or explicitly verify unaffected) each listed dependent — `PROOFS.md` and the docs are dependents of almost everything. New files must be added to the graph (S7 fails otherwise).
 4. **Before every commit:** run `make fitness`. Before finishing a branch: run the **`architecture-guardian` subagent** on the diff (`git diff main...HEAD`) and address its findings — treat a FAIL verdict as a broken build.
 5. **Commit format** (enforced by hook): Conventional Commits; `feat`/`fix`/`refactor`/`perf` must reference the issue: `feat(queue): claim tasks with SKIP LOCKED (#12)`.
 6. **Prove it.** When acceptance criteria are met, append an entry to `PROOFS.md` in the same branch: the claim, the exact command to reproduce it, and the observed result. No adjectives — if it can't be demonstrated by a command, test, eval score, or CI run, it doesn't go in.
 7. **PR** with: what changed, which invariants were touched, evidence. Close the issue via `Closes #N`.
 
-## Non-negotiables (summary — full text in GUARDRAILS.md)
+## Non-negotiables
 
-- Postgres is the only system of record; Qdrant/ES are rebuildable derivatives (I1)
-- LLM calls only via `steward-llm` aliases; provider SDKs and `litellm` imports only inside that package (I2)
-- Pydantic-typed seams everywhere; `mypy --strict` on `packages/`; no `dict`/`Any` across boundaries (I3)
-- Dependency flow: `services → packages`, edges declared in `scripts/fitness/boundaries.json`; `steward-schemas` = pydantic + stdlib only (I4)
-- No string-built SQL, ever; sources are read-only (I5)
-- Masked samples only in prompts (I6) · every step traced, every mutation audited in-transaction (I7)
-- Task handlers idempotent; enqueue transactional (I8)
-- LangGraph only inside `steward-agents`, its types never in the public API; steward-owned code there ≤ 2,000 LOC; crewai/autogen/llama-index/langchain(-community)/etc. banned outright (I9)
-- Prompts live in `prompts/`, versioned, never inline string literals (I10)
-- Model/prompt/retrieval changes pass eval gates from M2 (I11) · every run has hard budgets (I12)
+The invariants are **I1–I14 in `ARCHITECTURE.md` §5** — read them there, not from memory; they are the working summary and this file deliberately does not duplicate them (single source, no staleness). The ones agents trip on most: no string-built SQL (I5), LangGraph/provider SDKs only in their home packages with types never leaking (I2/I9), typed seams everywhere (I3), idempotent handlers + transactional enqueue (I8), hard budgets on every run (I12).
 
-When a task seems to require violating one of these, **stop and redesign** — or, if the invariant is genuinely wrong, follow the amendment process in GUARDRAILS.md §5. Never "temporarily" violate one.
+When a task seems to require violating an invariant, **stop and redesign** — or, if the invariant is genuinely wrong, follow the amendment process in GUARDRAILS.md §6. Never "temporarily" violate one.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `make fitness` | Run the full suite: F1–F9 (architecture/contract/invariant/acceptance leashes) + H1–H4 (hygiene); stdlib checks always, tool checks when available |
+| `make fitness` | Run the full suite: S (static architecture), H (behavioral harnesses), B (evals), G (hygiene); stdlib checks always, tool checks when available |
 | `make hooks` | Install git hooks (pre-commit fitness gate, commit-msg format check) — run once after clone |
 | `make lint` / `make type` / `make test` | Individual gates (ruff / mypy --strict / pytest+coverage) |
 | `python3 scripts/fitness/run.py --json` | Fitness results as JSON (used by CI and subagents) |

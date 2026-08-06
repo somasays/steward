@@ -29,8 +29,9 @@ Data stewardship work — writing docs that go stale, hand-maintaining quality c
 
 ## Documentation
 
-- **[SPEC.md](./SPEC.md)** — full technical specification: architecture, agent design, data model, API surface, evaluation framework, deployment, and roadmap.
-- **[GUARDRAILS.md](./GUARDRAILS.md)** — binding architectural invariants (I1–I12) and the automated fitness functions (F1–F10) that enforce them on **every commit**, via git hooks and CI.
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — the system definition: functional requirements, quantified NFRs, technology decisions, invariants (I1–I14).
+- **[GUARDRAILS.md](./GUARDRAILS.md)** — the fitness functions derived from the architecture: static checks, behavioral harnesses, benchmarks/evals, production fitness — enforced per commit via git hooks and CI.
+- **[SPEC.md](./SPEC.md)** — component-level design: agents, retrieval, data model, API surface, eval framework, deployment, roadmap.
 - **[CLAUDE.md](./CLAUDE.md)** — the development workflow: issue-driven iteration, per-commit fitness gates, and an adversarial `architecture-guardian` subagent that reviews every branch against the guardrails.
 - **[PROOFS.md](./PROOFS.md)** — running evidence log: each claim with the command that reproduces it.
 

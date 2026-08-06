@@ -2,7 +2,7 @@
 
 .PHONY: fitness hooks lint type test evals
 
-fitness:            ## Run all fitness functions (F1-F9)
+fitness:            ## Run the fitness suite: S/H/B tiers + hygiene (GUARDRAILS.md §1)
 	python3 scripts/fitness/run.py
 
 hooks:              ## Install git hooks (run once after clone)
@@ -10,14 +10,14 @@ hooks:              ## Install git hooks (run once after clone)
 	chmod +x .githooks/pre-commit .githooks/commit-msg
 	@echo "hooks installed (core.hooksPath -> .githooks)"
 
-lint:               ## F6
+lint:               ## G1
 	uv run ruff check . && uv run ruff format --check .
 
-type:               ## F7
+type:               ## G2
 	uv run mypy --strict packages
 
-test:               ## F8
-	uv run pytest -q --cov=packages --cov-branch --cov-fail-under=85
+test:               ## G3
+	uv run pytest -q -m "not acceptance" --cov=packages --cov-branch --cov-fail-under=85
 
-evals:              ## F9 (from M2)
+evals:              ## B tier (from M2)
 	uv run steward evals run

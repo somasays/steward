@@ -1,121 +1,136 @@
-# Architecture Guardrails
+# Fitness Functions & Enforcement
 
-**Status:** Binding · applies to every commit · enforced by `make fitness`, git hooks, and CI
+**Status:** Binding · applies to every commit · enforced by `make fitness`, git hooks, CI, and scheduled runs
 
-This document is the constitution of the Steward codebase. It defines:
+`ARCHITECTURE.md` defines what must stay true: functional requirements (FR), quantified non-functionals (N1–N10), and invariants (I1–I14). This document defines how those properties are **continuously measured**. The fitness functions are the leash that lets the system evolve fast — with heavy agent assistance — without its architecture or its guarantees eroding.
 
-- **Invariants (I1–I12):** properties of the architecture that must hold at every commit, forever. Changing an invariant requires editing this file in a dedicated PR that explains why — never as a side effect of a feature.
-- **Fitness functions (F1–F10):** automated, machine-checkable tests of those invariants. They run locally via `make fitness`, on every commit via the pre-commit hook, and on every push/PR via CI. **A commit that fails a fitness function does not merge.**
+Coverage rule: **every N-row and I-row in ARCHITECTURE.md is protected by at least one fitness function below** (see the matrix in §2). A change that adds an invariant or NFR without a protecting check is incomplete.
 
-The relationship is strict: every invariant is either enforced by a fitness function, enforced by construction (it cannot be violated without failing an existing check), or explicitly listed as **review-enforced** (checked by the `architecture-guardian` subagent and human review, because it isn't mechanically checkable yet). Review-enforced is a debt state — the roadmap for promoting each one to a fitness function is tracked in [§4](#4-enforcement-roadmap).
+Checks are tiered by *how* they measure, because different properties fail at different speeds:
 
----
+- **Tier S — static architecture checks**: seconds, every commit, no environment needed
+- **Tier H — behavioral harnesses**: minutes, every PR, real components against Dockerized fixtures
+- **Tier B — benchmarks & evals**: PR when affected paths change, plus nightly; golden datasets and load fixtures
+- **Tier P — production fitness**: continuous, on the live system
+- **Hygiene (G)** — generic code health. Blocking, but deliberately *not* called a fitness function: it protects code quality, not this system's architecture
 
-## 1. Invariants
+## 1. The catalog
 
-### I1 — Postgres is the only system of record
-Qdrant and ElasticSearch are derived indexes, rebuildable from Postgres at any time. No business fact may exist only in a vector store, search index, or cache. Corollary: any indexing operation must be re-runnable and convergent (deterministic document IDs, upserts).
+### Tier S — static architecture checks (every commit, seconds)
 
-### I2 — All model access goes through the gateway
-Agent and service code calls LLMs only through `steward-llm` using **model aliases** (`steward-reasoning`, `steward-fast`, …). Provider SDKs (`openai`, `anthropic`, `google-generativeai`, `mistralai`, `cohere`) and `litellm` itself may be imported **only** inside `packages/steward-llm`. Swapping providers must remain a config change.
+| ID | Fitness function | Protects | Measurement | Status |
+|----|------------------|----------|-------------|--------|
+| S1 | Boundaries & containment | I2, I4, I9, N9 | import-linter contracts (layers `services → packages`, declared package edges, schemas independence) + ruff TID251 banned-api (kitchen-sink frameworks banned everywhere; `langgraph`/`litellm`/provider SDKs unbanned only in their home packages). Schemas purity additionally enforced by dependency declaration, verified by isolated `uv run --package` import | bootstrap `check_boundaries.py` active; tool wiring tracked as issue |
+| S2 | Runtime size budget | I9 | `check_loc_budget.py` — effective LOC of `packages/steward-agents` ≤ 2,000 (custom: no tool does per-package budgets) | active |
+| S3 | SQL string-assembly ban | I5, N7 | ruff S608 | bootstrap `check_sql_safety.py` active |
+| S4 | Prompt literal ban | I10 | `check_prompt_hygiene.py` — prompt-shaped literals outside `prompts/` (custom: domain-specific) | active |
+| S5 | Public-surface lock | I9, I3 | `check_surface.py` — no contained-module type in any package's public signatures, class bases, or re-exports | issue #6 |
+| S6 | Contract compatibility | I3, N9 | JSON Schema snapshots of published Pydantic contracts (pytest + `contracts/`) and oasdiff on the exported OpenAPI spec; breaking change fails, additive requires snapshot update in the same commit | issue #7 |
+| S7 | File-graph coverage | doc consistency | `check_filegraph.py` — `scripts/fitness/filegraph.json` maps every file pattern to its impacted files; changing a file means updating/verifying its dependents (workflow law, CLAUDE.md); S7 fails if any tracked file is outside the graph | active |
 
-### I3 — Typed boundaries, everywhere
-Every seam — API request/response, tool input/output, task payload, task result, inter-package call — is a Pydantic model or a typed function signature. Raw `dict`/`Any` does not cross a package boundary. `mypy --strict` passes on `packages/`.
+### Tier H — behavioral harnesses (every PR; `pytest -m invariants` / `-m acceptance` against Docker fixtures)
 
-### I4 — One-way dependency flow
-`services/*` may import `packages/*`. `packages/*` may never import `services/*` or each other's internals, and never form cycles. `steward-schemas` depends on **pydantic and the standard library only** — it is importable by anything, dependent on nothing. Allowed package-to-package edges are declared in `scripts/fitness/boundaries.json`; any new edge is a reviewed change to that file.
+These run real components — Postgres, the queue, the runtime with a stub LLM — and assert system behavior. They bind to *registries* (task handlers, repositories, agents), so a newly added component is on the leash automatically.
 
-### I5 — Sources are read-only; SQL is never assembled from strings
-Connections to customer data sources use read-only roles, enforced at the database level. In code, SQL is either (a) a parameterized template from the connector library, or (b) composed by the Librarian **only** through the bounded `run_readonly_sql` tool (read-only role + `LIMIT` + statement timeout + cost cap + masking). String-formatted SQL (f-strings, `%`, `+`, `.format`) is banned everywhere.
+| ID | Fitness function | Protects | Measurement | Lands |
+|----|------------------|----------|-------------|-------|
+| H1 | Idempotency | I8 | every registered task handler executed twice with the same payload → byte-identical end state | M0 (issue #3) |
+| H2 | Crash recovery | N1 | SIGKILL a worker mid-run → run completes after restart with ≤ 1 step re-executed | M0/M5 chaos |
+| H3 | No lost/ghost tasks | I8, N1 | crash injection around enqueue/claim/complete → task set matches state-machine expectations exactly | M0 |
+| H4 | Budget termination | I12, N6 | agent given an impossible goal with 1-step/1-cent budget → terminates `budget_exceeded`, never hangs, cost ≤ cap | M0 runtime |
+| H5 | Audit completeness | I7, N8 | every repository mutation produces an audit row in the same transaction (asserted over the repository registry) | M1 |
+| H6 | Trace completeness | I7, N8 | a finished run's Langfuse trace contains the full expected span tree; every generation span carries a prompt version | M0/M1 |
+| H7 | Masking canary | I6, N7 | canary secrets planted in fixture data; assert they never appear in any captured prompt or trace payload | M1 |
+| H8 | Index rebuild convergence | I1, N9 | wipe Qdrant + ES, run rebuild job → search results identical to pre-wipe golden results | M2 |
+| H9 | Citation resolution | N2, FR8 | every citation in every golden answer resolves to a live asset/document id | M3 |
+| H10 | Governance gating | I13, FR9 | governance actions land in `pending_review` unless a policy explicitly auto-approves; the policy id is on the audit row | M1 |
+| H11 | Milestone acceptance | FR1–FR10 | executable exit criterion of each shipped milestone (SPEC §12); once shipped, runs forever | rolling |
 
-### I6 — Raw sensitive values never reach a model
-Any value sampled from a customer source passes through the masking layer before entering a prompt. Prompts are constructed from schemas, statistics, formats, and masked exemplars — never raw payloads. **(Review-enforced until the masking layer lands in M1; then enforced by construction: prompt-building APIs only accept `MaskedSample` types — I3 makes the type system the enforcement.)**
+### Tier B — benchmarks & evals (affected-path PRs + nightly)
 
-### I7 — Nothing happens invisibly
-Every agent step (generation, tool call) emits a Langfuse span. Every state-changing action writes `audit_log` **in the same transaction** as the mutation. A feature that can't answer "who/what/why" from its traces and audit rows is not done.
+Datasets live in Langfuse; runnable identically on a laptop and CI (`steward evals run`). Thresholds are ratchets: raising is routine, lowering follows §5 amendment.
 
-### I8 — Tasks are idempotent; enqueue is transactional
-Running any task handler twice with the same payload converges to the same state (upserts on natural keys, deterministic derived IDs). Tasks are enqueued in the same Postgres transaction as the state change that caused them — no ghost tasks, no lost tasks.
+| ID | Fitness function | Protects | Threshold | Lands |
+|----|------------------|----------|-----------|-------|
+| B1 | Retrieval quality | N3 | recall@8 ≥ 0.90, MRR@8 ≥ 0.75, no metric −2 pts vs main | M2 |
+| B2 | Classification quality | N2 | PII recall ≥ 0.95, precision ≥ 0.90 | M1 |
+| B3 | Doc groundedness | N2 | calibrated judge (κ ≥ 0.7 vs human subset): zero ungrounded claims, rubric mean ≥ 4.0/5 | M1 |
+| B4 | Answer faithfulness | N2 | ≥ 0.95, every claim cited | M3 |
+| B5 | Triage accuracy | N2 | root-cause hit@3 ≥ 0.8 on replayed incidents | M4 |
+| B6 | Latency budgets | N4 | search P95 ≤ 150/400 ms; ask P50 ≤ 10 s; API P99 ≤ 500 ms — measured on the fixture stack | M2+ |
+| B7 | Scan throughput | N5 | 500-table fixture scan ≤ 30 min | M5 |
+| B8 | Cost regression | N6 | cost per task type ≤ 1.2× tracked baseline | M1+ |
+| B9 | Provider independence | I14, N9 | B1–B5 re-run with aliases bound to the fallback provider — pass without code change | M3, nightly |
 
-### I9 — Frameworks are contained; the contract is owned
-Agent execution may use LangGraph — but only inside `packages/steward-agents`, and no LangGraph type appears in that package's public API: callers see our Pydantic contracts (`AgentSpec`, tool defs, budgets, `TaskResult`) only. Third-party module homes are declared in the `contained_modules` map in `scripts/fitness/boundaries.json` (`langgraph` → `steward-agents`; provider SDKs and `litellm` → `steward-llm`); imports outside a module's home are violations. Steward-owned code in `steward-agents` stays under **2,000 effective LOC** (non-blank, non-comment, tests excluded) — containment plus the size budget keeps the wrapper honest: if it balloons, we're rebuilding the framework inside the wrapper; if types leak, we're coupled to it. Kitchen-sink frameworks (`langchain`, `langchain-community`, `crewai`, `llama-index`, `autogen`, `semantic-kernel`, `pydantic-ai`, `haystack`) are banned outright as dependencies and imports.
+### Tier P — production fitness (continuous)
 
-### I10 — Prompts are versioned artifacts
-Prompts live in `prompts/` files (or Langfuse-managed versions referenced by ID) and are loaded by name+version. Prompt text is not scattered through application code as string literals. Changing a prompt is a diff a reviewer can see and an eval gate can test.
+| ID | Fitness function | Protects | Measurement |
+|----|------------------|----------|-------------|
+| P1 | Online quality | N2, I11 | 10% of production runs judge-scored async; alert on degradation vs offline baseline |
+| P2 | SLO burn | N4 | Prometheus SLO rules on the B6 budgets |
+| P3 | Cost guard | N6 | gateway budget caps (hard 429) + daily cost trend alerts |
+| P4 | Queue health | N1 | dead-task count, queue age > 10 min alerts |
+| P5 | Derived-index drift | I1 | nightly reconciliation diff Postgres ↔ Qdrant/ES; alert on divergence |
 
-### I11 — LLM-dependent behavior is eval-gated
-Every capability whose output depends on a model (documentation, classification, retrieval, answering, triage) has an eval suite with golden data. From M2 onward, changes to prompts, model bindings, or retrieval parameters must pass the affected suites in CI before merge. A behavior without an eval is a prototype, not a feature.
+### Hygiene (G) — blocking, but not fitness
 
-### I12 — Autonomy is bounded
-Every agent run has hard limits — max steps, max tokens, max cost, max wall-clock — enforced by the runtime, not by convention. Exceeding a budget is a visible, typed failure (`budget_exceeded`), never a silent truncation or an unbounded loop.
+| ID | Check | Mechanism |
+|----|-------|-----------|
+| G1 | Lint & format | ruff check + format --check |
+| G2 | Strict types | mypy --strict on `packages/` (this is also what turns typed-contract conventions (I3, I6-by-construction) into compile-time enforcement) |
+| G3 | Tests & coverage | pytest, branch coverage ≥ 85% on `packages/` |
+| G4 | Secret scan | gitleaks (full history in CI, staged diff pre-commit) — bootstrap `check_secrets.py` until wired |
+| G5 | Commit discipline | commit-msg hook: Conventional Commits; feat/fix/refactor/perf must reference an issue (custom: issue-ref rule is project policy) |
 
----
+Build-vs-buy rule: a check is hand-rolled only when no maintained tool has the semantics (S2, S4, S5, G5). Bootstrap stdlib implementations of S1/S3/G4 enforce the same rules until tool wiring lands; they get deleted, not maintained.
 
-## 2. Fitness functions
+## 2. Coverage matrix
 
-Fitness functions are **the leash that lets this system evolve fast — with heavy agent assistance — without the architecture eroding**. They are specific to Steward's invariants and promises, not generic hygiene: each one pins a property an agent (or a tired human) could otherwise silently break while "just implementing a feature." Generic hygiene (lint, types, coverage) still gates every commit, but it's table stakes and listed separately as H-checks.
+| Property | Protected by |
+|----------|--------------|
+| I1 sole system of record | H8, P5 |
+| I2 gateway-only model access | S1 |
+| I3 typed, versioned contracts | S6, S5, G2 |
+| I4 dependency flow | S1 |
+| I5 read-only sources, no string SQL | S3 (+ read-only role: fixture harness asserts writes fail — part of H11 M1 scenario) |
+| I6 masking | H7 (+ by construction via typed prompt-builder inputs, G2) |
+| I7 traced & audited | H5, H6 |
+| I8 idempotent, transactional tasks | H1, H3 |
+| I9 framework containment & size | S1, S2, S5 |
+| I10 versioned prompts | S4 |
+| I11 eval-gated behavior | B1–B5 gates, P1 |
+| I12 bounded autonomy | H4 |
+| I13 policy-gated governance | H10 |
+| I14 provider swap = config | B9 |
+| N1 recoverability | H2, H3, P4 |
+| N2 output correctness | B2–B5, H9, P1 |
+| N3 retrieval quality | B1 |
+| N4 latency | B6, P2 |
+| N5 throughput | B7 |
+| N6 cost | H4, B8, P3 |
+| N7 privacy/security | H7, S3, G4 |
+| N8 observability | H5, H6 |
+| N9 evolvability | S1, S6, H8, B9 |
+| N10 operability | M6 acceptance scenario (H11) + Argo rollout analysis |
+| Doc/file consistency | S7 (coverage) + filegraph propagation in the workflow |
 
-Structural checks are stdlib-only Python in `scripts/fitness/` (no venv — they must run before the project can even install itself); harness checks run via pytest markers. `make fitness` runs everything; individual checks are runnable directly.
+## 3. Rules of engagement
 
-### Tier A — Architecture standards (structural, always on)
+- **No bypass culture.** `git commit --no-verify` is for emergencies; CI re-runs everything, so a bypassed hook only delays the failure.
+- **Suppressions are visible and justified.** Inline pragmas (`# fitness: allow-sql-string`, `# fitness: allow-prompt-literal`, ruff `noqa`) require a same-line reason; CI reports pragma counts and reviewers treat increases as design questions.
+- **Checks fail loud, skip honest.** A check that can't run reports `SKIP` with the reason — never `PASS` for work it didn't do.
+- **Thresholds only ratchet.** Coverage and eval thresholds go up in dedicated PRs; down follows §6.
+- **Harnesses bind to registries**, not to lists in test files — a new handler/repository/agent is leashed the moment it's registered, with no test edit an agent could "forget."
 
-| ID | Name | Enforces | Mechanism |
-|----|------|----------|-----------|
-| **F1** | Import boundaries | I2, I4, I9 | `check_boundaries.py` — AST walk: no `packages → services` imports, no undeclared package edges, contained modules only in their declared homes (`langgraph` → `steward-agents`, providers/`litellm` → `steward-llm`), `steward-schemas` purity, banned frameworks nowhere (incl. `pyproject.toml` deps) — all vs `boundaries.json` |
-| **F2** | Runtime size budget | I9 | `check_loc_budget.py` — effective LOC of `packages/steward-agents` ≤ 2,000 |
-| **F3** | SQL safety | I5 | `check_sql_safety.py` — AST: flags f-strings/`%`/`format`/`+`-concat producing SQL |
-| **F4** | Prompt hygiene | I10 | `check_prompt_hygiene.py` — prompt-shaped literals outside `prompts/` |
-| **F5** | Public-surface lock | I9, I3 | `check_surface.py` — AST over each package's public modules: no contained-module type (langgraph, litellm, provider SDKs) in a public signature, class base, or re-export; the framework stays an implementation detail |
+## 4. Architecture & code smells — review checklist
 
-### Tier B — Contracts (what other code may rely on)
-
-| ID | Name | Enforces | Mechanism |
-|----|------|----------|-----------|
-| **F6** | Contract compatibility | I3 | `check_contracts.py` — JSON Schema snapshots of published Pydantic contracts (and the OpenAPI spec, once `services/api` exists) live in `contracts/`; regenerated on each run and diffed. **Breaking** (removed field/path, type change, new required field) fails; additive changes require the snapshot update in the same commit, which makes every contract change visible in review |
-
-### Tier C — Behavioral invariants (harness tests over real components)
-
-| ID | Name | Enforces | Mechanism |
-|----|------|----------|-----------|
-| **F7** | Invariant harness | I7, I8, I12 | `pytest -m invariants` — generic harnesses that hold for *every* registered component, present and future: each task handler executed twice with the same payload converges to identical state (I8); each repository mutation produces an audit row in the same transaction (I7); each agent run with a 1-step/1-cent budget terminates with `budget_exceeded`, never hangs (I12). New components are picked up by registration, so an agent adding a handler cannot skip the leash |
-
-### Tier D — Functional acceptance (does the system do its job)
-
-| ID | Name | Enforces | Mechanism |
-|----|------|----------|-----------|
-| **F8** | Acceptance scenarios | SPEC §12 exit criteria | `pytest -m acceptance` against the Dockerized fixture warehouse — executable versions of each milestone's exit criterion (M0: a run flows API → queue → worker → done with a trace; M1: scan yields reviewed docs + classifications; M4: injected faults are detected and triaged). Once a milestone ships, its scenario runs forever — regressions in old capability fail new work |
-| **F9** | Eval gates | I11 | `steward evals run` on suites affected by the diff; thresholds from SPEC §9. Activates in M2 |
-
-### Hygiene (generic, still blocking)
-
-| ID | Name | Mechanism |
-|----|------|-----------|
-| **H1** | Lint & format | `ruff check` + `ruff format --check` |
-| **H2** | Strict types | `mypy --strict` on `packages/` |
-| **H3** | Tests & coverage | `pytest` with branch coverage ≥ 85% on `packages/` |
-| **H4** | Secret scan | `check_secrets.py` — credential patterns (keys, tokens, DSNs with passwords) |
-| **H5** | Commit discipline | `commit-msg` hook — Conventional Commits; `feat`/`fix`/`refactor`/`perf` must reference an issue (`#N`) |
-
-All of Tier A + H4 run stdlib-only and gate pre-commit; everything runs in CI. Tool-backed checks skip honestly until their prerequisites exist (see Rules below).
-
-Rules of engagement:
-
-- **No bypass culture.** `git commit --no-verify` is for emergencies; CI re-runs everything anyway, so a bypassed hook only delays the failure to the PR.
-- **Suppressions are visible and justified.** The only escape hatches are inline pragmas (`# fitness: allow-sql-string`, `# fitness: allow-prompt-literal`) which **require a trailing reason** and are counted: CI reports total pragma count per check, and reviewers treat any increase as a design question.
-- **Checks fail loud, skip honest.** A check that can't run (tooling not installed, directory not created yet) reports `SKIP` with the reason — it never reports `PASS` for work it didn't do.
-- **Thresholds only ratchet.** Coverage and eval thresholds may go up in a dedicated PR; going down requires the same invariant-change process as §1.
-
----
-
-## 3. Architecture & code smells — review checklist
-
-Not everything reduces to a script. The `architecture-guardian` subagent (and human reviewers) check every diff for these, mapped to the invariant they usually precede violating:
+Not everything reduces to a check. The `architecture-guardian` subagent and human review watch every diff for these:
 
 | Smell | Early warning for |
 |---|---|
 | A "utils"/"helpers"/"common" module accreting unrelated functions | I4 (hidden coupling hub) |
 | A Pydantic model with `dict[str, Any]` fields doing real work | I3 (type laundering) |
-| Business logic appearing in `services/api` route handlers instead of packages | I4 (inverted dependency gravity) |
+| Business logic in `services/api` route handlers instead of packages | I4 (inverted dependency gravity) |
 | A tool function that both decides and acts (no seam to test the decision) | I3, testability |
 | Retry/timeout/budget logic duplicated in an agent instead of the runtime | I9, I12 (runtime bypass) |
 | A LangGraph type (graph, state, message) in a public signature of `steward-agents` | I9 (framework leak) |
@@ -125,25 +140,12 @@ Not everything reduces to a script. The `architecture-guardian` subagent (and hu
 | A test asserting on mock call order instead of observable state | test smell (brittle coupling) |
 | `# type: ignore` or pragma suppressions clustering in one module | design pressure — refactor, don't suppress |
 
----
+## 5. Enforcement status
 
-## 4. Enforcement roadmap
+Active now: S1–S4 (bootstrap), S7, G1–G3 (workspace), G4 (bootstrap + gitleaks in CI), G5. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced invariants (I6 until M1, I7/I8 until their harnesses) are the `architecture-guardian`'s explicit responsibility in the meantime.
 
-Review-enforced invariants and their promotion path to mechanical enforcement:
+## 6. Amendment process
 
-| Invariant | Currently | Promotion plan |
-|---|---|---|
-| I6 masking | review-enforced | M1: prompt-builder APIs accept only `MaskedSample` types → enforced by H2 (mypy strict) |
-| I7 tracing/audit | review-enforced | M1: audit-row-per-mutation harness in the invariant suite → F7 |
-| I8 idempotency | review-enforced | M1: twice-run harness over every registered task handler → F7 |
-| I12 budgets | review-enforced | M0: budgets constructor-required in the runtime (no default = unlimited) + termination harness → F7 |
-| F5, F6 | specced, not yet implemented | tracked as `guardrails` issues; runner reports them SKIP until they land |
-| F9 evals | inactive | M2: suites + thresholds land with the retrieval milestone |
-
----
-
-## 5. Amendment process
-
-1. Open an issue labeled `guardrails` stating the invariant/threshold to change and why.
-2. PR touching only `GUARDRAILS.md` (+ corresponding fitness script), linking the issue.
+1. Open an issue labeled `guardrails` stating the invariant/NFR/threshold to change and why.
+2. PR touching only `ARCHITECTURE.md`/`GUARDRAILS.md` (+ the corresponding check), linking the issue.
 3. The PR description must answer: *what does this make possible, what does it make possible to get wrong, and what replaces the lost protection?*

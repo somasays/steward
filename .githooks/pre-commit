@@ -1,3 +1,3 @@
 #!/bin/sh
-# Fitness gate (GUARDRAILS.md §2). Install with: make hooks
+# Fitness gate (GUARDRAILS.md §1). Install with: make hooks
 exec python3 scripts/fitness/run.py --stage pre-commit

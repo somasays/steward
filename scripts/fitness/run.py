@@ -1,11 +1,11 @@
-"""Fitness suite orchestrator (GUARDRAILS.md §2).
+"""Fitness suite orchestrator (GUARDRAILS.md).
 
 Usage:
     python3 scripts/fitness/run.py [--json] [--stage pre-commit|ci]
 
-Tier A (architecture standards) + H4 run stdlib-only, always. Contract,
-harness, and hygiene checks run when their prerequisites exist; otherwise
-they SKIP with the reason. Exit 1 if anything FAILs.
+Tiers (GUARDRAILS.md §1): S = static architecture checks (stdlib, always run),
+H = behavioral harnesses (pytest markers), B = benchmarks/evals, G = hygiene.
+Checks whose prerequisites don't exist yet SKIP with the reason. Exit 1 on FAIL.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 import check_boundaries
+import check_filegraph
 import check_loc_budget
 import check_prompt_hygiene
 import check_secrets
@@ -42,7 +43,7 @@ def _tool_check(check_id: str, name: str, cmd: List[str], skip_reason: str = "",
 
 
 def _script_or_pending(check_id: str, name: str, script: str) -> CheckResult:
-    """Structural checks that are specced in GUARDRAILS.md but land via their own issue."""
+    """Checks specced in GUARDRAILS.md that land via their own issue."""
     path = Path(__file__).parent / script
     if not path.exists():
         return CheckResult(check_id, name, "SKIP", [], f"{script} not implemented yet (tracked as an issue)")
@@ -67,35 +68,35 @@ def main() -> int:
     no_harness = {PYTEST_NO_TESTS_COLLECTED: "no tests with this marker yet"}
 
     results: List[CheckResult] = [
-        # Tier A — architecture standards
-        check_boundaries.run(),
-        check_loc_budget.run(),
-        check_sql_safety.run(),
-        check_prompt_hygiene.run(),
-        _script_or_pending("F5", "public-surface lock", "check_surface.py"),
-        # Tier B — contracts
-        _script_or_pending("F6", "contract compatibility", "check_contracts.py"),
-        # Tier C — behavioral invariants
-        _tool_check("F7", "invariant harness", ["uv", "run", "pytest", "-q", "-m", "invariants"],
+        # Tier S — static architecture checks
+        check_boundaries.run(),          # S1
+        check_loc_budget.run(),          # S2
+        check_sql_safety.run(),          # S3
+        check_prompt_hygiene.run(),      # S4
+        _script_or_pending("S5", "public-surface lock", "check_surface.py"),
+        _script_or_pending("S6", "contract compatibility", "check_contracts.py"),
+        check_filegraph.run(),           # S7
+        # Tier H — behavioral harnesses
+        _tool_check("H*", "invariant harnesses", ["uv", "run", "pytest", "-q", "-m", "invariants"],
                     not_installed or ("" if has_tests else "no tests yet"), no_harness),
-        # Tier D — functional acceptance
-        _tool_check("F8", "acceptance scenarios", ["uv", "run", "pytest", "-q", "-m", "acceptance"],
+        _tool_check("H11", "acceptance scenarios", ["uv", "run", "pytest", "-q", "-m", "acceptance"],
                     not_installed or ("" if has_tests else "no tests yet"), no_harness),
-        _tool_check("F9", "eval gates", ["uv", "run", "steward", "evals", "run", "--changed"],
+        # Tier B — benchmarks & evals
+        _tool_check("B*", "eval gates", ["uv", "run", "steward", "evals", "run", "--changed"],
                     "" if has_evals else "activates in M2 (no evals/ yet)"),
         # Hygiene
-        _tool_check("H1", "lint & format", ["uv", "run", "ruff", "check", "."], not_installed),
-        _tool_check("H2", "strict types", ["uv", "run", "mypy", "--strict", "packages"],
+        _tool_check("G1", "lint & format", ["uv", "run", "ruff", "check", "."], not_installed),
+        _tool_check("G2", "strict types", ["uv", "run", "mypy", "--strict", "packages"],
                     not_installed or ("" if has_packages else "no packages/ yet")),
-        _tool_check("H3", "tests & coverage",
+        _tool_check("G3", "tests & coverage",
                     ["uv", "run", "pytest", "-q", "-m", "not acceptance",
                      "--cov=packages", "--cov-branch", "--cov-fail-under=85"],
                     not_installed or ("" if has_tests else "no tests yet")),
-        check_secrets.run(),  # H4
+        check_secrets.run(),             # G4 (bootstrap until gitleaks wiring lands)
     ]
     if not installed and stage == "ci" and (root / "pyproject.toml").exists():
         # uv missing in CI would silently skip real gates — that is a failure, not a skip.
-        results.append(CheckResult("H", "toolchain", "FAIL", [], "pyproject.toml exists but uv not found in CI"))
+        results.append(CheckResult("G", "toolchain", "FAIL", [], "pyproject.toml exists but uv not found in CI"))
 
     if as_json:
         print(json.dumps([r._asdict() for r in results], default=lambda o: o._asdict(), indent=2))

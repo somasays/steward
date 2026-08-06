@@ -1,4 +1,4 @@
-"""H5 — Commit discipline (commit-msg hook).
+"""G5 — Commit discipline (commit-msg hook).
 
 Conventional Commits, subject <= 100 chars. feat/fix/refactor/perf commits must
 reference a GitHub issue (#N) somewhere in the message — work is issue-driven.
