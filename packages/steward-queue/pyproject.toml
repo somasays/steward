@@ -1,0 +1,20 @@
+[project]
+name = "steward-queue"
+version = "0.1.0"
+description = "Postgres task queue: transactional enqueue, SKIP LOCKED claiming, backoff retries, audit (I5/I7/I8/I12)."
+requires-python = ">=3.12"
+dependencies = [
+    "steward-schemas",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.13",
+]
+
+[tool.uv.sources]
+steward-schemas = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/steward_queue"]

@@ -129,6 +129,7 @@ The repo is a `uv` workspace with independently importable packages — the same
 ```
 packages/
   steward-schemas/     # Pydantic models: API contracts, tool I/O, events (zero heavy deps)
+  steward-queue/       # Postgres task queue: migrations, transactional enqueue, SKIP LOCKED claiming, worker loop
   steward-agents/      # Agent runtime: owned contracts (tools, budgets, results); LangGraph contained here
   steward-retrieval/   # Hybrid search client: Qdrant + ES + fusion + rerank
   steward-llm/         # Thin LiteLLM client wrapper: typed completions, structured output helpers
