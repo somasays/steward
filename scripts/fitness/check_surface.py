@@ -5,8 +5,9 @@ boundaries.json's `contained_modules` (e.g. `langgraph` homed in
 `steward-agents`), the home package's PUBLIC surface must never reference
 that module:
 
-  (a) in annotations (parameter, return, or class-attribute) of a top-level
-      def or class in a public module,
+  (a) in annotations (parameter, return, class-attribute, or module-level
+      variable) of a top-level def, class, or annotated assignment in a
+      public module,
   (b) as a base class of a top-level class in a public module,
   (c) via `import X` / `from X import ...` of the contained module in a
       public `__init__.py` (the classic re-export vector).
@@ -183,6 +184,12 @@ def _scan_module(path: Path, rel_root: Path, targets: Set[str]) -> List[Finding]
                     findings.append(Finding(
                         rel, lineno,
                         f"'{name}' ({root}) leaks into {ctx} of class '{node.name}' (I9/I3)"))
+        elif isinstance(node, ast.AnnAssign):
+            for lineno, name, root in _annotation_refs(node.annotation, aliases):
+                if root in targets:
+                    findings.append(Finding(
+                        rel, lineno,
+                        f"'{name}' ({root}) leaks into public module-level annotation (I9/I3)"))
 
     if path.name == "__init__.py":
         for lineno, imported in _reexport_refs(tree, targets):
@@ -250,6 +257,9 @@ from langgraph.graph import StateGraph
 class Runtime(lg.graph.StateGraph):
     def build(self) -> StateGraph:
         raise NotImplementedError
+
+
+default_graph: StateGraph = Runtime().build()
 """
 
 _LEAK_PRIVATE = """\
@@ -304,8 +314,8 @@ def _selftest() -> int:
         elif private_flagged:
             print("selftest FAIL: private module was flagged (should be exempt)")
             ok = False
-        elif len(findings) < 3:
-            print(f"selftest FAIL: expected findings for all three rules (a/b/c), got {len(findings)}")
+        elif len(findings) < 4:
+            print(f"selftest FAIL: expected findings for annotation/base/re-export/module-var, got {len(findings)}")
             ok = False
         else:
             print(f"selftest: planted-leak fixture correctly FAILs ({scanned} modules scanned, {len(findings)} findings)")
