@@ -18,3 +18,27 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/steward_agents"]
+
+# S1 containment home (I2/I9): unbans langgraph + langchain_core here only. Ruff config
+# tables replace rather than merge across `extend`, so this restates the root banned-api
+# dict minus this package's own contained modules -- keep in sync with root pyproject.toml.
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"langchain" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"langchain_community" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"crewai" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"llama_index" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"autogen" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"semantic_kernel" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"pydantic_ai" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"haystack" = { msg = "kitchen-sink framework banned everywhere (I9)" }
+"langchain_openai" = { msg = "contained: steward-llm only (I2/I9)" }
+"litellm" = { msg = "contained: steward-llm only (I2/I9)" }
+"openai" = { msg = "contained: steward-llm only (I2/I9)" }
+"anthropic" = { msg = "contained: steward-llm only (I2/I9)" }
+"google" = { msg = "contained: steward-llm only (I2/I9)" }
+"mistralai" = { msg = "contained: steward-llm only (I2/I9)" }
+"cohere" = { msg = "contained: steward-llm only (I2/I9)" }
+"boto3" = { msg = "contained: steward-llm only (I2/I9)" }

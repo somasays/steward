@@ -9,7 +9,7 @@
     "PROOFS.md": [],
     "scripts/fitness/*": ["GUARDRAILS.md", "Makefile", ".github/workflows/*", "PROOFS.md"],
     ".claude/agents/*": ["CLAUDE.md"],
-    ".githooks/*": ["Makefile", "CLAUDE.md"],
+    ".githooks/*": ["Makefile", "CLAUDE.md", "GUARDRAILS.md"],
     ".github/workflows/*": ["GUARDRAILS.md", "PROOFS.md"],
     "Makefile": ["CLAUDE.md", "README.md"],
     "pyproject.toml": ["uv.lock", "GUARDRAILS.md", "scripts/fitness/boundaries.json"],
