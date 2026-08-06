@@ -1,10 +1,14 @@
 """Queue-local contracts.
 
 `steward-schemas` owns what crosses the orchestrator/worker seam (`TaskSpec`,
-`TaskResult`, `RunBudget`, `ProblemDetails`). This module owns the bookkeeping
-vocabulary that only the queue has an opinion about: the SPEC.md §3.1 state
-machine, run status, the audit actor, and the row projections the queue hands
-back to callers.
+`TaskResult`, `RunBudget`, `ProblemDetails`, `RunStatus`). This module owns the
+bookkeeping vocabulary that only the queue has an opinion about: the SPEC.md
+§3.1 task state machine, the audit actor, and the row projections the queue
+hands back to callers.
+
+`RunStatus` is re-exported rather than redefined: the API (`steward_schemas.run`)
+and the queue must agree on what state a run is in, and two enums with the same
+members are two things that can drift (I3).
 """
 
 from datetime import datetime
@@ -12,7 +16,19 @@ from enum import StrEnum
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
-from steward_schemas import RunBudget, TaskSpec
+from steward_schemas import RunBudget, RunStatus, TaskSpec
+
+__all__ = [
+    "SYSTEM_ACTOR",
+    "Actor",
+    "ActorKind",
+    "ClaimedTask",
+    "QueueModel",
+    "RunRecord",
+    "RunStatus",
+    "TaskRecord",
+    "TaskState",
+]
 
 
 class QueueModel(BaseModel):
@@ -41,16 +57,6 @@ class TaskState(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     DEAD = "dead"
-
-
-class RunStatus(StrEnum):
-    """Lifecycle of a run (SPEC.md §7 `runs`)."""
-
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 class ActorKind(StrEnum):
