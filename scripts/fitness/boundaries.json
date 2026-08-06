@@ -1,0 +1,29 @@
+{
+  "_doc": "F1 import-boundary declarations (GUARDRAILS.md I2/I4/I9). Adding an edge or a containment entry is a reviewed architectural decision — justify it in the PR.",
+  "packages_dir": "packages",
+  "services_dir": "services",
+  "schemas_package": "steward-schemas",
+  "schemas_allowed_thirdparty": ["pydantic", "pydantic_core", "annotated_types", "typing_extensions"],
+  "contained_modules": {
+    "langgraph": ["steward-agents"],
+    "langchain_core": ["steward-agents", "steward-llm"],
+    "langchain_openai": ["steward-llm"],
+    "litellm": ["steward-llm"],
+    "openai": ["steward-llm"],
+    "anthropic": ["steward-llm"],
+    "google": ["steward-llm"],
+    "mistralai": ["steward-llm"],
+    "cohere": ["steward-llm"],
+    "boto3": ["steward-llm"]
+  },
+  "banned_modules": [
+    "langchain", "langchain_community", "crewai", "llama_index",
+    "autogen", "semantic_kernel", "pydantic_ai", "haystack"
+  ],
+  "allowed_package_edges": {
+    "steward-agents": ["steward-schemas", "steward-llm"],
+    "steward-llm": ["steward-schemas"],
+    "steward-retrieval": ["steward-schemas"],
+    "steward-sdk": ["steward-schemas"]
+  }
+}
