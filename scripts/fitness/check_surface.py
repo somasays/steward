@@ -230,7 +230,7 @@ def _scan_tree(packages_dir: Path, rel_root: Path, contained_modules: Dict[str, 
 def run() -> CheckResult:
     root = repo_root()
     cfg = json.loads((Path(__file__).parent / "boundaries.json").read_text())
-    packages_dir = root / cfg["packages_dir"]
+    packages_dir = root / "packages"
     if not packages_dir.exists():
         return CheckResult("S5", "public-surface lock", "SKIP", [], "no packages/ yet")
 
