@@ -4,11 +4,14 @@ Prompts are versioned artifacts in prompts/ directories (or Langfuse-managed),
 not string literals in application code. Flags prompt-shaped literals — long
 instruction-like strings — outside prompts/ and tests.
 
-Static SQL statements are exempt from the *length* rule only: I5/S3 require SQL
-to be a parameterized constant rather than an assembled string, so a long SQL
-literal is the shape this architecture asks for, not a smuggled prompt. The
-instruction-shape rule still applies to them, so prose hidden in a literal that
-opens with a SQL keyword is still caught.
+Narrow exemption: in a module whose whole job is holding static SQL (`_sql.py`,
+or an Alembic revision under `versions/`), a literal that opens with a SQL
+statement keyword is exempt from the *length* rule. I5/S3 require SQL to be a
+parameterized constant rather than an assembled string, so a long SQL literal
+there is the shape this architecture asks for, not a smuggled prompt. Both
+conditions are required — a prompt prefixed with `SELECT 1;` in ordinary
+application code is still flagged — and the instruction-shape rule applies
+everywhere, including inside those modules.
 
 Escape hatch (requires a written reason, counted in CI):
     text = "..."  # fitness: allow-prompt-literal <reason>
@@ -38,6 +41,11 @@ def _in_prompts_dir(path: Path) -> bool:
     return "prompts" in path.parts
 
 
+def _sql_module(path: Path) -> bool:
+    """Modules that exist to hold static SQL: the I5 constant-statement pattern."""
+    return path.name == "_sql.py" or path.parent.name == "versions"
+
+
 def run() -> CheckResult:
     root = repo_root()
     findings: List[Finding] = []
@@ -48,6 +56,7 @@ def run() -> CheckResult:
             if _in_prompts_dir(path) or is_test_path(path):
                 continue
             scanned += 1
+            sql_module = _sql_module(path)
             source = path.read_text(encoding="utf-8", errors="replace")
             lines = source.splitlines()
             try:
@@ -67,7 +76,8 @@ def run() -> CheckResult:
                 if node.lineno in docstring_linenos:
                     continue
                 text = node.value
-                long_prose = len(text) >= LONG_LITERAL and not SQL_STATEMENT_RE.match(text)
+                exempt = sql_module and SQL_STATEMENT_RE.match(text)
+                long_prose = len(text) >= LONG_LITERAL and not exempt
                 prompt_shaped = long_prose or (
                     len(text) >= INSTRUCTION_MIN and INSTRUCTION_RE.search(text))
                 if not prompt_shaped:
