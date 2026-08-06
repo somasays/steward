@@ -4,6 +4,15 @@ Prompts are versioned artifacts in prompts/ directories (or Langfuse-managed),
 not string literals in application code. Flags prompt-shaped literals — long
 instruction-like strings — outside prompts/ and tests.
 
+Narrow exemption: in a module whose whole job is holding static SQL (`_sql.py`,
+or an Alembic revision under `versions/`), a literal that opens with a SQL
+statement keyword is exempt from the *length* rule. I5/S3 require SQL to be a
+parameterized constant rather than an assembled string, so a long SQL literal
+there is the shape this architecture asks for, not a smuggled prompt. Both
+conditions are required — a prompt prefixed with `SELECT 1;` in ordinary
+application code is still flagged — and the instruction-shape rule applies
+everywhere, including inside those modules.
+
 Escape hatch (requires a written reason, counted in CI):
     text = "..."  # fitness: allow-prompt-literal <reason>
 """
@@ -19,6 +28,10 @@ from common import CheckResult, Finding, is_test_path, iter_python_files, pragma
 
 INSTRUCTION_RE = re.compile(
     r"^\s*(You are\b|Your (task|job|role)\b|## (Instructions|Task|Role))", re.IGNORECASE | re.MULTILINE)
+SQL_STATEMENT_RE = re.compile(
+    r"^\s*(WITH\s|SELECT\s|INSERT\s+INTO\s|UPDATE\s|DELETE\s+FROM\s|TRUNCATE\s"
+    r"|CREATE\s+(TABLE|INDEX|UNIQUE\s+INDEX|VIEW|SCHEMA|EXTENSION)\s"
+    r"|DROP\s+(TABLE|INDEX|VIEW|SCHEMA|EXTENSION)\s|ALTER\s+TABLE\s)", re.IGNORECASE)
 LONG_LITERAL = 600
 INSTRUCTION_MIN = 150
 PRAGMA = "allow-prompt-literal"
@@ -26,6 +39,11 @@ PRAGMA = "allow-prompt-literal"
 
 def _in_prompts_dir(path: Path) -> bool:
     return "prompts" in path.parts
+
+
+def _sql_module(path: Path) -> bool:
+    """Modules that exist to hold static SQL: the I5 constant-statement pattern."""
+    return path.name == "_sql.py" or path.parent.name == "versions"
 
 
 def run() -> CheckResult:
@@ -38,6 +56,7 @@ def run() -> CheckResult:
             if _in_prompts_dir(path) or is_test_path(path):
                 continue
             scanned += 1
+            sql_module = _sql_module(path)
             source = path.read_text(encoding="utf-8", errors="replace")
             lines = source.splitlines()
             try:
@@ -57,7 +76,9 @@ def run() -> CheckResult:
                 if node.lineno in docstring_linenos:
                     continue
                 text = node.value
-                prompt_shaped = len(text) >= LONG_LITERAL or (
+                exempt = sql_module and SQL_STATEMENT_RE.match(text)
+                long_prose = len(text) >= LONG_LITERAL and not exempt
+                prompt_shaped = long_prose or (
                     len(text) >= INSTRUCTION_MIN and INSTRUCTION_RE.search(text))
                 if not prompt_shaped:
                     continue

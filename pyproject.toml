@@ -9,6 +9,11 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-asyncio>=0.24",
     "import-linter>=2.0",
+    # Tier H harnesses run against a real Postgres, not a fake: pgserver ships the
+    # server binaries in its wheel and starts an ephemeral instance per session, so
+    # the queue's SKIP LOCKED and transaction semantics are exercised for real
+    # without Docker on a developer laptop.
+    "pgserver>=0.1.4",
 ]
 
 [tool.ruff]
@@ -67,6 +72,7 @@ select = ["E", "F", "I", "UP", "B", "S608", "TID251"]
 root_packages = [
     "steward_agents",
     "steward_llm",
+    "steward_queue",
     "steward_retrieval",
     "steward_schemas",
     "steward_sdk",
@@ -77,26 +83,26 @@ root_packages = [
 [[tool.importlinter.contracts]]
 name = "services import packages, never the reverse (I4)"
 type = "forbidden"
-source_modules = ["steward_agents", "steward_llm", "steward_retrieval", "steward_schemas", "steward_sdk"]
+source_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_schemas", "steward_sdk"]
 forbidden_modules = ["steward_api", "steward_workers"]
 
 [[tool.importlinter.contracts]]
 name = "steward-agents depends only on its declared edges (I4)"
 type = "forbidden"
 source_modules = ["steward_agents"]
-forbidden_modules = ["steward_retrieval", "steward_sdk"]
+forbidden_modules = ["steward_queue", "steward_retrieval", "steward_sdk"]
 
 [[tool.importlinter.contracts]]
 name = "leaf packages depend only on steward-schemas (I4)"
 type = "forbidden"
-source_modules = ["steward_llm", "steward_retrieval", "steward_sdk"]
-forbidden_modules = ["steward_agents", "steward_llm", "steward_retrieval", "steward_sdk"]
+source_modules = ["steward_llm", "steward_queue", "steward_retrieval", "steward_sdk"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_sdk"]
 
 [[tool.importlinter.contracts]]
 name = "steward-schemas is independent: pydantic + stdlib only (I4)"
 type = "forbidden"
 source_modules = ["steward_schemas"]
-forbidden_modules = ["steward_agents", "steward_llm", "steward_retrieval", "steward_sdk"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_sdk"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -106,6 +112,7 @@ mypy_path = [
     "packages/steward-schemas/src",
     "packages/steward-agents/src",
     "packages/steward-llm/src",
+    "packages/steward-queue/src",
     "packages/steward-retrieval/src",
     "packages/steward-sdk/src",
 ]
