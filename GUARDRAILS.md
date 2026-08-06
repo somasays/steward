@@ -20,7 +20,7 @@ Checks are tiered by *how* they measure, because different properties fail at di
 
 | ID | Fitness function | Protects | Measurement | Status |
 |----|------------------|----------|-------------|--------|
-| S1 | Boundaries & containment | I2, I4, I9, N9 | import-linter contracts (layers `services → packages`, declared package edges, schemas independence) + ruff TID251 banned-api (kitchen-sink frameworks banned everywhere; `langgraph`/`litellm`/provider SDKs unbanned only in their home packages). Schemas purity additionally enforced by dependency declaration, verified by isolated `uv run --package` import | bootstrap `check_boundaries.py` active; tool wiring tracked as issue |
+| S1 | Boundaries & containment | I2, I4, I9, N9 | import-linter contracts (layers `services → packages`, declared package edges, schemas independence) + ruff TID251 banned-api (kitchen-sink frameworks banned everywhere; `langgraph`/`litellm`/provider SDKs unbanned only in their home packages). Schemas purity additionally enforced by dependency declaration, verified by isolated `uv run --package` import | bootstrap `check_boundaries.py` active; tool wiring: issue #9 |
 | S2 | Runtime size budget | I9 | `check_loc_budget.py` — effective LOC of `packages/steward-agents` ≤ 2,000 (custom: no tool does per-package budgets) | active |
 | S3 | SQL string-assembly ban | I5, N7 | ruff S608 | bootstrap `check_sql_safety.py` active |
 | S4 | Prompt literal ban | I10 | `check_prompt_hygiene.py` — prompt-shaped literals outside `prompts/` (custom: domain-specific) | active |
