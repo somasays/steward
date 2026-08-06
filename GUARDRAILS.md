@@ -34,10 +34,10 @@ These run real components — Postgres, the queue, the runtime with a stub LLM �
 
 | ID | Fitness function | Protects | Measurement | Lands |
 |----|------------------|----------|-------------|-------|
-| H1 | Idempotency | I8 | every registered task handler executed twice with the same payload → byte-identical end state | M0 (issue #3) |
+| H1 | Idempotency | I8 | every registered task handler executed twice with the same payload → byte-identical end state | active |
 | H2 | Crash recovery | N1 | SIGKILL a worker mid-run → run completes after restart with ≤ 1 step re-executed | M0/M5 chaos |
-| H3 | No lost/ghost tasks | I8, N1 | crash injection around enqueue/claim/complete → task set matches state-machine expectations exactly | M0 |
-| H4 | Budget termination | I12, N6 | agent given an impossible goal with 1-step/1-cent budget → terminates `budget_exceeded`, never hangs, cost ≤ cap | M0 runtime |
+| H3 | No lost/ghost tasks | I8, N1 | crash injection around enqueue/claim/complete → task set matches state-machine expectations exactly | active |
+| H4 | Budget termination | I12, N6 | agent given an impossible goal with 1-step/1-cent budget → terminates `budget_exceeded`, never hangs, cost ≤ cap | wall-clock active (worker); step/token/cost with the M1 agent loop |
 | H5 | Audit completeness | I7, N8 | every repository mutation produces an audit row in the same transaction (asserted over the repository registry) | M1 |
 | H6 | Trace completeness | I7, N8 | a finished run's Langfuse trace contains the full expected span tree; every generation span carries a prompt version | M0/M1 |
 | H7 | Masking canary | I6, N7 | canary secrets planted in fixture data; assert they never appear in any captured prompt or trace payload | M1 |
@@ -142,7 +142,7 @@ Not everything reduces to a check. The `architecture-guardian` subagent and huma
 
 ## 5. Enforcement status
 
-Active now: S1–S4 (S1/S3 tool-backed: import-linter + ruff; S2/S4 stdlib), S7, G1–G3 (workspace), G4 (gitleaks: CI hard gate + local pre-commit/`make fitness` pass-through), G5. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced invariants (I6 until M1, I7/I8 until their harnesses) are the `architecture-guardian`'s explicit responsibility in the meantime.
+Active now: S1–S5 (S1/S3 tool-backed: import-linter + ruff; S2/S4/S5 stdlib), S7, H1, H3, H4 (wall-clock half), G1–G3, G4 (gitleaks: CI hard gate + local pass-through), G5. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced invariants in the meantime — I6 (until masking lands, M1) and the tracing half of I7 (until #5) — are the `architecture-guardian`'s explicit responsibility.
 
 ## 6. Amendment process
 
