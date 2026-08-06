@@ -1,9 +1,25 @@
 [project]
 name = "steward-api"
 version = "0.1.0"
-description = "Steward API service (FastAPI gateway). Skeleton only — see issue #4."
+description = "Steward API service (FastAPI gateway). Skeleton — issue #4."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "steward-schemas",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.scripts]
+steward-api = "steward_api.__main__:main"
+steward-api-export-openapi = "steward_api.export_openapi:main"
+
+[tool.uv.sources]
+steward-schemas = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+]
 
 [build-system]
 requires = ["hatchling"]

@@ -22,4 +22,6 @@ def test_contracts_registry_exported() -> None:
         "run_budget",
         "agent_spec",
         "problem_details",
+        "run_create",
+        "run",
     }

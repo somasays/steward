@@ -20,7 +20,10 @@ from steward_schemas import (
     AssetType,
     Column,
     ProblemDetails,
+    Run,
     RunBudget,
+    RunCreate,
+    RunStatus,
     Source,
     SourceEngine,
     TaskResult,
@@ -142,6 +145,21 @@ def build_agent_spec() -> AgentSpec:
     )
 
 
+def build_run_create() -> RunCreate:
+    return RunCreate(goal="scan_source", payload={"source_id": "22222222-2222-2222-2222-222222222222"})
+
+
+def build_run() -> Run:
+    return Run(
+        id=UUID("77777777-7777-7777-7777-777777777777"),
+        goal="scan_source",
+        payload={"source_id": "22222222-2222-2222-2222-222222222222"},
+        status=RunStatus.PENDING,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
 def test_source_roundtrips() -> None:
     _roundtrips(build_source())
 
@@ -186,6 +204,14 @@ def test_problem_details_minimal_roundtrips() -> None:
     _roundtrips(ProblemDetails(title="Internal error", status=500))
 
 
+def test_run_create_roundtrips() -> None:
+    _roundtrips(build_run_create())
+
+
+def test_run_roundtrips() -> None:
+    _roundtrips(build_run())
+
+
 def test_problem_details_extension_member_survives_roundtrip() -> None:
     """RFC 9457 extension members (extra="allow") must not be dropped."""
     original = ProblemDetails.model_validate(
@@ -207,6 +233,8 @@ def test_all_contract_samples_roundtrip() -> None:
         "run_budget": build_run_budget(),
         "agent_spec": build_agent_spec(),
         "problem_details": build_problem_details(),
+        "run_create": build_run_create(),
+        "run": build_run(),
     }
     assert set(samples) == set(CONTRACTS)
     for name, model in samples.items():

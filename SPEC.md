@@ -322,9 +322,12 @@ GET    /v1/reviews?type=classification|document|rule
 POST   /v1/reviews/{id}:approve | :reject     # rejection requires a reason → becomes eval data
 
 # Runs & operations
+POST   /v1/runs                          # M0 skeleton: generic goal-based run creation → 202 + run_id
 GET    /v1/runs/{id}                     # status, task tree, cost, trace link
 POST   /v1/runs/{id}:cancel
 ```
+
+`POST /v1/runs` is the M0 API skeleton's entry point (issue #4): a generic `{goal, payload}` body, no orchestrator wiring yet (a run is created straight into `pending`). Goal-specific endpoints (`POST /v1/sources/{id}/scan`, above) land in M1 and are expected to become the primary way runs get created; whether `POST /v1/runs` stays as a generic escape hatch or narrows to goal-specific endpoints only is an open question for that milestone.
 
 Conventions: cursor pagination everywhere; RFC 9457 problem-details errors; idempotency keys on all POSTs that create runs; SSE (not WebSockets) for streaming — it's proxy-friendly and resumable via `Last-Event-ID`.
 
