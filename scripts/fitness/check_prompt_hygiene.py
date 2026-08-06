@@ -4,6 +4,12 @@ Prompts are versioned artifacts in prompts/ directories (or Langfuse-managed),
 not string literals in application code. Flags prompt-shaped literals — long
 instruction-like strings — outside prompts/ and tests.
 
+Static SQL statements are exempt from the *length* rule only: I5/S3 require SQL
+to be a parameterized constant rather than an assembled string, so a long SQL
+literal is the shape this architecture asks for, not a smuggled prompt. The
+instruction-shape rule still applies to them, so prose hidden in a literal that
+opens with a SQL keyword is still caught.
+
 Escape hatch (requires a written reason, counted in CI):
     text = "..."  # fitness: allow-prompt-literal <reason>
 """
@@ -19,6 +25,10 @@ from common import CheckResult, Finding, is_test_path, iter_python_files, pragma
 
 INSTRUCTION_RE = re.compile(
     r"^\s*(You are\b|Your (task|job|role)\b|## (Instructions|Task|Role))", re.IGNORECASE | re.MULTILINE)
+SQL_STATEMENT_RE = re.compile(
+    r"^\s*(WITH\s|SELECT\s|INSERT\s+INTO\s|UPDATE\s|DELETE\s+FROM\s|TRUNCATE\s"
+    r"|CREATE\s+(TABLE|INDEX|UNIQUE\s+INDEX|VIEW|SCHEMA|EXTENSION)\s"
+    r"|DROP\s+(TABLE|INDEX|VIEW|SCHEMA|EXTENSION)\s|ALTER\s+TABLE\s)", re.IGNORECASE)
 LONG_LITERAL = 600
 INSTRUCTION_MIN = 150
 PRAGMA = "allow-prompt-literal"
@@ -57,7 +67,8 @@ def run() -> CheckResult:
                 if node.lineno in docstring_linenos:
                     continue
                 text = node.value
-                prompt_shaped = len(text) >= LONG_LITERAL or (
+                long_prose = len(text) >= LONG_LITERAL and not SQL_STATEMENT_RE.match(text)
+                prompt_shaped = long_prose or (
                     len(text) >= INSTRUCTION_MIN and INSTRUCTION_RE.search(text))
                 if not prompt_shaped:
                     continue
