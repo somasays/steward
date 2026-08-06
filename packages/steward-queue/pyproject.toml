@@ -7,6 +7,10 @@ dependencies = [
     "steward-schemas",
     "psycopg[binary]>=3.2",
     "alembic>=1.13",
+    # Imported directly by the Alembic env (it drives a SQLAlchemy engine), so it
+    # is declared rather than leaned on as an alembic transitive. The queue's own
+    # statements do not go through it -- see src/steward_queue/_sql.py.
+    "sqlalchemy>=2.0",
 ]
 
 [tool.uv.sources]

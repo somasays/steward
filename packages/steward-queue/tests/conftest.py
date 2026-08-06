@@ -96,14 +96,15 @@ def make_spec(
     payload: dict[str, object] | None = None,
     max_attempts: int = 3,
     task_id: UUID | None = None,
+    budget: RunBudget | None = None,
 ) -> TaskSpec:
-    """A TaskSpec with the fixture budget; the payload defaults to unique."""
+    """A TaskSpec with the fixture budget unless the test needs a tighter one."""
     return TaskSpec(
         task_id=task_id or uuid4(),
         run_id=run,
         task_type=task_type,
         payload=payload if payload is not None else {"echo": "noop"},
-        budget=TEST_BUDGET,
+        budget=budget or TEST_BUDGET,
         max_attempts=max_attempts,
     )
 
@@ -123,6 +124,7 @@ def queued(conn: QueueConnection, run_id: UUID) -> Callable[..., TaskSpec]:
         payload: dict[str, object] | None = None,
         max_attempts: int = 3,
         task_id: UUID | None = None,
+        budget: RunBudget | None = None,
     ) -> TaskSpec:
         spec = make_spec(
             run_id,
@@ -130,6 +132,7 @@ def queued(conn: QueueConnection, run_id: UUID) -> Callable[..., TaskSpec]:
             payload=payload,
             max_attempts=max_attempts,
             task_id=task_id,
+            budget=budget,
         )
         enqueue(conn, spec)
         conn.commit()

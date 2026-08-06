@@ -33,6 +33,7 @@ SELECT_AUDIT_ACTIONS = "SELECT action FROM audit_log ORDER BY id"
 COUNT_TASKS = "SELECT count(*) FROM tasks"
 SELECT_TASK_LAST_ERROR = "SELECT last_error FROM tasks WHERE id = %s"
 SELECT_AUDIT_BEFORE = "SELECT before FROM audit_log WHERE action = %s AND entity_id = %s"
+SELECT_AUDIT_AFTER = "SELECT after FROM audit_log WHERE action = %s AND entity_id = %s"
 SELECT_CHECKPOINT_STATE = "SELECT state FROM checkpoints WHERE task_id = %s AND step = %s"
 
 NO_BACKOFF = timedelta(0)
@@ -181,7 +182,24 @@ class TestLifecycle:
             "task.claimed",
             "task.started",
             "task.succeeded",
+            "run.usage_recorded",
         ]
+
+    def test_run_spend_is_audited_as_a_mutation_of_the_run(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # I7: "how did this run reach its cap" needs a row per increment, on the
+        # run entity -- not one row about the task that caused it.
+        spec = queued()
+        claim(conn, worker_id="w1")
+        complete(conn, succeed(spec, steps=3))
+        conn.commit()
+        before = scalar(conn, SELECT_AUDIT_BEFORE, "run.usage_recorded", str(run_id))
+        after = scalar(conn, SELECT_AUDIT_AFTER, "run.usage_recorded", str(run_id))
+        assert isinstance(before, dict) and isinstance(after, dict)
+        assert before["steps"] == 0
+        assert after["steps"] == 3
+        assert after["task_id"] == str(spec.task_id)
 
     def test_the_audit_row_records_the_state_it_actually_replaced(
         self, conn: QueueConnection, queued: Callable[..., TaskSpec]
@@ -295,6 +313,49 @@ class TestRetryAndDeadLetter:
         task = get_task(conn, spec.task_id)
         assert task is not None and task.state is TaskState.FAILED
         assert "task.failed" in audit_actions(conn)
+
+
+class TestFencing:
+    def test_a_stale_worker_cannot_move_a_task_someone_else_now_holds(
+        self, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """The claim is fenced by worker id, not just by state.
+
+        Worker "a" stalls past its lease, a reaper requeues the task, worker "b"
+        claims it. Without the fence, a's late complete/fail would pass the
+        state check and stomp b's claim while b is still executing it.
+        """
+        spec = queued()
+        claim(conn, worker_id="a", lease=EXPIRED_LEASE)
+        conn.commit()
+        requeue_stale(conn)
+        conn.commit()
+        claim(conn, worker_id="b")
+        conn.commit()
+
+        with pytest.raises(TaskNotClaimable):
+            mark_running(conn, spec.task_id, claimed_by="a")
+        with pytest.raises(TaskNotClaimable):
+            complete(conn, succeed(spec), claimed_by="a")
+        with pytest.raises(TaskNotClaimable):
+            fail(conn, spec.task_id, boom(), claimed_by="a")
+
+        # The holder is unaffected and can still finish it.
+        complete(conn, succeed(spec), claimed_by="b")
+        conn.commit()
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.SUCCEEDED
+
+    def test_an_unfenced_call_still_works_for_a_single_owner(
+        self, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # Orchestrator-side callers that are not workers may omit the token.
+        spec = queued()
+        claim(conn, worker_id="a")
+        complete(conn, succeed(spec))
+        conn.commit()
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.SUCCEEDED
 
 
 class TestLeaseRecovery:

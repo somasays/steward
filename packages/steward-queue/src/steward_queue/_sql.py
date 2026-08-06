@@ -25,18 +25,36 @@ FROM runs
 WHERE id = %(id)s
 """
 
+# `previous` CTEs throughout: `UPDATE ... RETURNING` yields post-update values,
+# and an audit row that reports the state it just wrote as the state it replaced
+# is worse than no audit row. Reading the old value in the same statement also
+# avoids a read-modify-write window that a concurrent writer could slip into.
 UPDATE_RUN_STATUS = """
-UPDATE runs SET status = %(status)s, updated_at = now() WHERE id = %(id)s RETURNING status
+WITH previous AS (
+    SELECT id, status FROM runs WHERE id = %(id)s FOR UPDATE
+)
+UPDATE runs AS r
+SET status = %(status)s, updated_at = now()
+FROM previous AS p
+WHERE r.id = p.id
+RETURNING p.status
 """
 
 ADD_RUN_USAGE = """
-UPDATE runs
-SET used_steps = used_steps + %(steps)s,
-    used_tokens = used_tokens + %(tokens)s,
-    used_cost_usd = used_cost_usd + %(cost_usd)s,
-    used_wall_clock = used_wall_clock + %(wall_clock)s,
+WITH previous AS (
+    SELECT id, used_steps, used_tokens, used_cost_usd, used_wall_clock
+    FROM runs WHERE id = %(id)s FOR UPDATE
+)
+UPDATE runs AS r
+SET used_steps = r.used_steps + %(steps)s,
+    used_tokens = r.used_tokens + %(tokens)s,
+    used_cost_usd = r.used_cost_usd + %(cost_usd)s,
+    used_wall_clock = r.used_wall_clock + %(wall_clock)s,
     updated_at = now()
-WHERE id = %(id)s
+FROM previous AS p
+WHERE r.id = p.id
+RETURNING p.used_steps, p.used_tokens, p.used_cost_usd, p.used_wall_clock,
+          r.used_steps, r.used_tokens, r.used_cost_usd, r.used_wall_clock
 """
 
 INSERT_TASK = """
@@ -61,7 +79,7 @@ WHERE id = %(id)s
 """
 
 SELECT_TASK_ATTEMPTS_FOR_UPDATE = """
-SELECT state, attempts, max_attempts FROM tasks WHERE id = %(id)s FOR UPDATE
+SELECT state, attempts, max_attempts, claimed_by FROM tasks WHERE id = %(id)s FOR UPDATE
 """
 
 SELECT_TASK_RESULT = """
@@ -101,22 +119,25 @@ RETURNING t.id, t.run_id, t.task_type, t.payload, t.attempts, t.max_attempts,
           t.claimed_by, t.lease_expires_at
 """
 
+# The `claimed_by` predicate is a fencing token: a worker whose lease expired and
+# whose task a reaper handed to someone else must not be able to move it. Without
+# it, a stalled worker's late `mark_running`/`complete`/`fail` would silently
+# stomp the claim of the worker now executing the task.
 MARK_RUNNING = """
 UPDATE tasks
 SET state = 'running',
     started_at = COALESCE(started_at, now()),
     lease_expires_at = now() + %(lease)s,
     updated_at = now()
-WHERE id = %(id)s AND state = 'claimed'
+WHERE id = %(id)s
+  AND state = 'claimed'
+  AND (%(claimed_by)s::text IS NULL OR claimed_by = %(claimed_by)s::text)
 RETURNING id, run_id
 """
 
-# The `previous` CTE is how the audit row gets a truthful `before` state:
-# `UPDATE ... RETURNING` yields post-update values, and an audit trail that
-# reports the state it just wrote as the state it replaced is worse than none.
 COMPLETE_TASK = """
 WITH previous AS (
-    SELECT id, state FROM tasks WHERE id = %(id)s
+    SELECT id, state FROM tasks WHERE id = %(id)s FOR UPDATE
 )
 UPDATE tasks AS t
 SET state = 'succeeded',
@@ -126,7 +147,9 @@ SET state = 'succeeded',
     lease_expires_at = NULL,
     updated_at = now()
 FROM previous AS p
-WHERE t.id = p.id AND t.state IN ('claimed', 'running')
+WHERE t.id = p.id
+  AND t.state IN ('claimed', 'running')
+  AND (%(claimed_by)s::text IS NULL OR t.claimed_by = %(claimed_by)s::text)
 RETURNING t.run_id, p.state
 """
 

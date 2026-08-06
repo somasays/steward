@@ -31,7 +31,7 @@ import contextlib
 from collections.abc import Sequence
 from datetime import timedelta
 
-from steward_schemas import ProblemDetails, TaskResult, TaskStatus
+from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskStatus
 
 from steward_queue import queue
 from steward_queue.backoff import DEFAULT_BASE_DELAY, DEFAULT_FACTOR, DEFAULT_MAX_DELAY
@@ -43,11 +43,30 @@ DEFAULT_POLL_INTERVAL = timedelta(milliseconds=200)
 
 HANDLER_FAILED = "handler raised"
 UNKNOWN_TYPE = "no handler registered for task type"
+BUDGET_EXCEEDED = "budget_exceeded"
 
 
 def _problem(title: str, detail: str) -> ProblemDetails:
     """A typed failure record for the `last_error` column (SPEC.md §8)."""
     return ProblemDetails(type="urn:steward:task-failed", title=title, status=500, detail=detail)
+
+
+def _budget_exceeded(budget: RunBudget) -> ProblemDetails:
+    """The typed, visible failure I12 requires when a hard cap is hit.
+
+    Carries the budget it blew as an RFC 9457 extension member (which is why
+    this goes through `model_validate` rather than the constructor), so an
+    operator reading the `last_error` column sees the cap, not just the symptom.
+    """
+    return ProblemDetails.model_validate(
+        {
+            "type": "urn:steward:budget-exceeded",
+            "title": BUDGET_EXCEEDED,
+            "status": 504,
+            "detail": f"wall-clock budget of {budget.wall_clock} exhausted",
+            "budget": budget.model_dump(mode="json"),
+        }
+    )
 
 
 class Worker:
@@ -120,11 +139,17 @@ class Worker:
         return len(recovered)
 
     def _start(self, conn: QueueConnection, task: ClaimedTask) -> None:
-        queue.mark_running(conn, task.spec.task_id, lease=self._lease, actor=self._actor)
+        queue.mark_running(
+            conn,
+            task.spec.task_id,
+            lease=self._lease,
+            claimed_by=self._worker_id,
+            actor=self._actor,
+        )
         conn.commit()
 
     def _succeed(self, conn: QueueConnection, result: TaskResult) -> None:
-        queue.complete(conn, result, actor=self._actor)
+        queue.complete(conn, result, claimed_by=self._worker_id, actor=self._actor)
         conn.commit()
 
     def _fail(self, conn: QueueConnection, task: ClaimedTask, error: ProblemDetails) -> None:
@@ -136,6 +161,7 @@ class Worker:
             base_delay=self._retry_base_delay,
             factor=self._retry_factor,
             max_delay=self._retry_max_delay,
+            claimed_by=self._worker_id,
             actor=self._actor,
         )
         conn.commit()
@@ -170,7 +196,16 @@ class Worker:
             return True
         ctx = TaskContext(connection=conn, spec=task.spec, attempts=task.attempts)
         try:
-            result = await registration.fn(ctx)
+            # I12: the wall-clock cap is enforced here, by the runtime, not left
+            # to handlers to honour. A handler blocked on a dead connection ends
+            # as a typed `budget_exceeded` failure instead of holding this worker
+            # slot until the lease expires. Step/token/cost caps belong to the
+            # agent loop that spends them (steward-agents, M1) -- M0 has no LLM.
+            async with asyncio.timeout(task.spec.budget.wall_clock.total_seconds()):
+                result = await registration.fn(ctx)
+        except TimeoutError:
+            await asyncio.to_thread(self._fail, conn, task, _budget_exceeded(task.spec.budget))
+            return True
         except Exception as exc:
             await asyncio.to_thread(
                 self._fail, conn, task, _problem(HANDLER_FAILED, f"{type(exc).__name__}: {exc}")

@@ -1241,6 +1241,7 @@ source = { editable = "packages/steward-queue" }
 dependencies = [
     { name = "alembic" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "sqlalchemy" },
     { name = "steward-schemas" },
 ]
 
@@ -1248,6 +1249,7 @@ dependencies = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "steward-schemas", editable = "packages/steward-schemas" },
 ]
 

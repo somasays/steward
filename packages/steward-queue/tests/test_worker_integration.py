@@ -26,6 +26,7 @@ from steward_queue import (
 )
 from steward_queue.db import QueueConnection
 from steward_queue.registry import TaskContext
+from steward_queue.worker import BUDGET_EXCEEDED
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
 
 NO_BACKOFF = timedelta(0)
@@ -34,9 +35,13 @@ NO_USAGE = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timede
 
 EXPLODES = "test.explodes_on_demand"
 REPORTS_FAILURE = "test.reports_failure"
+SLEEPS = "test.sleeps"
 UNREGISTERED = "test.unregistered"
 
+TINY_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(milliseconds=20))
+
 SELECT_TASK_RESULT = "SELECT result FROM tasks WHERE id = %s"
+SELECT_TASK_LAST_ERROR = "SELECT last_error FROM tasks WHERE id = %s"
 SELECT_CHECKPOINTS = "SELECT step, state FROM checkpoints WHERE task_id = %s ORDER BY step"
 SELECT_AUDIT_ACTIONS = "SELECT action FROM audit_log WHERE entity_id = %s ORDER BY id"
 
@@ -51,6 +56,18 @@ async def explodes_on_demand(ctx: TaskContext) -> TaskResult:
     if ctx.spec.payload.get("boom"):
         raise RuntimeError("handler exploded")
     write_checkpoint(ctx.connection, ctx.spec.task_id, step=0, state={"boom": False})
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(SLEEPS, sample_payload={"seconds": 0.0})
+async def sleeps(ctx: TaskContext) -> TaskResult:
+    """Burns as much wall clock as the payload asks for, and writes nothing.
+
+    Payload-driven so the sample payload (zero seconds) stays instant and
+    idempotent under H1, while a budget test can ask for more time than the
+    task's `RunBudget.wall_clock` allows.
+    """
+    await asyncio.sleep(float(ctx.spec.payload["seconds"]))
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
 
 
@@ -155,6 +172,34 @@ class TestFailurePaths:
         task = get_task(conn, spec.task_id)
         assert task is not None and task.state is TaskState.DEAD
         assert "task.dead" in audit_actions(conn, spec.task_id)
+
+    async def test_a_handler_that_outruns_its_wall_clock_budget_is_terminated(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # I12: the cap is enforced by the runtime and the failure is typed and
+        # visible -- the task does not sit holding a worker until its lease dies.
+        spec = queued(
+            task_type=SLEEPS,
+            payload={"seconds": 30.0},
+            budget=TINY_WALL_CLOCK,
+            max_attempts=1,
+        )
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.DEAD
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        assert row is not None
+        assert row[0]["title"] == BUDGET_EXCEEDED
+        assert row[0]["budget"]["steps"] == 1  # the cap travels with the problem
+
+    async def test_a_handler_within_its_budget_is_left_alone(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        spec = queued(task_type=SLEEPS, payload={"seconds": 0.0})
+        await Worker(dsn, "w1").run_once()
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.SUCCEEDED
 
     async def test_unknown_task_type_fails_the_task(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]

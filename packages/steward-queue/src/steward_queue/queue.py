@@ -167,17 +167,16 @@ def set_run_status(
     *,
     actor: Actor = SYSTEM_ACTOR,
 ) -> None:
-    before = get_run(conn, run_id)
-    if before is None:
+    row = conn.execute(_sql.UPDATE_RUN_STATUS, {"id": run_id, "status": status.value}).fetchone()
+    if row is None:
         raise LookupError(f"no such run: {run_id}")
-    conn.execute(_sql.UPDATE_RUN_STATUS, {"id": run_id, "status": status.value})
     _audit(
         conn,
         actor=actor,
         action="run.status_changed",
         entity_type=RUN_ENTITY,
         entity_id=str(run_id),
-        before={"status": before.status.value},
+        before={"status": row[0]},
         after={"status": status.value},
     )
 
@@ -195,6 +194,13 @@ def enqueue(
     Returns the id of the task now queued -- `spec.task_id` for a new row, or
     the id of the existing row when `dedup_key` already exists in the run. The
     caller commits; until it does, the task does not exist for any worker.
+
+    On a dedup hit the queued task keeps the payload it was enqueued with and
+    this spec's payload is discarded. With the derived key that is a tautology
+    (the payload is what the key is computed from); with an explicit
+    `dedup_key` it is the caller asserting "these are the same task", so
+    passing one with a payload that differs in a way that matters is a caller
+    bug this function cannot detect.
     """
     key = dedup_key if dedup_key is not None else dedup_key_for(spec.task_type, spec.payload)
     params: dict[str, Any] = {
@@ -288,12 +294,20 @@ def mark_running(
     task_id: UUID,
     *,
     lease: timedelta = DEFAULT_LEASE,
+    claimed_by: str | None = None,
     actor: Actor = SYSTEM_ACTOR,
 ) -> None:
-    """Move a claimed task to `running` and extend its lease."""
-    row = conn.execute(_sql.MARK_RUNNING, {"id": task_id, "lease": lease}).fetchone()
+    """Move a claimed task to `running` and extend its lease.
+
+    `claimed_by` is a fencing token (see `complete`): pass the worker id that
+    claimed the task so a stalled worker cannot move a task a reaper has since
+    handed to someone else.
+    """
+    row = conn.execute(
+        _sql.MARK_RUNNING, {"id": task_id, "lease": lease, "claimed_by": claimed_by}
+    ).fetchone()
     if row is None:
-        raise TaskNotClaimable(f"task {task_id} is not in state claimed")
+        raise TaskNotClaimable(f"task {task_id} is not claimed by {claimed_by or 'any worker'}")
     _audit(
         conn,
         actor=actor,
@@ -305,36 +319,46 @@ def mark_running(
     )
 
 
+def _usage_fields(budget: RunBudget) -> dict[str, Any]:
+    """JSON-safe rendering of a `RunBudget` for an audit payload."""
+    return {
+        "steps": budget.steps,
+        "tokens": budget.tokens,
+        "cost_usd": str(budget.cost_usd),
+        "wall_clock_seconds": budget.wall_clock.total_seconds(),
+    }
+
+
 def complete(
     conn: QueueConnection,
     result: TaskResult,
     *,
+    claimed_by: str | None = None,
     actor: Actor = SYSTEM_ACTOR,
 ) -> None:
     """Record a successful execution and roll its usage up onto the run.
 
     Called on the same connection the handler wrote through, so the handler's
-    effects, the terminal state, the run's cost/token totals and the audit row
-    are one commit (I7, I12).
+    effects, the terminal state, the run's cost/token totals and both audit
+    rows are one commit (I7, I12).
+
+    `claimed_by` is a fencing token. Pass the id of the worker that claimed the
+    task and the transition applies only while that worker still holds it; a
+    worker whose lease expired mid-execution then gets `TaskNotClaimable`
+    instead of silently overwriting the outcome of the worker that took over.
     """
     row = conn.execute(
         _sql.COMPLETE_TASK,
-        {"id": result.task_id, "result": Jsonb(result.model_dump(mode="json"))},
+        {
+            "id": result.task_id,
+            "result": Jsonb(result.model_dump(mode="json")),
+            "claimed_by": claimed_by,
+        },
     ).fetchone()
     if row is None:
-        raise TaskNotClaimable(f"task {result.task_id} is not claimed or running")
+        raise TaskNotClaimable(f"task {result.task_id} is not held by {claimed_by or 'any worker'}")
     run_id: UUID = row[0]
     previous = TaskState(row[1])
-    conn.execute(
-        _sql.ADD_RUN_USAGE,
-        {
-            "id": run_id,
-            "steps": result.usage.steps,
-            "tokens": result.usage.tokens,
-            "cost_usd": result.usage.cost_usd,
-            "wall_clock": result.usage.wall_clock,
-        },
-    )
     _audit(
         conn,
         actor=actor,
@@ -343,6 +367,37 @@ def complete(
         entity_id=str(result.task_id),
         before={"state": previous.value},
         after={"state": TaskState.SUCCEEDED.value},
+    )
+    _record_usage(conn, run_id, result, actor=actor)
+
+
+def _record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, actor: Actor) -> None:
+    """Add a task's usage to its run's totals, audited on the run entity (I7).
+
+    The run's spend is a mutation in its own right -- a reviewer asking "how
+    did this run reach its cap" needs a row per increment, not one row about
+    the task that caused it.
+    """
+    row = conn.execute(
+        _sql.ADD_RUN_USAGE,
+        {
+            "id": run_id,
+            "steps": result.usage.steps,
+            "tokens": result.usage.tokens,
+            "cost_usd": result.usage.cost_usd,
+            "wall_clock": result.usage.wall_clock,
+        },
+    ).fetchone()
+    before = _require_row(row, "run usage update returned no row")
+    _audit(
+        conn,
+        actor=actor,
+        action="run.usage_recorded",
+        entity_type=RUN_ENTITY,
+        entity_id=str(run_id),
+        before=_usage_fields(_budget_from(before[0], before[1], before[2], before[3])),
+        after=_usage_fields(_budget_from(before[4], before[5], before[6], before[7]))
+        | {"task_id": str(result.task_id)},
     )
 
 
@@ -355,6 +410,7 @@ def fail(
     base_delay: timedelta = DEFAULT_BASE_DELAY,
     factor: float = DEFAULT_FACTOR,
     max_delay: timedelta = DEFAULT_MAX_DELAY,
+    claimed_by: str | None = None,
     actor: Actor = SYSTEM_ACTOR,
 ) -> TaskState:
     """Record a failed execution; reschedule it or dead-letter it.
@@ -363,13 +419,19 @@ def fail(
     `now() + retry_delay(attempts)`. The attempt that spends `max_attempts`
     goes to `dead`; a non-retryable failure goes straight to `failed`. Returns
     the state the task landed in.
+
+    `claimed_by` is the same fencing token `complete` takes; the row is read
+    `FOR UPDATE` first, so checking the holder here is as strong as checking it
+    in the `UPDATE` predicate.
     """
     row = conn.execute(_sql.SELECT_TASK_ATTEMPTS_FOR_UPDATE, {"id": task_id}).fetchone()
     if row is None:
         raise LookupError(f"no such task: {task_id}")
-    state, attempts, max_attempts = TaskState(row[0]), row[1], row[2]
+    state, attempts, max_attempts, holder = TaskState(row[0]), row[1], row[2], row[3]
     if state not in (TaskState.CLAIMED, TaskState.RUNNING):
         raise TaskNotClaimable(f"task {task_id} is not claimed or running")
+    if claimed_by is not None and holder != claimed_by:
+        raise TaskNotClaimable(f"task {task_id} is held by {holder!r}, not {claimed_by!r}")
 
     error_json = Jsonb(error.model_dump(mode="json"))
     if retryable and attempts < max_attempts:
