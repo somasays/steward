@@ -32,6 +32,7 @@ from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, Tas
 SELECT_AUDIT_ACTIONS = "SELECT action FROM audit_log ORDER BY id"
 COUNT_TASKS = "SELECT count(*) FROM tasks"
 SELECT_TASK_LAST_ERROR = "SELECT last_error FROM tasks WHERE id = %s"
+SELECT_AUDIT_BEFORE = "SELECT before FROM audit_log WHERE action = %s AND entity_id = %s"
 SELECT_CHECKPOINT_STATE = "SELECT state FROM checkpoints WHERE task_id = %s AND step = %s"
 
 NO_BACKOFF = timedelta(0)
@@ -181,6 +182,18 @@ class TestLifecycle:
             "task.started",
             "task.succeeded",
         ]
+
+    def test_the_audit_row_records_the_state_it_actually_replaced(
+        self, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # Completing straight from `claimed` (no `mark_running`) must not be
+        # audited as if it had replaced `running`.
+        spec = queued()
+        claim(conn, worker_id="w1")
+        complete(conn, succeed(spec))
+        conn.commit()
+        before = scalar(conn, SELECT_AUDIT_BEFORE, "task.succeeded", str(spec.task_id))
+        assert before == {"state": TaskState.CLAIMED.value}
 
     def test_claim_only_returns_requested_task_types(
         self, conn: QueueConnection, queued: Callable[..., TaskSpec]

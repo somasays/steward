@@ -111,16 +111,23 @@ WHERE id = %(id)s AND state = 'claimed'
 RETURNING id, run_id
 """
 
+# The `previous` CTE is how the audit row gets a truthful `before` state:
+# `UPDATE ... RETURNING` yields post-update values, and an audit trail that
+# reports the state it just wrote as the state it replaced is worse than none.
 COMPLETE_TASK = """
-UPDATE tasks
+WITH previous AS (
+    SELECT id, state FROM tasks WHERE id = %(id)s
+)
+UPDATE tasks AS t
 SET state = 'succeeded',
     result = %(result)s,
     last_error = NULL,
     finished_at = now(),
     lease_expires_at = NULL,
     updated_at = now()
-WHERE id = %(id)s AND state IN ('claimed', 'running')
-RETURNING run_id
+FROM previous AS p
+WHERE t.id = p.id AND t.state IN ('claimed', 'running')
+RETURNING t.run_id, p.state
 """
 
 RETRY_TASK = """

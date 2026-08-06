@@ -324,6 +324,7 @@ def complete(
     if row is None:
         raise TaskNotClaimable(f"task {result.task_id} is not claimed or running")
     run_id: UUID = row[0]
+    previous = TaskState(row[1])
     conn.execute(
         _sql.ADD_RUN_USAGE,
         {
@@ -340,7 +341,7 @@ def complete(
         action="task.succeeded",
         entity_type=TASK_ENTITY,
         entity_id=str(result.task_id),
-        before={"state": TaskState.RUNNING.value},
+        before={"state": previous.value},
         after={"state": TaskState.SUCCEEDED.value},
     )
 
