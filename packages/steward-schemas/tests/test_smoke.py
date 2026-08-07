@@ -1,5 +1,6 @@
 """Smoke test: the package imports and its public surface is well-formed."""
 
+import pytest
 import steward_schemas
 
 
@@ -7,9 +8,9 @@ def test_importable() -> None:
     assert "RunBudget" in steward_schemas.__all__
 
 
-def test_all_exports_resolve() -> None:
-    for name in steward_schemas.__all__:
-        assert hasattr(steward_schemas, name)
+@pytest.mark.parametrize("name", steward_schemas.__all__)
+def test_export_resolves(name: str) -> None:
+    assert hasattr(steward_schemas, name)
 
 
 def test_contracts_registry_exported() -> None:

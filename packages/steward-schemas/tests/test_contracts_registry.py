@@ -1,13 +1,15 @@
 """CONTRACTS registry: every published contract generates a JSON Schema that
-round-trips through JSON (issue #2 acceptance criteria; feeds the future S6
+round-trips through JSON (issue #2 acceptance criteria; feeds the S6
 contract-compatibility check, GUARDRAILS.md).
 
-Plain `test_*` functions, no third-party test framework import — see the
-note in test_roundtrip.py (I4, enforced by S1 across this whole package).
+Uses pytest.mark.parametrize: S1 (GUARDRAILS.md) scopes the schemas
+independence contract to the installed package (`src/`), not `tests/`
+(issue #12), so tests are free to import pytest (issue #13).
 """
 
 import json
 
+import pytest
 from steward_schemas import CONTRACTS
 
 
@@ -16,16 +18,16 @@ def test_contracts_registry_is_nonempty() -> None:
     assert len(CONTRACTS) == 10
 
 
-def test_every_contract_json_schema_roundtrips() -> None:
-    for name in sorted(CONTRACTS):
-        model_cls = CONTRACTS[name]
-        schema = model_cls.model_json_schema()
-        restored = json.loads(json.dumps(schema))
-        assert restored == schema, name
+@pytest.mark.parametrize("name", sorted(CONTRACTS))
+def test_contract_json_schema_roundtrips(name: str) -> None:
+    model_cls = CONTRACTS[name]
+    schema = model_cls.model_json_schema()
+    restored = json.loads(json.dumps(schema))
+    assert restored == schema
 
 
-def test_every_contract_schema_title_matches_class() -> None:
-    for name in sorted(CONTRACTS):
-        model_cls = CONTRACTS[name]
-        schema = model_cls.model_json_schema()
-        assert schema["title"] == model_cls.__name__, name
+@pytest.mark.parametrize("name", sorted(CONTRACTS))
+def test_contract_schema_title_matches_class(name: str) -> None:
+    model_cls = CONTRACTS[name]
+    schema = model_cls.model_json_schema()
+    assert schema["title"] == model_cls.__name__
