@@ -23,6 +23,7 @@ Every change follows this cycle:
 6. **Prove it.** When acceptance criteria are met, produce a proof entry: the claim, the exact command to reproduce it, and the observed result. No adjectives — if it can't be demonstrated by a command, test, eval score, or CI run, it doesn't go in.
    **Where it goes depends on who you are.** Working solo on a branch, append it to `PROOFS.md` directly. Working as a dispatched agent (or alongside one), put it in the **PR body** instead and leave `PROOFS.md` untouched — concurrent branches all appending to one table conflict every time. The maintainer appends PR-body rows to `PROOFS.md` on merge, so the evidence still lands; the ledger just has a single writer. A branch instruction saying "do not edit PROOFS.md" is this rule, not a violation of it — reviewers should not flag it as one.
 7. **PR** with: what changed, which invariants were touched, evidence. Close the issue via `Closes #N`.
+   **Open the PR before waiting on CI, not after.** Push, dispatch CI, open the PR immediately, then wait. A branch with green CI and no PR is invisible work — three dispatched agents have ended mid-wait with nothing to review.
 
 ## Non-negotiables
 
