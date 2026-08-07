@@ -1,11 +1,12 @@
 {
   "_doc": "File dependency graph (S7). When a file matching a key changes, every listed dependent must be updated or explicitly verified unaffected — that propagation is workflow law (CLAUDE.md). S7 mechanically enforces coverage: every tracked file must match at least one key or leaf pattern, so new files cannot exist outside the graph. Patterns are fnmatch globs against repo-relative paths.",
   "edges": {
-    "ARCHITECTURE.md": ["GUARDRAILS.md", "SPEC.md", "CLAUDE.md", "README.md", ".claude/agents/*", "PROOFS.md"],
+    "ARCHITECTURE.md": ["GUARDRAILS.md", "SPEC.md", "CLAUDE.md", "README.md", "VALUE.md", ".claude/agents/*", "PROOFS.md"],
     "GUARDRAILS.md": ["scripts/fitness/*", "CLAUDE.md", "README.md", ".claude/agents/architecture-guardian.md", "Makefile", ".githooks/*", "PROOFS.md"],
-    "SPEC.md": ["ARCHITECTURE.md", "GUARDRAILS.md", "README.md", "PROOFS.md"],
+    "SPEC.md": ["ARCHITECTURE.md", "GUARDRAILS.md", "README.md", "VALUE.md", "PROOFS.md"],
     "CLAUDE.md": [".claude/agents/*", "README.md"],
     "README.md": ["PROOFS.md"],
+    "VALUE.md": ["README.md", "ARCHITECTURE.md", "SPEC.md"],
     "PROOFS.md": [],
     "scripts/fitness/*": ["GUARDRAILS.md", "Makefile", ".github/workflows/*", "PROOFS.md"],
     "scripts/demo/*": ["DEMO.md", "Makefile", "PROOFS.md"],
