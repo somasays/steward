@@ -91,13 +91,60 @@ def _diff_schema_breaking(old: Any, new: Any, pointer: str = "") -> List[Tuple[s
     return findings
 
 
+def _diff_operation_breaking(old_op: JSONDict, new_op: JSONDict, pointer: str) -> List[Tuple[str, str]]:
+    """Breaking differences on a single operation object that the generic
+    schema differ can't see: inline `parameters` (path/query/header/cookie
+    -- FastAPI emits these directly on the operation, not via `$ref`, so a
+    removed or newly-required path param would otherwise pass silently) and
+    inline `requestBody` media-type schemas."""
+    findings: List[Tuple[str, str]] = []
+
+    def _param_key(p: JSONDict) -> Tuple[Any, Any]:
+        return (p.get("name"), p.get("in"))
+
+    old_params = {_param_key(p): p for p in (old_op.get("parameters") or []) if isinstance(p, dict)}
+    new_params = {_param_key(p): p for p in (new_op.get("parameters") or []) if isinstance(p, dict)}
+    for key in sorted(old_params, key=repr):
+        label = f"{pointer}/parameters/{key[1]}.{key[0]}"
+        if key not in new_params:
+            findings.append((label, "removed parameter"))
+            continue
+        old_p, new_p = old_params[key], new_params[key]
+        if bool(old_p.get("required")) is False and bool(new_p.get("required")) is True:
+            findings.append((label, "parameter newly required"))
+        findings.extend(_diff_schema_breaking(old_p.get("schema"), new_p.get("schema"), f"{label}/schema"))
+    for key in sorted(set(new_params) - set(old_params), key=repr):
+        if new_params[key].get("required") is True:
+            findings.append((f"{pointer}/parameters/{key[1]}.{key[0]}", "new required parameter"))
+
+    old_content = ((old_op.get("requestBody") or {}).get("content")) or {}
+    new_content = ((new_op.get("requestBody") or {}).get("content")) or {}
+    for media in sorted(old_content):
+        label = f"{pointer}/requestBody/content/{media}"
+        if media not in new_content:
+            findings.append((label, "removed request media type"))
+            continue
+        findings.extend(_diff_schema_breaking(
+            (old_content[media] or {}).get("schema"), (new_content[media] or {}).get("schema"), f"{label}/schema"))
+
+    return findings
+
+
 def _diff_openapi_breaking(old: JSONDict, new: JSONDict) -> List[Tuple[str, str]]:
     """Breaking differences at the OpenAPI level: removed path, removed
-    method on a surviving path, and (via the schema differ) removed/changed
-    fields on `components.schemas` entries -- the same models published in
+    method on a surviving path, removed/newly-required/type-changed inline
+    parameters and request bodies on a surviving method (`_diff_operation_
+    breaking`), and (via the schema differ) removed/changed fields on
+    `components.schemas` entries -- the same models published in
     contracts/schemas/, so this mostly reconfirms them under their spec
-    names, plus catches path/method removal that the schema snapshots
-    can't see."""
+    names, plus catches path/method removal the schema snapshots can't see.
+
+    Known conservative bound: response-body schemas aren't diffed here --
+    a narrower response is a break for consumers too, but producers loosen
+    responses far more often than they break them, and every response
+    schema in this API is a `$ref` into `components.schemas`, which the
+    walk below already covers. Inline (non-`$ref`) response schemas would
+    slip through; none exist in this API today."""
     findings: List[Tuple[str, str]] = []
 
     old_paths = old.get("paths") if isinstance(old.get("paths"), dict) else {}
@@ -106,10 +153,13 @@ def _diff_openapi_breaking(old: JSONDict, new: JSONDict) -> List[Tuple[str, str]
         if path not in new_paths:
             findings.append((f"/paths{path}", "removed path"))
             continue
-        old_methods = {k for k in old_paths[path] if k in HTTP_METHODS}
-        new_methods = {k for k in new_paths[path] if k in HTTP_METHODS}
-        for method in sorted(old_methods - new_methods):
+        old_methods = {k: v for k, v in old_paths[path].items() if k in HTTP_METHODS}
+        new_methods = {k: v for k, v in new_paths[path].items() if k in HTTP_METHODS}
+        for method in sorted(set(old_methods) - set(new_methods)):
             findings.append((f"/paths{path}/{method}", "removed method"))
+        for method in sorted(set(old_methods) & set(new_methods)):
+            findings.extend(_diff_operation_breaking(
+                old_methods[method], new_methods[method], f"/paths{path}/{method}"))
 
     old_schemas = (old.get("components") or {}).get("schemas")
     old_schemas = old_schemas if isinstance(old_schemas, dict) else {}
@@ -318,6 +368,26 @@ def _selftest() -> int:
         ok = False
     else:
         print("selftest: removed OpenAPI method correctly classified breaking")
+
+    # 7. removed inline path parameter -> breaking (FastAPI emits these
+    # directly on the operation, not via $ref -- the schema differ alone
+    # can't see them)
+    old_api_param: JSONDict = {
+        "paths": {"/v1/runs/{run_id}": {"get": {
+            "parameters": [{"name": "run_id", "in": "path", "required": True,
+                             "schema": {"type": "string"}}]}}},
+        "components": {"schemas": {}},
+    }
+    new_api_param_removed: JSONDict = {
+        "paths": {"/v1/runs/{run_id}": {"get": {"parameters": []}}},
+        "components": {"schemas": {}},
+    }
+    status, items = _classify(old_api_param, new_api_param_removed, _diff_openapi_breaking)
+    if status != "breaking" or not any("removed parameter" in m for _, m in items):
+        print(f"selftest FAIL: removed path parameter expected breaking, got {status} {items}")
+        ok = False
+    else:
+        print("selftest: removed inline path parameter correctly classified breaking")
 
     print(f"S6 selftest: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
