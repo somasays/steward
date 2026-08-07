@@ -165,6 +165,11 @@ class Worker:
         loop was not already going to pay: the next interval is a bounded
         retry it runs anyway, and every other worker's own reaper covers the
         same stale tasks in the meantime (N1, P4).
+
+        Scoped to `OperationalError` deliberately, not `psycopg.Error`: this is
+        the connection-refusal shape #56 is about, and a broader catch would
+        also swallow a genuine bug in `requeue_stale`'s SQL (a `ProgrammingError`)
+        every interval instead of surfacing it.
         """
         while not stop.is_set():
             with contextlib.suppress(psycopg.OperationalError):
@@ -312,9 +317,10 @@ class Worker:
         A task IS claimed by the time this runs, unlike `_claim`, which has
         none to answer for -- so a connection this worker cannot open here is
         not left to kill the worker (#56, SPEC.md §13 D7). `_connect_for_execute`
-        retries briefly; if the pool stays out of room past that, the attempt
-        is left `running` for `requeue_stale` rather than recorded, because
-        there is no connection left to record it on.
+        retries briefly; if the pool stays out of room past that, `mark_running`
+        never runs, so the row is left `claimed` -- not `running` -- for
+        `requeue_stale` rather than recorded, because there is no connection
+        left to record it on.
         """
         conn = await asyncio.to_thread(self._connect_for_execute)
         if conn is None:
@@ -343,9 +349,12 @@ class Worker:
         finds it instead of taking the worker down over a task it already
         owns. The retry is aimed at the shape #56 found still reachable after
         #45 -- losing a race for the last slot in the pool, not genuine
-        `max_connections` exhaustion -- so it stays short: a few attempts a
-        few hundred milliseconds apart, a fraction of a poll interval and
-        nowhere near a task's lease.
+        `max_connections` exhaustion -- so it stays short: `CONNECT_RETRY_ATTEMPTS`
+        attempts, `CONNECT_RETRY_DELAY` apart. The worst case (every attempt
+        refused) is on the order of one poll interval, not a fraction of
+        one -- it can delay how promptly `run_once` returns and `run_forever`
+        rechecks `stop` by about that much -- but it is nowhere near a task's
+        multi-minute lease, which is the bound that actually matters here.
 
         Always called off the event loop (`execute` runs it via `to_thread`),
         so the retry's `time.sleep` blocks only this thread. `None` tells the
