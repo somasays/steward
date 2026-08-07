@@ -130,6 +130,7 @@ The repo is a `uv` workspace with independently importable packages — the same
 packages/
   steward-schemas/     # Pydantic models: API contracts, tool I/O, events (zero heavy deps)
   steward-queue/       # Postgres task queue: migrations, transactional enqueue, SKIP LOCKED claiming, worker loop
+  steward-orchestration/ # Goal registry + deterministic planners: name, input schema, planner, allowed task types, budget
   steward-agents/      # Agent runtime: owned contracts (tools, budgets, results); LangGraph contained here
   steward-retrieval/   # Hybrid search client: Qdrant + ES + fusion + rerank
   steward-llm/         # Thin LiteLLM client wrapper: typed completions, structured output helpers
@@ -152,8 +153,8 @@ The runtime has two layers with different ownership rules (see [D1](#13-key-desi
 
 ### 3.1 Execution model: planner / worker
 
-- A **run** is created from a goal (e.g. `scan_source(source_id)`, `answer(question)`).
-- The **planner** (deterministic code for well-known goals; LLM-planned only for `ask` runs) expands the goal into a **task DAG**. Example for `scan_source`:
+- A **run** is created from a goal (e.g. `scan_source(source_id)`, `answer(question)`). Goals are registered, one site each, in `steward-orchestration`: name, typed input schema, planner, allowed task types, budget policy. The API validates the request against that registration before a run row exists — an unknown goal or a payload the schema rejects is problem-details, not a run (issue #19).
+- The **planner** (deterministic code for well-known goals; LLM-planned only for `ask` runs) expands the goal into a **task DAG**, and may only name task types its registration allows. Example for `scan_source`:
 
 ```
 discover_schema ──► profile_table (×N, fan-out per table)
@@ -329,7 +330,7 @@ GET    /v1/runs/{id}                     # status, task tree, cost, trace link
 POST   /v1/runs/{id}:cancel
 ```
 
-`POST /v1/runs` is M0's entry point: a generic `{goal, payload}` body returning 202. The run row and its first task are written in one transaction (I8), so a 202 is a guarantee that work is queued, not a promise to queue it later; a worker then executes the task and the run's status follows its tasks (`pending → running → succeeded|failed`) in the transaction that settles the last one. M0 expands every goal to a single `noop` task — the deterministic planner that turns a goal into a task DAG (§3.1) lands in M1 and replaces that expansion, not the endpoint. Goal-specific endpoints (`POST /v1/sources/{id}/scan`, above) land in M1 and are expected to become the primary way runs get created; whether `POST /v1/runs` stays as a generic escape hatch or narrows to goal-specific endpoints only is an open question for that milestone.
+`POST /v1/runs` is M0's entry point: a generic `{goal, payload}` body returning 202. The run row and the tasks its goal plans are written in one transaction (I8), so a 202 is a guarantee that work is queued, not a promise to queue it later; a worker then executes the task and the run's status follows its tasks (`pending → running → succeeded|failed`) in the transaction that settles the last one. The expansion is the goal registry's (§3.1): the endpoint validates `goal` and `payload` against the registration and rejects anything unregistered or schema-invalid with problem details before a run exists (#19). Goal-specific endpoints (`POST /v1/sources/{id}/scan`, above) land in M1 and are expected to become the primary way runs get created; whether `POST /v1/runs` stays as a generic escape hatch or narrows to goal-specific endpoints only is an open question for that milestone.
 
 The published run contract is a **projection**, not the row: `Run` (id, goal, payload, status, trace id, budget, usage, timestamps) is built from the `runs` record by the API service, so storage can change without that being an API change (I3, N9). Every run carries a Langfuse trace id from creation, generated locally and stored on the row whether or not tracing credentials are configured — so a run is always correlatable and no deployment depends on an observability account to function (I7).
 
