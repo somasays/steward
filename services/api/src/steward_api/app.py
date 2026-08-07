@@ -1,4 +1,4 @@
-"""FastAPI application factory (SPEC.md §8; issue #4)."""
+"""FastAPI application factory (SPEC.md §8; issues #4 and #5)."""
 
 from __future__ import annotations
 
@@ -11,9 +11,14 @@ from steward_api.store import InMemoryRunStore, RunStore
 
 
 def create_app(run_store: RunStore | None = None) -> FastAPI:
-    """Build the API app. `run_store` defaults to the M0 in-memory
-    implementation; tests and issue #5's queue-backed store both pass their
-    own `RunStore` here instead of reaching into app internals."""
+    """Build the API app around a `RunStore`.
+
+    The default is the in-memory store, which is what the OpenAPI export and
+    the HTTP-layer tests need: both must build the app without a database.
+    Every deployment passes a `PostgresRunStore` instead -- see
+    `steward_api.__main__`, which is the composition root and the only place
+    that reads the environment.
+    """
 
     app = FastAPI(title="Steward API", version="0.1.0")
     install_problem_details(app)

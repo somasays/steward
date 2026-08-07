@@ -20,9 +20,9 @@ from steward_schemas import (
     AssetType,
     Column,
     ProblemDetails,
-    Run,
     RunBudget,
     RunCreate,
+    RunResponse,
     RunStatus,
     Source,
     SourceEngine,
@@ -149,12 +149,15 @@ def build_run_create() -> RunCreate:
     return RunCreate(goal="scan_source", payload={"source_id": "22222222-2222-2222-2222-222222222222"})
 
 
-def build_run() -> Run:
-    return Run(
+def build_run_response() -> RunResponse:
+    return RunResponse(
         id=UUID("77777777-7777-7777-7777-777777777777"),
         goal="scan_source",
         payload={"source_id": "22222222-2222-2222-2222-222222222222"},
         status=RunStatus.PENDING,
+        trace_id="0123456789abcdef0123456789abcdef",
+        budget=build_run_budget(),
+        usage=RunBudget(steps=0, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(0)),
         created_at=NOW,
         updated_at=NOW,
     )
@@ -208,8 +211,8 @@ def test_run_create_roundtrips() -> None:
     _roundtrips(build_run_create())
 
 
-def test_run_roundtrips() -> None:
-    _roundtrips(build_run())
+def test_run_response_roundtrips() -> None:
+    _roundtrips(build_run_response())
 
 
 def test_problem_details_extension_member_survives_roundtrip() -> None:
@@ -234,7 +237,7 @@ def test_all_contract_samples_roundtrip() -> None:
         "agent_spec": build_agent_spec(),
         "problem_details": build_problem_details(),
         "run_create": build_run_create(),
-        "run": build_run(),
+        "run_response": build_run_response(),
     }
     assert set(samples) == set(CONTRACTS)
     for name, model in samples.items():

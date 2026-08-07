@@ -50,47 +50,38 @@
         "title": "ProblemDetails",
         "type": "object"
       },
-      "Run": {
+      "RunBudget": {
         "additionalProperties": false,
-        "description": "An agent run record (SPEC.md \u00a77: \"runs -- agent run records (goal,\nstatus, cost, token totals, langfuse trace id)\").",
+        "description": "Hard caps on one bounded agent run or task.\n\nAlso reused by `TaskResult.usage` to report what was actually consumed\n(ARCHITECTURE.md I12; SPEC.md \u00a73.2) \u2014 same shape, no separate type needed\nfor \"amount spent\" vs. \"amount allowed\".",
         "properties": {
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
+          "cost_usd": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Cost Usd",
             "type": "string"
           },
-          "goal": {
-            "title": "Goal",
-            "type": "string"
+          "steps": {
+            "minimum": 0.0,
+            "title": "Steps",
+            "type": "integer"
           },
-          "id": {
-            "format": "uuid",
-            "title": "Id",
-            "type": "string"
+          "tokens": {
+            "minimum": 0.0,
+            "title": "Tokens",
+            "type": "integer"
           },
-          "payload": {
-            "additionalProperties": true,
-            "title": "Payload",
-            "type": "object"
-          },
-          "status": {
-            "$ref": "#/components/schemas/RunStatus"
-          },
-          "updated_at": {
-            "format": "date-time",
-            "title": "Updated At",
+          "wall_clock": {
+            "format": "duration",
+            "title": "Wall Clock",
             "type": "string"
           }
         },
         "required": [
-          "id",
-          "goal",
-          "payload",
-          "status",
-          "created_at",
-          "updated_at"
+          "steps",
+          "tokens",
+          "cost_usd",
+          "wall_clock"
         ],
-        "title": "Run",
+        "title": "RunBudget",
         "type": "object"
       },
       "RunCreate": {
@@ -113,8 +104,64 @@
         "title": "RunCreate",
         "type": "object"
       },
+      "RunResponse": {
+        "additionalProperties": false,
+        "description": "The API's projection of a run (SPEC.md \u00a78: \"status, task tree, cost,\ntrace link\").\n\n`trace_id` is not optional: a run always has one, generated when the run\nrow is written and independent of whether any tracing backend is\nconfigured (I7). `budget` and `usage` ship together so a caller can see how\nclose a run is to its caps without a second request (I12); the task tree\nlands with the orchestrator in M1.",
+        "properties": {
+          "budget": {
+            "$ref": "#/components/schemas/RunBudget"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "goal": {
+            "title": "Goal",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatus"
+          },
+          "trace_id": {
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/RunBudget"
+          }
+        },
+        "required": [
+          "id",
+          "goal",
+          "payload",
+          "status",
+          "trace_id",
+          "budget",
+          "usage",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "RunResponse",
+        "type": "object"
+      },
       "RunStatus": {
-        "description": "Lifecycle of a `Run` (SPEC.md \u00a77). The M0 in-memory store only ever\nproduces `PENDING`; the remaining states are driven by the orchestrator\nonce a run is actually executed (issue #5 onward).",
+        "description": "Lifecycle of a run (SPEC.md \u00a77).\n\nA run is `PENDING` until a worker starts its first task, `RUNNING` while\nany task is in flight, and terminal once every task is terminal: `FAILED`\nif any task failed or dead-lettered, `SUCCEEDED` otherwise. `CANCELLED` is\noperator-driven and is never entered by the rollup.\n\nThe queue's `tasks.state` machine is a different, finer thing (claimed,\nleases, attempts); these five are the run-level states the API publishes.",
         "enum": [
           "pending",
           "running",
@@ -194,7 +241,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Run"
+                  "$ref": "#/components/schemas/RunResponse"
                 }
               }
             },
@@ -237,7 +284,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Run"
+                  "$ref": "#/components/schemas/RunResponse"
                 }
               }
             },

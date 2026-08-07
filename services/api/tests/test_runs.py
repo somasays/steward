@@ -1,3 +1,4 @@
+import re
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -14,6 +15,15 @@ def test_create_run_returns_202_with_run_id(client: TestClient) -> None:
     assert body["status"] == "pending"
     assert "id" in body
     assert resp.headers["location"] == f"/v1/runs/{body['id']}"
+
+
+def test_a_created_run_is_traceable_and_bounded(client: TestClient) -> None:
+    # I7 and I12 are visible in the contract, not just in the database: a
+    # client can always name the trace, and can always see the caps.
+    body = client.post("/v1/runs", json={"goal": "scan_source"}).json()
+    assert re.fullmatch(r"[0-9a-f]{32}", body["trace_id"])
+    assert body["budget"]["steps"] > 0
+    assert body["usage"]["steps"] == 0
 
 
 def test_get_run_returns_created_run(client: TestClient) -> None:

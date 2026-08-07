@@ -16,7 +16,7 @@ from steward_schemas.asset import Asset, AssetLifecycle, AssetType
 from steward_schemas.budget import RunBudget
 from steward_schemas.column import Column
 from steward_schemas.errors import ProblemDetails
-from steward_schemas.run import Run, RunCreate, RunStatus
+from steward_schemas.run import RunCreate, RunResponse, RunStatus
 from steward_schemas.source import Source, SourceEngine
 from steward_schemas.task import TaskResult, TaskSpec, TaskStatus
 
@@ -28,9 +28,9 @@ __all__ = [
     "AssetType",
     "Column",
     "ProblemDetails",
-    "Run",
     "RunBudget",
     "RunCreate",
+    "RunResponse",
     "RunStatus",
     "Source",
     "SourceEngine",
@@ -49,5 +49,5 @@ CONTRACTS: dict[str, type[BaseModel]] = {
     "agent_spec": AgentSpec,
     "problem_details": ProblemDetails,
     "run_create": RunCreate,
-    "run": Run,
+    "run_response": RunResponse,
 }
