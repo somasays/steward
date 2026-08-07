@@ -293,6 +293,18 @@ def registered_goals() -> tuple[str, ...]:
     return tuple(sorted(REGISTRY))
 
 
+def unregister(name: str) -> None:
+    """Undo `name`'s registration. Test-only teardown, never called by product
+    code -- `goal()` is the one way in, this is the deliberate way back out.
+
+    Exists so a test that registers a throwaway goal to exercise a rejection
+    path (in this package or another) has a public way to clean up after
+    itself, rather than reaching into `REGISTRY` -- deliberately not
+    re-exported -- directly.
+    """
+    del REGISTRY[name]
+
+
 def plan_run(name: str, payload: Mapping[str, Any]) -> RunPlan:
     """The plan for `name` and `payload` -- the admission decision, whole.
 

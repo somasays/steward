@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 from steward_api.app import create_app
 from steward_api.store import PostgresRunStore
 from steward_orchestration import NOOP_BUDGET, GoalParams, PlannedTask
-from steward_orchestration.registry import REGISTRY, goal
+from steward_orchestration.registry import goal, unregister
 from steward_queue import connect, upgrade_to_head
 from steward_queue.db import QueueConnection
 from steward_schemas import RunBudget
@@ -99,7 +99,7 @@ def plans_nothing_goal() -> Iterator[str]:
     try:
         yield EMPTY_PLAN_GOAL
     finally:
-        del REGISTRY[EMPTY_PLAN_GOAL]
+        unregister(EMPTY_PLAN_GOAL)
 
 
 def _counts(conn: QueueConnection) -> tuple[int, int]:
