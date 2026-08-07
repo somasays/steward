@@ -348,4 +348,5 @@ if __name__ == "__main__":
     for f in result.findings:
         print(f"{f.path}:{f.line}: {f.message}")
     print(f"S5 {result.status} ({result.detail})")
-    sys.exit(1 if result.status == "FAIL" else 0)
+    # 0 PASS / 1 FAIL / 2 SKIP — see run.py::_script_or_pending.
+    sys.exit({"PASS": 0, "FAIL": 1, "SKIP": 2}[result.status])

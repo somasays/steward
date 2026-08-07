@@ -11,7 +11,12 @@ jobs:
     name: fitness gate (GUARDRAILS.md)
     runs-on: ubuntu-latest
     steps:
+      # Full history: S6 compares the exported contracts against the snapshot at the
+      # baseline commit (PR base sha, or the merge-base with the default branch). At
+      # depth 1 neither object is in the checkout and S6 FAILs "baseline unresolved".
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
