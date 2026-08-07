@@ -271,7 +271,10 @@ def _declared_contracts(text: str) -> FrozenSet[str]:
     header/separator rows without special-casing them). An incomplete row --
     a contract named with no ground, migration note, or decision -- declares
     nothing: completeness is what makes a declaration a decision instead of
-    a loophole."""
+    a loophole. A cell containing a literal `|` also parses as incomplete
+    (splits into more than 4 cells) -- fails closed, since the contract then
+    still shows up as an undeclared break rather than a silently-accepted
+    one."""
     declared: set = set()
     for line in text.splitlines():
         stripped = line.strip()
