@@ -967,7 +967,7 @@
                 }
               }
             },
-            "description": "Idempotency key reused with a different request"
+            "description": "Idempotency key reused with a different request, or answered by a run already carrying a different key of its own"
           },
           "422": {
             "content": {

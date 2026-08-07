@@ -23,6 +23,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -34,8 +35,9 @@ from fastapi.testclient import TestClient
 from steward_api.app import create_app
 from steward_api.catalog import PostgresCatalogStore
 from steward_api.store import PostgresRunStore
-from steward_queue import Worker, connect, upgrade_to_head
+from steward_queue import Worker, connect, create_run, upgrade_to_head
 from steward_queue.db import QueueConnection
+from steward_schemas import RunBudget
 
 pytestmark = pytest.mark.acceptance
 
@@ -351,6 +353,95 @@ def test_a_key_bound_to_a_different_source_still_409s_while_the_other_scan_is_in
     assert conflict.status_code == 409
     assert conflict.json()["instance"] == f"/v1/runs/{owner.json()['id']}"
     assert scalar(conn, COUNT_RUNS) == 2  # no run was created or rebound for the conflict
+
+
+def test_a_second_key_answered_by_single_flight_is_rejected_not_silently_accepted(
+    client: TestClient, conn: QueueConnection, registered: str
+) -> None:
+    """Issue #47. A run stores one key: single-flight answering a second,
+    distinct key with the run someone else's request already keyed cannot
+    also bind that key, and pre-#47 it did not try -- it returned 202 and
+    threw the key away, so a later replay under it alone found nothing in
+    flight and started a second scan. That must now be an explicit `409`,
+    not a silent 202, and the original key must be unaffected."""
+    first = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k1"})
+    assert first.status_code == 202
+    run_id = first.json()["id"]
+
+    second = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k2"})
+
+    assert second.status_code == 409
+    assert second.json()["type"] == "urn:steward:idempotency-key-unbindable"
+    assert second.json()["instance"] == f"/v1/runs/{run_id}"
+    assert scalar(conn, COUNT_RUNS) == 1  # nothing was created for the rejected key
+
+    # k1 still finds the run it was bound to -- rejecting k2 did not disturb it.
+    replay = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k1"})
+    assert (replay.status_code, replay.json()["id"]) == (202, run_id)
+    assert scalar(conn, COUNT_RUNS) == 1
+
+
+def test_the_rejected_key_is_rejected_again_while_still_in_flight(
+    client: TestClient, conn: QueueConnection, registered: str
+) -> None:
+    """Rejection is not a one-time slip either -- replaying the same
+    unbindable key while the run is still in flight gets the same `409`
+    every time, not 202 on some attempts and 409 on others."""
+    client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k1"})
+
+    first_reject = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k2"})
+    second_reject = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k2"})
+
+    assert first_reject.status_code == second_reject.status_code == 409
+    assert scalar(conn, COUNT_RUNS) == 1
+
+
+def test_a_rejected_key_replayed_after_completion_starts_a_new_scan(
+    client: TestClient, conn: QueueConnection, dsn: str, registered: str
+) -> None:
+    """The documented consequence of rejecting rather than recording (SPEC.md
+    §8): a key that never bound to anything is indistinguishable, later,
+    from a client that never sent a key at all. This is not the #44 bug --
+    the client was told at the time, with a 409, that this key would not
+    converge -- but it is a real deviation from "a key always finds its run"
+    and has to be true on purpose, not by accident."""
+    first = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k1"})
+    run_id = first.json()["id"]
+    rejected = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k2"})
+    assert rejected.status_code == 409
+    drain(client, Worker(dsn, "m1-acceptance-worker"), run_id)
+
+    replay = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "k2"})
+
+    assert replay.status_code == 202
+    assert replay.json()["id"] != run_id
+    assert scalar(conn, COUNT_RUNS) == 2
+
+
+def test_the_conflict_check_distinguishes_goal_as_well_as_payload(
+    client: TestClient, conn: QueueConnection, registered: str
+) -> None:
+    """Issue #47's other fix: the conflict check used to compare payload
+    alone, so a key already bound to a run of a *different goal* that
+    happened to share this payload shape would read as "the same request"
+    and be accepted -- unreachable today (this endpoint only ever plans
+    `scan_source`), but only because nothing else shares the key space yet."""
+    payload = {"source_id": registered}
+    budget = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(minutes=5))
+    create_run(
+        conn,
+        goal="other_goal",
+        payload=payload,
+        budget=budget,
+        idempotency_key="cross-goal",
+    )
+    conn.commit()
+
+    conflict = client.post(f"/v1/sources/{registered}/scan", headers={"Idempotency-Key": "cross-goal"})
+
+    assert conflict.status_code == 409
+    assert conflict.json()["type"] == "urn:steward:idempotency-key-reused"
+    assert scalar(conn, COUNT_RUNS) == 1  # the other-goal run only, nothing scan-shaped created
 
 
 def scalar(conn: QueueConnection, sql: str) -> object:

@@ -97,6 +97,39 @@ class SourceNotFound(LookupError):
         self.source_id = source_id
 
 
+class IdempotencyKeyUnbindable(Exception):
+    """An idempotency key answered by single-flight could not be attached to
+    the run it named, because that run already carries a different key of
+    its own (issue #47).
+
+    `runs.bind_idempotency_key` stores exactly one key per run -- a schema
+    limit, not a bug -- so a second, independent request racing its own key
+    against a run someone else's request already keyed has nowhere to put
+    it. Silently returning the run anyway (the pre-#47 behaviour) told the
+    client its key would find this run again; it would not, because nothing
+    ever recorded it. This is the alternative issue #47 chose over a
+    key-to-run mapping table: refuse the key outright, at the moment it
+    fails to bind, rather than accept it with a guarantee the schema cannot
+    keep.
+
+    A `409`, same as `IdempotencyKeyReused`, but a different cause: the
+    request named the *same* source as the run single-flight found -- this
+    is not a client sending a key to the wrong place, it is two legitimate
+    requests for the same work whose keys cannot both be remembered. Nothing
+    is written for this key: it is rejected, not recorded, so a later POST
+    carrying it while nothing is in flight is indistinguishable from an
+    unkeyed request and is free to start a new scan.
+    """
+
+    def __init__(self, idempotency_key: str, existing: Run) -> None:
+        super().__init__(
+            f"idempotency key {idempotency_key!r} could not be bound: run {existing.id} "
+            "already carries a different key"
+        )
+        self.idempotency_key = idempotency_key
+        self.existing = existing
+
+
 class CatalogStore(Protocol):
     """Typed seam between the catalog API and wherever the catalog lives."""
 
@@ -109,9 +142,12 @@ class CatalogStore(Protocol):
         """Start a scan of `source_id`, or return the one already in flight.
         The flag says whether this call started it.
 
-        Raises `SourceNotFound` when nothing is registered under `source_id`,
-        and `IdempotencyKeyReused` when `idempotency_key` was used for a
-        different request."""
+        Raises `SourceNotFound` when nothing is registered under `source_id`;
+        `IdempotencyKeyReused` when `idempotency_key` already names a run of
+        a different goal or source; and `IdempotencyKeyUnbindable` when
+        single-flight answers with a run that already carries a different
+        key of its own, so `idempotency_key` cannot be durably attached to
+        it."""
         ...
 
     async def list_assets(self, *, source_id: UUID | None, cursor: str | None, limit: int) -> AssetPage:
@@ -245,6 +281,14 @@ class PostgresCatalogStore:
         keep landing while the first run is still in flight) never gets a key
         bound at all: the run finishes, a later retry finds nothing in flight,
         and the unbound key does not stop a second scan (issue #44).
+
+        A run remembers one key, so the bind above can itself fail to attach --
+        single-flight's run may already carry a different key from an
+        earlier request. That is `IdempotencyKeyUnbindable`, raised below
+        rather than accepted silently (issue #47): a run reachable by many
+        keys would need a key-to-run mapping this schema does not have, so
+        the second key is refused instead of accepted with a promise the
+        schema cannot keep.
         """
         payload = scan_payload(source_id)
         plan = plan_run(SCAN_SOURCE_GOAL, payload)
@@ -284,12 +328,25 @@ class PostgresCatalogStore:
                         enqueue(conn, task, actor=API_ACTOR)
                 conn.commit()
                 started = record.id == run_id
-        if idempotency_key is not None and record.payload != payload:
-            # The key names a run of a different source -- either create_run's
-            # own conflict or a key single-flight found already bound
-            # elsewhere. Returning that run would tell the client its request
-            # was queued when nothing will ever scan this source.
-            raise IdempotencyKeyReused(idempotency_key, to_response(record))
+        if idempotency_key is not None:
+            if record.goal != SCAN_SOURCE_GOAL or record.payload != payload:
+                # The key names a run of a different goal or source -- either
+                # create_run's own conflict or a key single-flight found
+                # already bound elsewhere. Comparing goal as well as payload
+                # is currently unreachable through this endpoint (it only
+                # ever plans SCAN_SOURCE_GOAL), but payload alone is not a
+                # safe key-space partition once a second goal shares it
+                # (issue #47). Returning that run would tell the client its
+                # request was queued when nothing will ever scan this source.
+                raise IdempotencyKeyReused(idempotency_key, to_response(record))
+            if record.idempotency_key != idempotency_key:
+                # Same run, but the bind above did not attach: single-flight
+                # found it already carrying a different key of its own (a run
+                # remembers one key). Accepting this silently is issue #47's
+                # gap -- the client would read 202 and believe this key finds
+                # the run again, but a replay under this key alone never
+                # will, because nothing was ever recorded for it.
+                raise IdempotencyKeyUnbindable(idempotency_key, to_response(record))
         return self._traced(record), started
 
     def _traced(self, record: RunRecord) -> Run:
@@ -396,6 +453,7 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "SOURCE_LOCATION_PREFIX",
     "CatalogStore",
+    "IdempotencyKeyUnbindable",
     "InMemoryCatalogStore",
     "InvalidCursor",
     "PostgresCatalogStore",
