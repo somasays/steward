@@ -25,6 +25,15 @@ Classification (GUARDRAILS.md S6):
     from the baseline is not stale: that is contract evolution.
   - identical: PASS.
 
+Declared breaks (issue #24): a breaking finding whose contract label is
+named in a complete entry (`| Contract | Ground | Migration | Decision |`,
+all four cells filled) of `contracts/BREAKING.md` is waived instead of
+failing the build. The waiver is scoped to the diff, not standing: a
+declared label with no matching breaking finding this run -- the break
+regenerated clean, or was never made -- FAILs as a stale declaration, and an
+entry naming the wrong contract leaves the real break undeclared (also
+FAIL) while the phantom entry FAILs as stale. See `_declared_contracts`.
+
 Baseline resolution (`_resolve_baseline`) is explicit, because origin/main is
 not reliably present in a shallow CI checkout or an offline clone:
   - CI, pull_request event: the base SHA from the event payload, falling back
@@ -72,7 +81,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from common import CheckResult, Finding, repo_root
 
@@ -88,6 +97,9 @@ FETCH_DEPTH_HINT = "CI needs actions/checkout with fetch-depth: 0"
 
 SCHEMAS_PREFIX = "contracts/schemas/"
 OPENAPI_PATH = "contracts/openapi.json"
+BREAKING_DECLARATIONS_PATH = "contracts/BREAKING.md"
+
+STALE_DECLARATION_MESSAGE = "declared break not observed in this diff (stale entry in contracts/BREAKING.md)"
 
 
 class Baseline(NamedTuple):
@@ -250,6 +262,32 @@ def _load_json(path: Path) -> Optional[JSONDict]:
     if not path.exists():
         return None
     return json.loads(path.read_text())  # type: ignore[no-any-return]
+
+
+def _declared_contracts(text: str) -> FrozenSet[str]:
+    """Contract labels declared in contracts/BREAKING.md (issue #24): rows of
+    the `| Contract | Ground | Migration | Decision |` table with all four
+    columns filled in and a first cell under contracts/ (which also skips the
+    header/separator rows without special-casing them). An incomplete row --
+    a contract named with no ground, migration note, or decision -- declares
+    nothing: completeness is what makes a declaration a decision instead of
+    a loophole. A cell containing a literal `|` also parses as incomplete
+    (splits into more than 4 cells) -- fails closed, since the contract then
+    still shows up as an undeclared break rather than a silently-accepted
+    one."""
+    declared: set = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if len(cells) != 4 or not all(cells[1:]):
+            continue
+        for cell in cells[0].split(","):
+            name = cell.strip().strip("`")
+            if name.startswith("contracts/"):
+                declared.add(name)
+    return frozenset(declared)
 
 
 # --- baseline resolution ----------------------------------------------
@@ -440,13 +478,22 @@ def _artifacts(
     return items
 
 
-def _evaluate(artifacts: List[Artifact], baseline_available: bool) -> Tuple[List[Finding], str, int]:
+def _evaluate(
+    artifacts: List[Artifact], baseline_available: bool, declared: FrozenSet[str] = frozenset(),
+) -> Tuple[List[Finding], str, int]:
     """Both axes over every artifact: breaking vs the baseline (only when a
     baseline was resolved) and breaking/stale vs the committed snapshot.
     Returns the findings, a summary, and how many artifacts the baseline axis
     actually compared -- a zero there must reach the detail line, or "the
     baseline had nothing" reads exactly like "nothing broke". Pure: the
-    selftest drives it with in-memory contracts."""
+    selftest drives it with in-memory contracts.
+
+    `declared` (issue #24) is the set of contract labels contracts/BREAKING.md
+    names in a complete entry. A breaking contract in that set is waived --
+    its findings are dropped and it no longer fails the build. A declared
+    label that named no actual break this run is itself a failure (a
+    declaration is a claim about THIS diff, not a standing waiver) -- see
+    `STALE_DECLARATION_MESSAGE`."""
     findings: List[Finding] = []
     breaking_files: List[str] = []
     stale_files: List[str] = []
@@ -475,12 +522,28 @@ def _evaluate(artifacts: List[Artifact], baseline_available: bool) -> Tuple[List
             for pointer, msg in fresh:
                 findings.append(Finding(art.label, 0, f"{pointer}: {msg}" if pointer else msg))
 
+    broken = set(breaking_files)
+    waived = broken & declared
+    stale_declarations = sorted(declared - broken)
+    if waived:
+        # Waive only the breaking findings on a declared label -- a
+        # simultaneous stale-snapshot finding on the same contract is a
+        # different problem (forgot to regenerate) that no declaration
+        # excuses.
+        findings = [f for f in findings if not (f.path in waived and "(breaking" in f.message)]
+        breaking_files = [label for label in breaking_files if label not in waived]
+    for label in stale_declarations:
+        findings.append(Finding(label, 0, STALE_DECLARATION_MESSAGE))
+
     if breaking_files:
         return findings, "breaking: " + ", ".join(breaking_files), compared
+    if stale_declarations:
+        return findings, "stale declaration: " + ", ".join(stale_declarations), compared
     if stale_files:
         return findings, STALE_MESSAGE + " (" + ", ".join(stale_files) + ")", compared
     schema_count = sum(1 for art in artifacts if art.label != OPENAPI_PATH)
-    return findings, f"{schema_count} schemas + openapi.json match their snapshots", compared
+    suffix = f" ({len(waived)} declared break(s) waived per contracts/BREAKING.md)" if waived else ""
+    return findings, f"{schema_count} schemas + openapi.json match their snapshots{suffix}", compared
 
 
 def _read_dir(schemas_dir: Path) -> Dict[str, JSONDict]:
@@ -532,7 +595,9 @@ def run() -> CheckResult:
 
         artifacts = _artifacts(contracts.schemas, _read_dir(schemas_dir), _read_dir(tmp_schemas),
                                contracts.openapi, _load_json(openapi_path), _load_json(tmp_openapi))
-        findings, detail, compared = _evaluate(artifacts, baseline.sha is not None)
+        declarations_path = root / BREAKING_DECLARATIONS_PATH
+        declared = _declared_contracts(declarations_path.read_text()) if declarations_path.exists() else frozenset()
+        findings, detail, compared = _evaluate(artifacts, baseline.sha is not None, declared)
 
     if baseline.sha is None:
         detail = f"{detail}; baseline unresolved — {baseline.method}"
@@ -668,6 +733,7 @@ def _selftest() -> int:
 
     ok = _selftest_baseline_resolution(ok)
     ok = _selftest_baseline_axis(ok)
+    ok = _selftest_declared_breaks(ok)
 
     print(f"S6 selftest: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
@@ -840,6 +906,69 @@ def _selftest_baseline_axis(ok: bool) -> bool:
         baseline_available=True)
     ok = _check(ok, "stale snapshot still reported when the change itself is compatible",
                 any(STALE_MESSAGE in f.message for f in findings), (findings, detail))
+    return ok
+
+
+def _selftest_declared_breaks(ok: bool) -> bool:
+    """Issue #24: declaring an intentional break in contracts/BREAKING.md,
+    and the three ways a declaration must still FAIL rather than becoming a
+    blanket waiver."""
+    complete_row = "| contracts/schemas/widget.json | pre-v1 | drop the field | #24 |\n"
+    ok = _check(ok, "a complete row parses to its contract label",
+                _declared_contracts("| Contract | Ground | Migration | Decision |\n"
+                                    "|---|---|---|---|\n" + complete_row)
+                == frozenset({"contracts/schemas/widget.json"}), None)
+    ok = _check(ok, "a row missing a column declares nothing",
+                _declared_contracts("| contracts/schemas/widget.json | pre-v1 | | #24 |\n") == frozenset(),
+                None)
+
+    broken = json.loads(json.dumps(_BASE_SCHEMA))
+    del broken["properties"]["status"]
+    removed = [Artifact("contracts/schemas/widget.json", _diff_schema_breaking, _BASE_SCHEMA, broken, None)]
+
+    # 1. no declaration -> the removal still FAILs
+    findings, detail, _ = _evaluate(removed, baseline_available=True)
+    ok = _check(ok, "a removal with no declaration FAILs",
+                detail.startswith("breaking:") and findings, (findings, detail))
+
+    # 2. matching declaration -> accepted (waived, not a FAIL)
+    findings, detail, _ = _evaluate(
+        removed, baseline_available=True, declared=frozenset({"contracts/schemas/widget.json"}))
+    ok = _check(ok, "the same removal with a complete, matching declaration PASSes",
+                not findings and not detail.startswith("breaking:")
+                and not detail.startswith("stale declaration:"), (findings, detail))
+
+    # 3. declaration names a different contract than what broke -> the real
+    # break stays undeclared (FAIL) and the phantom entry is also stale (FAIL)
+    findings, detail, _ = _evaluate(
+        removed, baseline_available=True, declared=frozenset({"contracts/schemas/other.json"}))
+    ok = _check(ok, "a declaration naming a different contract FAILs, on both counts",
+                detail.startswith("breaking:")
+                and any(STALE_DECLARATION_MESSAGE in f.message and f.path == "contracts/schemas/other.json"
+                        for f in findings), (findings, detail))
+
+    # 4. declaration outlives its break -> stale, not a permanent waiver
+    clean = [Artifact("contracts/schemas/widget.json", _diff_schema_breaking, _BASE_SCHEMA, _BASE_SCHEMA,
+                      _BASE_SCHEMA)]
+    findings, detail, _ = _evaluate(
+        clean, baseline_available=True, declared=frozenset({"contracts/schemas/widget.json"}))
+    ok = _check(ok, "a declaration left behind after its break is gone FAILs as stale",
+                detail.startswith("stale declaration:")
+                and any(STALE_DECLARATION_MESSAGE in f.message for f in findings), (findings, detail))
+
+    # 5. the waiver only excuses the declared break, not an unrelated
+    # forgotten-regeneration on the same contract riding along with it
+    without_status = json.loads(json.dumps(_BASE_SCHEMA))
+    del without_status["properties"]["status"]
+    regenerated_plus_note = json.loads(json.dumps(without_status))
+    regenerated_plus_note["properties"]["note"] = {"type": "string"}
+    mixed = [Artifact("contracts/schemas/widget.json", _diff_schema_breaking,
+                      _BASE_SCHEMA, without_status, regenerated_plus_note)]
+    findings, detail, _ = _evaluate(
+        mixed, baseline_available=True, declared=frozenset({"contracts/schemas/widget.json"}))
+    ok = _check(ok, "a waived break does not also excuse an unregenerated snapshot on the same contract",
+                detail.startswith(STALE_MESSAGE) and any(STALE_MESSAGE in f.message for f in findings)
+                and not any("(breaking" in f.message for f in findings), (findings, detail))
     return ok
 
 
