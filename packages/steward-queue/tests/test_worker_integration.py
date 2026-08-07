@@ -7,6 +7,7 @@ each one has to satisfy the registry contract on its own.
 
 import asyncio
 import contextlib
+import itertools
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -33,6 +34,7 @@ from steward_queue import (
     write_checkpoint,
 )
 from steward_queue.db import QueueConnection
+from steward_queue.execution import EXECUTION_FAILED
 from steward_queue.registry import TaskContext
 from steward_queue.worker import BUDGET_EXCEEDED, DEADLINE_GRACE
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
@@ -271,6 +273,26 @@ async def drain(worker: Worker) -> None:
         pass
 
 
+def break_handler_connections(
+    monkeypatch: pytest.MonkeyPatch, error: BaseException, *, times: int = 1
+) -> None:
+    """Make the next `times` handler connections fail to open.
+
+    The seam is the connect the handler thread makes for itself, so the
+    worker's own bookkeeping connection is left working -- which is the case
+    #45 describes: the second connection a task opens, after `mark_running` has
+    already committed, against a server that has no capacity left for it.
+    """
+    attempts = itertools.count()
+
+    def failing(dsn: str, *, statement_timeout: timedelta | None = None) -> QueueConnection:
+        if next(attempts) < times:
+            raise error
+        return connect(dsn, statement_timeout=statement_timeout)
+
+    monkeypatch.setattr("steward_queue.execution.connect", failing)
+
+
 class TestHappyPath:
     async def test_noop_task_runs_to_success(
         self, dsn: str, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
@@ -428,6 +450,69 @@ class TestFailurePaths:
         assert await worker.run_once() == 1
         task = get_task(conn, spec.task_id)
         assert task is not None and task.state is TaskState.DEAD
+
+
+class TestExecutionFailures:
+    """#45: a task the worker cannot even start costs that task, not the worker.
+
+    The failure this is written against happens before the handler is called at
+    all -- the connection it runs through cannot be opened -- so no handler can
+    be responsible for catching it. Until this it travelled out of the future
+    the poll loop reads and killed the process, leaving the task `running` for
+    the length of its lease; N1 got it back, but a worker that dies on a
+    transient connection error is not operable.
+    """
+
+    async def test_a_handler_connection_that_cannot_be_opened_fails_the_task(
+        self,
+        dsn: str,
+        conn: QueueConnection,
+        queued: Callable[..., TaskSpec],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        broken = queued(task_type=NOOP_TASK_TYPE, payload={"n": 900}, max_attempts=1)
+        break_handler_connections(monkeypatch, psycopg.OperationalError("too many connections"))
+
+        stop = asyncio.Event()
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=20), retry_base_delay=NO_BACKOFF)
+        loop_task = asyncio.create_task(worker.run_forever(stop))
+        try:
+            await until(lambda: state_of(conn, broken.task_id) is TaskState.DEAD)
+
+            # Enqueued only now, so claiming it proves the loop is still
+            # polling rather than that it had two tasks in one batch.
+            healthy = queued(task_type=NOOP_TASK_TYPE, payload={"n": 901})
+            await until(lambda: state_of(conn, healthy.task_id) is TaskState.SUCCEEDED)
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop_task, timeout=5)
+
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (broken.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None
+        assert row[0]["title"] == EXECUTION_FAILED  # not the handler's fault, and named as such
+        assert row[0]["detail"].startswith("OperationalError")
+
+    async def test_a_shutdown_on_the_handler_thread_still_stops_the_worker(
+        self,
+        dsn: str,
+        conn: QueueConnection,
+        queued: Callable[..., TaskSpec],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The other half of the distinction: not every raise is a task's fault.
+
+        `KeyboardInterrupt` and `SystemExit` mean the process is ending, so they
+        travel out of the worker instead of being filed as a failed task. The
+        attempt is left where lease recovery can find it (N1).
+        """
+        spec = queued(task_type=NOOP_TASK_TYPE, payload={"n": 902})
+        break_handler_connections(monkeypatch, KeyboardInterrupt())
+
+        with pytest.raises(KeyboardInterrupt):
+            await Worker(dsn, "w1").run_once()
+
+        assert state_of(conn, spec.task_id) is TaskState.RUNNING
 
 
 class TestConcurrency:
