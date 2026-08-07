@@ -64,6 +64,40 @@ FROM runs
 WHERE idempotency_key = %(idempotency_key)s
 """
 
+# Every writer of `idempotency_key` takes this first -- `create_run`'s INSERT
+# and `bind_idempotency_key`'s UPDATE alike -- so two requests racing to claim
+# the *same key*, whichever pair of functions they call, serialise on the key
+# rather than reaching the unique index concurrently. `INSERT ... ON CONFLICT`
+# is race-free against another INSERT on its own, but an UPDATE has no `ON
+# CONFLICT` to arbitrate with, so without this lock an INSERT-vs-UPDATE race
+# on the same key surfaces a raw constraint violation instead of the typed
+# conflict every caller here expects. A different advisory lock domain from
+# admission's (salt `1` rather than `0`, `hashtextextended`'s namespacing
+# argument), keyed on the idempotency key itself rather than (goal, payload).
+LOCK_IDEMPOTENCY_KEY = """
+SELECT pg_advisory_xact_lock(hashtextextended(%(key)s, 1))
+"""
+
+# `idempotency_key IS NULL` in the predicate makes this a no-op -- no row, no
+# audit -- when the run already carries this exact key (a second retry while
+# still in flight). The `NOT EXISTS` guards the case the first predicate
+# alone would not: the *target* run is unbound but some other run already
+# holds this key, which would otherwise reach the unique index as a raw
+# `UniqueViolation` instead of the typed conflict the caller expects. Called
+# only after `LOCK_IDEMPOTENCY_KEY`, which is what makes the guard's read
+# race-free -- every other binder of this exact key is serialised behind the
+# same lock, so nothing can insert or update the key out from under it.
+BIND_IDEMPOTENCY_KEY = """
+UPDATE runs
+SET idempotency_key = %(idempotency_key)s, updated_at = now()
+WHERE id = %(id)s
+  AND idempotency_key IS NULL
+  AND NOT EXISTS (SELECT 1 FROM runs WHERE idempotency_key = %(idempotency_key)s)
+RETURNING id, goal, payload, status, budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
+          used_steps, used_tokens, used_cost_usd, used_wall_clock, trace_id, idempotency_key,
+          created_at, updated_at
+"""
+
 # `previous` CTEs throughout: `UPDATE ... RETURNING` yields post-update values,
 # and an audit row that reports the state it just wrote as the state it replaced
 # is worse than no audit row. Reading the old value in the same statement also

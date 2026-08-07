@@ -362,7 +362,20 @@ first time, 200 on a repeat, so a client can tell whether it created anything
 without a second request. `POST /v1/sources/{id}/scan` answers 202 either way:
 if a scan of that source is already pending or running it returns that run
 rather than starting a second, decided under a transaction-scoped advisory lock
-so two simultaneous requests serialise instead of both starting one.
+so two simultaneous requests serialise instead of both starting one. When the
+request also carries an `Idempotency-Key` that is unbound so far, the key is
+bound to whichever run answers it — the one just created, or the one
+single-flight found already in flight — so a later replay of the same key
+converges on that run even after it finishes, instead of the key going
+unbound while a scan is in flight and a later replay starting a second one
+(issue #44). A key already bound to a run of a *different* source is a `409`
+on this endpoint the same as it is on `POST /v1/runs`, including when the
+request that names the wrong source is itself answered by single-flight. A
+run remembers one key: if single-flight answers a request with a run that
+already carries a *different* key (a second, independent retry racing its own
+key against a run someone else's request started), that run is returned as
+normal but the new key is not recorded on it, so a later replay under the new
+key alone will not find it and starts its own run.
 `GET /v1/assets` pages by opaque cursor over `(schema, name, id)` — a total
 order, so a scan committing between two pages cannot make a client skip an asset.
 

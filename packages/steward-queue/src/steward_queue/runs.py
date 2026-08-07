@@ -68,8 +68,20 @@ def create_run(
     With an `idempotency_key`, a replay returns the existing record unchanged
     and writes no audit row: nothing was created, so nothing is recorded. The
     caller can tell the two apart by comparing `run_id` to the returned id.
+
+    Takes `LOCK_IDEMPOTENCY_KEY` first when a key is given -- the same lock
+    `bind_idempotency_key` takes for the single-flight path. Without it, this
+    INSERT and a concurrent `bind_idempotency_key` racing to claim the same
+    key are serialised only by Postgres's own unique-index insertion wait,
+    which resolves into a raw `UniqueViolation` rather than either function's
+    typed "already bound elsewhere" return -- exactly the failure mode both
+    were written to avoid. `ON CONFLICT DO NOTHING` alone is race-free against
+    another `create_run`, but not against an `UPDATE`, which has no `ON
+    CONFLICT` to arbitrate with.
     """
     identifier = run_id or uuid4()
+    if idempotency_key is not None:
+        conn.execute(_sql.LOCK_IDEMPOTENCY_KEY, {"key": idempotency_key})
     params: dict[str, Any] = {
         "id": identifier,
         "goal": goal,
@@ -93,6 +105,82 @@ def create_run(
         entity_type=RUN_ENTITY,
         entity_id=str(record.id),
         after={"status": record.status.value, "goal": record.goal, "trace_id": record.trace_id},
+    )
+    return record
+
+
+def bind_idempotency_key(
+    conn: QueueConnection,
+    run_id: UUID,
+    idempotency_key: str,
+    *,
+    actor: Actor = SYSTEM_ACTOR,
+) -> RunRecord:
+    """Attach `idempotency_key` to the run at `run_id`, or return the run the
+    key already names.
+
+    For a run `create_run` never sees: `claim_single_flight` found it already
+    admitted, so there is no INSERT for `ON CONFLICT` to arbitrate and the key
+    would otherwise go unbound on that path -- the run started under one
+    request's admission but a *different* request's retry, carrying the key,
+    is the one that has to record it.
+
+    Same contract as `create_run`'s idempotency handling, restated for an
+    UPDATE instead of an INSERT: binding is a no-op, and writes no audit row,
+    when this run already carries this exact key (a second retry while still
+    in flight finds nothing to change). A key already bound to a *different*
+    run is never moved onto this one -- the caller gets that run back instead,
+    same as a fresh `create_run` conflict, so it can tell a same-payload
+    replay (return the original, unchanged) from a different-payload one
+    (`IdempotencyKeyReused`).
+
+    Takes the same `LOCK_IDEMPOTENCY_KEY` `create_run` does before its INSERT
+    when it is given a key, so the two never race each other for the same key
+    either -- an INSERT and this UPDATE contending for one key resolve through
+    the lock, not through Postgres surfacing a raw `UniqueViolation`.
+
+    A fourth state the UPDATE alone cannot tell apart from a plain conflict:
+    this run may already carry a *different* key of its own -- one column
+    holds one key, so a second, independent request retrying under its own
+    fresh key can reach a run single-flight admitted under someone else's.
+    That is not a conflict (nothing named `idempotency_key` disagrees about
+    what this run is), it is the schema's one-key-per-run limit, so the run
+    is returned unchanged rather than raised on: the caller still gets back
+    the run it asked about, it just cannot also be found by this second key
+    later.
+    """
+    conn.execute(_sql.LOCK_IDEMPOTENCY_KEY, {"key": idempotency_key})
+    row = conn.execute(
+        _sql.BIND_IDEMPOTENCY_KEY, {"id": run_id, "idempotency_key": idempotency_key}
+    ).fetchone()
+    if row is None:
+        owner = conn.execute(
+            _sql.SELECT_RUN_BY_IDEMPOTENCY_KEY, {"idempotency_key": idempotency_key}
+        ).fetchone()
+        if owner is not None:
+            # Either this run already carries this exact key (self, a no-op
+            # replay) or some other run does (a genuine conflict for the
+            # caller to resolve) -- either way, the key names a run, and this
+            # is it.
+            return _run_record(owner)
+        # The key names nothing yet, so the UPDATE's own predicate is what
+        # failed: this run's column already holds a different key.
+        current = conn.execute(_sql.SELECT_RUN, {"id": run_id}).fetchone()
+        if current is None:
+            # Not "the schema drifted" (that's what `_require_row` guards
+            # elsewhere) -- a caller-supplied `run_id` naming nothing at all.
+            # Same typed shape `set_run_status` uses for the same condition.
+            raise LookupError(f"no such run: {run_id}")
+        return _run_record(current)
+    record = _run_record(row)
+    write_audit(
+        conn,
+        actor=actor,
+        action="run.idempotency_key_bound",
+        entity_type=RUN_ENTITY,
+        entity_id=str(record.id),
+        before={"idempotency_key": None},
+        after={"idempotency_key": idempotency_key},
     )
     return record
 

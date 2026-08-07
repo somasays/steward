@@ -15,6 +15,7 @@ from steward_queue import (
     RunStatus,
     TaskNotClaimable,
     TaskState,
+    bind_idempotency_key,
     claim,
     claim_single_flight,
     complete,
@@ -746,3 +747,184 @@ class TestSingleFlightAdmission:
         waiter.join(timeout=5)
         assert seen == [created.id]
         assert scalar(conn, COUNT_RUNS) == 1
+
+
+class TestBindIdempotencyKey:
+    """`bind_idempotency_key` -- the primitive that closes issue #44: a run
+    `claim_single_flight` found already has no INSERT for `ON CONFLICT` to
+    arbitrate, so binding a retry's key onto it needs its own path, with the
+    same guarantees `create_run`'s idempotency handling has."""
+
+    def test_binds_an_unbound_run(self, conn: QueueConnection, budget: RunBudget) -> None:
+        created = create_run(conn, goal="scan_source", payload={"source_id": "a"}, budget=budget)
+        conn.commit()
+
+        bound = bind_idempotency_key(conn, created.id, "retry-1")
+        conn.commit()
+
+        assert bound.id == created.id
+        assert bound.idempotency_key == "retry-1"
+        fetched = get_run(conn, created.id)
+        assert fetched is not None and fetched.idempotency_key == "retry-1"
+        assert audit_actions(conn) == ["run.created", "run.idempotency_key_bound"]
+
+    def test_a_second_bind_of_the_same_key_is_a_no_op(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        created = create_run(conn, goal="scan_source", payload={"source_id": "a"}, budget=budget)
+        conn.commit()
+        bind_idempotency_key(conn, created.id, "retry-1")
+        conn.commit()
+
+        again = bind_idempotency_key(conn, created.id, "retry-1")
+        conn.commit()
+
+        assert again.id == created.id
+        assert again.idempotency_key == "retry-1"
+        # No second mutation: the audit trail has exactly one bind, not two.
+        assert audit_actions(conn) == ["run.created", "run.idempotency_key_bound"]
+
+    def test_a_key_bound_elsewhere_is_not_moved(self, conn: QueueConnection, budget: RunBudget) -> None:
+        owner = create_run(
+            conn, goal="scan_source", payload={"source_id": "a"}, budget=budget, idempotency_key="k"
+        )
+        other = create_run(conn, goal="scan_source", payload={"source_id": "b"}, budget=budget)
+        conn.commit()
+
+        result = bind_idempotency_key(conn, other.id, "k")
+        conn.commit()
+
+        # The caller gets the key's actual owner back, not `other` -- exactly
+        # `create_run`'s own conflict shape, so the caller can compare payloads
+        # and decide 409 the same way regardless of which path it took.
+        assert result.id == owner.id
+        assert result.payload == owner.payload
+        fetched = get_run(conn, other.id)
+        assert fetched is not None and fetched.idempotency_key is None
+        assert audit_actions(conn) == ["run.created", "run.created"]  # no bind was recorded
+
+    def test_a_run_already_carrying_a_different_key_is_returned_unchanged(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        """The state neither predicate alone tells apart from a plain
+        conflict: this run already has its own key, and the key being bound
+        is fresh -- owned by nobody, so the lookup fallback finds no row. That
+        must return the run as-is, not raise: one column holds one key, and a
+        second independent request retrying under its own key can reach a run
+        single-flight admitted under someone else's."""
+        created = create_run(
+            conn, goal="scan_source", payload={"source_id": "a"}, budget=budget, idempotency_key="k1"
+        )
+        conn.commit()
+
+        result = bind_idempotency_key(conn, created.id, "k2")
+        conn.commit()
+
+        assert result.id == created.id
+        assert result.payload == created.payload
+        fetched = get_run(conn, created.id)
+        assert fetched is not None and fetched.idempotency_key == "k1"  # unchanged, not overwritten
+        assert audit_actions(conn) == ["run.created"]  # no bind was recorded
+
+    def test_a_missing_run_id_raises_a_typed_lookup_error(
+        self, conn: QueueConnection
+    ) -> None:
+        """Not the schema drifting -- a caller-supplied `run_id` that names
+        nothing at all. Same typed shape `set_run_status` uses for the same
+        condition, not a bare `RuntimeError`."""
+        with pytest.raises(LookupError, match="no such run"):
+            bind_idempotency_key(conn, uuid4(), "fresh-key")
+
+    def test_a_bound_key_then_replayed_through_create_run_finds_the_same_run(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        """The bridge the bug broke: a key bound by `bind_idempotency_key`
+        (the single-flight path) must be exactly as visible to a later
+        `create_run` replay (the no-longer-in-flight path) as one bound by
+        `create_run` itself -- one unique index, one source of truth."""
+        created = create_run(conn, goal="scan_source", payload={"source_id": "a"}, budget=budget)
+        conn.commit()
+        bind_idempotency_key(conn, created.id, "retry-1")
+        conn.commit()
+
+        replayed = create_run(
+            conn, goal="scan_source", payload={"source_id": "a"}, budget=budget, idempotency_key="retry-1"
+        )
+        conn.commit()
+
+        assert replayed.id == created.id
+        assert scalar(conn, COUNT_RUNS) == 1  # no second run was created
+
+    def test_the_lock_serialises_two_simultaneous_binds_of_the_same_key(
+        self, conn: QueueConnection, open_conn: Callable[[], QueueConnection], budget: RunBudget
+    ) -> None:
+        """Without a lock over the key's own namespace, two runs racing to
+        bind the same key could both see "unbound" and one loses the write to
+        a raw unique-index violation instead of the typed conflict callers
+        expect."""
+        first_conn = open_conn()
+        first = create_run(first_conn, goal="scan_source", payload={"source_id": "a"}, budget=budget)
+        first_conn.commit()
+        second_conn = open_conn()
+        second = create_run(second_conn, goal="scan_source", payload={"source_id": "b"}, budget=budget)
+        second_conn.commit()
+
+        holder = open_conn()
+        bind_idempotency_key(holder, first.id, "contended")
+
+        seen: list[UUID] = []
+
+        def contend() -> None:
+            bound = bind_idempotency_key(second_conn, second.id, "contended")
+            seen.append(bound.id)
+            second_conn.commit()
+
+        waiter = threading.Thread(target=contend)
+        waiter.start()
+        waiter.join(timeout=0.5)
+        assert waiter.is_alive()  # blocked on the key's lock, as designed
+
+        holder.commit()
+        waiter.join(timeout=5)
+        assert seen == [first.id]  # the key stayed with whoever bound it first
+        fetched = get_run(conn, second.id)
+        assert fetched is not None and fetched.idempotency_key is None
+
+    def test_create_run_and_bind_do_not_race_the_same_key(
+        self, conn: QueueConnection, open_conn: Callable[[], QueueConnection], budget: RunBudget
+    ) -> None:
+        """`create_run`'s INSERT and this UPDATE are two different statements
+        contending for one unique index; only `LOCK_IDEMPOTENCY_KEY` makes them
+        serialise instead of one of them surfacing a raw `UniqueViolation`."""
+        second_conn = open_conn()
+        other = create_run(second_conn, goal="scan_source", payload={"source_id": "b"}, budget=budget)
+        second_conn.commit()
+
+        first_conn = open_conn()
+        # Holds the key's lock without committing -- create_run has already
+        # taken LOCK_IDEMPOTENCY_KEY by the time this call returns.
+        created = create_run(
+            first_conn,
+            goal="scan_source",
+            payload={"source_id": "a"},
+            budget=budget,
+            idempotency_key="contended",
+        )
+
+        seen: list[UUID] = []
+
+        def contend() -> None:
+            bound = bind_idempotency_key(second_conn, other.id, "contended")
+            seen.append(bound.id)
+            second_conn.commit()
+
+        waiter = threading.Thread(target=contend)
+        waiter.start()
+        waiter.join(timeout=0.5)
+        assert waiter.is_alive()  # blocked on the shared key lock, not racing the index
+
+        first_conn.commit()
+        waiter.join(timeout=5)
+        assert seen == [created.id]  # the key stayed with create_run's winner
+        fetched = get_run(conn, other.id)
+        assert fetched is not None and fetched.idempotency_key is None
