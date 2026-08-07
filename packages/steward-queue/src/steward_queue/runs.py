@@ -68,8 +68,20 @@ def create_run(
     With an `idempotency_key`, a replay returns the existing record unchanged
     and writes no audit row: nothing was created, so nothing is recorded. The
     caller can tell the two apart by comparing `run_id` to the returned id.
+
+    Takes `LOCK_IDEMPOTENCY_KEY` first when a key is given -- the same lock
+    `bind_idempotency_key` takes for the single-flight path. Without it, this
+    INSERT and a concurrent `bind_idempotency_key` racing to claim the same
+    key are serialised only by Postgres's own unique-index insertion wait,
+    which resolves into a raw `UniqueViolation` rather than either function's
+    typed "already bound elsewhere" return -- exactly the failure mode both
+    were written to avoid. `ON CONFLICT DO NOTHING` alone is race-free against
+    another `create_run`, but not against an `UPDATE`, which has no `ON
+    CONFLICT` to arbitrate with.
     """
     identifier = run_id or uuid4()
+    if idempotency_key is not None:
+        conn.execute(_sql.LOCK_IDEMPOTENCY_KEY, {"key": idempotency_key})
     params: dict[str, Any] = {
         "id": identifier,
         "goal": goal,
@@ -121,6 +133,11 @@ def bind_idempotency_key(
     same as a fresh `create_run` conflict, so it can tell a same-payload
     replay (return the original, unchanged) from a different-payload one
     (`IdempotencyKeyReused`).
+
+    Takes the same `LOCK_IDEMPOTENCY_KEY` `create_run` does before its INSERT
+    when it is given a key, so the two never race each other for the same key
+    either -- an INSERT and this UPDATE contending for one key resolve through
+    the lock, not through Postgres surfacing a raw `UniqueViolation`.
     """
     conn.execute(_sql.LOCK_IDEMPOTENCY_KEY, {"key": idempotency_key})
     row = conn.execute(

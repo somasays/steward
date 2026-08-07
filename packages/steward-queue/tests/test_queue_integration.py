@@ -857,3 +857,42 @@ class TestBindIdempotencyKey:
         assert seen == [first.id]  # the key stayed with whoever bound it first
         fetched = get_run(conn, second.id)
         assert fetched is not None and fetched.idempotency_key is None
+
+    def test_create_run_and_bind_do_not_race_the_same_key(
+        self, conn: QueueConnection, open_conn: Callable[[], QueueConnection], budget: RunBudget
+    ) -> None:
+        """`create_run`'s INSERT and this UPDATE are two different statements
+        contending for one unique index; only `LOCK_IDEMPOTENCY_KEY` makes them
+        serialise instead of one of them surfacing a raw `UniqueViolation`."""
+        second_conn = open_conn()
+        other = create_run(second_conn, goal="scan_source", payload={"source_id": "b"}, budget=budget)
+        second_conn.commit()
+
+        first_conn = open_conn()
+        # Holds the key's lock without committing -- create_run has already
+        # taken LOCK_IDEMPOTENCY_KEY by the time this call returns.
+        created = create_run(
+            first_conn,
+            goal="scan_source",
+            payload={"source_id": "a"},
+            budget=budget,
+            idempotency_key="contended",
+        )
+
+        seen: list[UUID] = []
+
+        def contend() -> None:
+            bound = bind_idempotency_key(second_conn, other.id, "contended")
+            seen.append(bound.id)
+            second_conn.commit()
+
+        waiter = threading.Thread(target=contend)
+        waiter.start()
+        waiter.join(timeout=0.5)
+        assert waiter.is_alive()  # blocked on the shared key lock, not racing the index
+
+        first_conn.commit()
+        waiter.join(timeout=5)
+        assert seen == [created.id]  # the key stayed with create_run's winner
+        fetched = get_run(conn, other.id)
+        assert fetched is not None and fetched.idempotency_key is None

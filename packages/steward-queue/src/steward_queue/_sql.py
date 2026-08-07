@@ -64,15 +64,16 @@ FROM runs
 WHERE idempotency_key = %(idempotency_key)s
 """
 
-# Binding a key onto a run that already exists -- the single-flight admission
-# path, where a run was found rather than created, so `INSERT ... ON CONFLICT`
-# is not in play. A different advisory lock domain from admission's (salt `1`
-# rather than `0`, `hashtextextended`'s namespacing argument), keyed on the
-# idempotency key itself rather than (goal, payload): two requests racing to
-# bind the *same key* to two *different* runs must serialise on the key, not
-# on either run's payload, or both could see "unbound" and one would lose the
-# write to the unique index with a raw constraint violation instead of the
-# typed conflict the caller expects.
+# Every writer of `idempotency_key` takes this first -- `create_run`'s INSERT
+# and `bind_idempotency_key`'s UPDATE alike -- so two requests racing to claim
+# the *same key*, whichever pair of functions they call, serialise on the key
+# rather than reaching the unique index concurrently. `INSERT ... ON CONFLICT`
+# is race-free against another INSERT on its own, but an UPDATE has no `ON
+# CONFLICT` to arbitrate with, so without this lock an INSERT-vs-UPDATE race
+# on the same key surfaces a raw constraint violation instead of the typed
+# conflict every caller here expects. A different advisory lock domain from
+# admission's (salt `1` rather than `0`, `hashtextextended`'s namespacing
+# argument), keyed on the idempotency key itself rather than (goal, payload).
 LOCK_IDEMPOTENCY_KEY = """
 SELECT pg_advisory_xact_lock(hashtextextended(%(key)s, 1))
 """
