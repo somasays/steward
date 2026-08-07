@@ -50,6 +50,7 @@ from steward_queue import (
     Actor,
     ActorKind,
     RunRecord,
+    bind_idempotency_key,
     claim_single_flight,
     connect,
     create_run,
@@ -235,6 +236,15 @@ class PostgresCatalogStore:
         same source serialise: the second finds the run the first committed
         instead of both finding nothing and both starting a scan. The lock is
         transaction-scoped, so committing releases it.
+
+        Single-flight dedupes on (goal, payload); the idempotency key dedupes
+        on the key. They agree most of the time -- a retried request has both
+        the same payload and the same key -- but each can fire without the
+        other, and both branches below have to bind the key when it is given,
+        or a client that only ever sees the single-flight branch (its retries
+        keep landing while the first run is still in flight) never gets a key
+        bound at all: the run finishes, a later retry finds nothing in flight,
+        and the unbound key does not stop a second scan (issue #44).
         """
         payload = scan_payload(source_id)
         plan = plan_run(SCAN_SOURCE_GOAL, payload)
@@ -245,28 +255,42 @@ class PostgresCatalogStore:
                 raise SourceNotFound(source_id)
             in_flight = claim_single_flight(conn, goal=SCAN_SOURCE_GOAL, payload=payload)
             if in_flight is not None:
-                conn.rollback()
-                return self._traced(in_flight), False
-            record = create_run(
-                conn,
-                goal=SCAN_SOURCE_GOAL,
-                payload=payload,
-                budget=plan.budget,
-                run_id=run_id,
-                trace_id=new_trace_id(seed=str(run_id)),
-                idempotency_key=idempotency_key,
-                actor=API_ACTOR,
-            )
-            if record.id == run_id:
-                for task in plan.task_specs(record.id):
-                    enqueue(conn, task, actor=API_ACTOR)
-            conn.commit()
-        if record.id != run_id and record.payload != payload and idempotency_key is not None:
-            # The key was replayed for a *different* source. Returning the
-            # original run would tell the client its request was queued when
-            # nothing will ever scan that source.
+                if idempotency_key is None:
+                    record = in_flight
+                    conn.rollback()
+                else:
+                    # Bind onto the run single-flight found, not create_run --
+                    # there is no INSERT here for ON CONFLICT to arbitrate.
+                    # A key already bound to a *different* run comes back
+                    # unchanged; the check below turns that into a 409 when
+                    # that run is a different source, exactly as it does for
+                    # the create_run path.
+                    record = bind_idempotency_key(conn, in_flight.id, idempotency_key, actor=API_ACTOR)
+                    conn.commit()
+                started = False
+            else:
+                record = create_run(
+                    conn,
+                    goal=SCAN_SOURCE_GOAL,
+                    payload=payload,
+                    budget=plan.budget,
+                    run_id=run_id,
+                    trace_id=new_trace_id(seed=str(run_id)),
+                    idempotency_key=idempotency_key,
+                    actor=API_ACTOR,
+                )
+                if record.id == run_id:
+                    for task in plan.task_specs(record.id):
+                        enqueue(conn, task, actor=API_ACTOR)
+                conn.commit()
+                started = record.id == run_id
+        if idempotency_key is not None and record.payload != payload:
+            # The key names a run of a different source -- either create_run's
+            # own conflict or a key single-flight found already bound
+            # elsewhere. Returning that run would tell the client its request
+            # was queued when nothing will ever scan this source.
             raise IdempotencyKeyReused(idempotency_key, to_response(record))
-        return self._traced(record), record.id == run_id
+        return self._traced(record), started
 
     def _traced(self, record: RunRecord) -> Run:
         """Open the run's span on the identity the row carries (I7)."""

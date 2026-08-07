@@ -59,6 +59,7 @@ from steward_queue.registry import (
     task_handler,
 )
 from steward_queue.runs import (
+    bind_idempotency_key,
     claim_single_flight,
     create_run,
     get_run,
@@ -101,6 +102,7 @@ __all__ = [
     "TaskState",
     "UnknownTaskType",
     "Worker",
+    "bind_idempotency_key",
     "canonical_json",
     "claim",
     "claim_single_flight",

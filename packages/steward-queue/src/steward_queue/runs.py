@@ -97,6 +97,53 @@ def create_run(
     return record
 
 
+def bind_idempotency_key(
+    conn: QueueConnection,
+    run_id: UUID,
+    idempotency_key: str,
+    *,
+    actor: Actor = SYSTEM_ACTOR,
+) -> RunRecord:
+    """Attach `idempotency_key` to the run at `run_id`, or return the run the
+    key already names.
+
+    For a run `create_run` never sees: `claim_single_flight` found it already
+    admitted, so there is no INSERT for `ON CONFLICT` to arbitrate and the key
+    would otherwise go unbound on that path -- the run started under one
+    request's admission but a *different* request's retry, carrying the key,
+    is the one that has to record it.
+
+    Same contract as `create_run`'s idempotency handling, restated for an
+    UPDATE instead of an INSERT: binding is a no-op, and writes no audit row,
+    when this run already carries this exact key (a second retry while still
+    in flight finds nothing to change). A key already bound to a *different*
+    run is never moved onto this one -- the caller gets that run back instead,
+    same as a fresh `create_run` conflict, so it can tell a same-payload
+    replay (return the original, unchanged) from a different-payload one
+    (`IdempotencyKeyReused`).
+    """
+    conn.execute(_sql.LOCK_IDEMPOTENCY_KEY, {"key": idempotency_key})
+    row = conn.execute(
+        _sql.BIND_IDEMPOTENCY_KEY, {"id": run_id, "idempotency_key": idempotency_key}
+    ).fetchone()
+    if row is None:
+        existing = conn.execute(
+            _sql.SELECT_RUN_BY_IDEMPOTENCY_KEY, {"idempotency_key": idempotency_key}
+        ).fetchone()
+        return _run_record(_require_row(existing, "idempotency key bind found no owner"))
+    record = _run_record(row)
+    write_audit(
+        conn,
+        actor=actor,
+        action="run.idempotency_key_bound",
+        entity_type=RUN_ENTITY,
+        entity_id=str(record.id),
+        before={"idempotency_key": None},
+        after={"idempotency_key": idempotency_key},
+    )
+    return record
+
+
 def claim_single_flight(conn: QueueConnection, *, goal: str, payload: Mapping[str, Any]) -> RunRecord | None:
     """The run already in flight for this exact goal and payload, or None --
     and, either way, the right to decide, until the caller commits.
