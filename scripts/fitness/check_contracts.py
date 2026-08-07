@@ -35,6 +35,9 @@ not reliably present in a shallow CI checkout or an offline clone:
   - CI, any other event (push to another ref, workflow_dispatch): merge-base
     with the repository default branch.
   - local: merge-base with origin/main, when that ref exists.
+  - any merge-base that equals HEAD (a dispatch run on the default branch, an
+    undiverged ref) is rejected: comparing a commit with itself is not a
+    compatibility check, whatever the event was.
   - unresolvable -- including resolved but unreadable, e.g. a blobless clone
     where `git show` cannot produce the blob: SKIP with the reason locally
     (exit 2), FAIL in CI. Never
@@ -317,14 +320,25 @@ def _resolve_baseline(
                                   f"this checkout, and merge-base would be HEAD itself ({FETCH_DEPTH_HINT})")
         merge_base = git(["merge-base", "HEAD", f"origin/{default_branch}"])
         if merge_base:
-            return Baseline(merge_base, f"CI {event}: merge-base with origin/{default_branch}")
+            return _unless_head(git, merge_base, f"CI {event}: merge-base with origin/{default_branch}")
         return Baseline(None, f"CI {event}: no merge-base with "
                               f"origin/{default_branch} in this checkout ({FETCH_DEPTH_HINT})")
 
     merge_base = git(["merge-base", "HEAD", "origin/main"])
     if merge_base:
-        return Baseline(merge_base, "local: merge-base with origin/main")
+        return _unless_head(git, merge_base, "local: merge-base with origin/main")
     return Baseline(None, "local: origin/main is not present (offline clone or no remote-tracking ref)")
+
+
+def _unless_head(git: GitFn, merge_base: str, method: str) -> Baseline:
+    """A merge-base equal to HEAD -- on the default branch, or any ref that
+    hasn't diverged -- would compare the commit with itself and call it a
+    compatibility check. That is not a baseline; route it to the unresolved
+    policy (SKIP locally, FAIL in CI) instead of vouching for nothing."""
+    head = git(["rev-parse", "HEAD"])
+    if head is not None and head == merge_base:
+        return Baseline(None, f"{method} is HEAD itself — no divergence to compare")
+    return Baseline(merge_base, method)
 
 
 def _default_branch(env: Mapping[str, str], load_event: Callable[[Mapping[str, str]], JSONDict]) -> str:
@@ -369,7 +383,10 @@ def _baseline_contracts(git: GitFn, sha: str) -> BaselineContracts:
         if path == OPENAPI_PATH:
             openapi = value
         else:
-            schemas[Path(path).stem] = value
+            # Keyed by the path under contracts/schemas/ minus .json, matching
+            # `_read_dir`: both sides of a comparison must traverse alike, or a
+            # nested schema reads as "removed since baseline".
+            schemas[path[len(SCHEMAS_PREFIX):-len(".json")]] = value
     return BaselineContracts(schemas, openapi, None)
 
 
@@ -458,13 +475,15 @@ def _evaluate(artifacts: List[Artifact], baseline_available: bool) -> Tuple[List
 
 
 def _read_dir(schemas_dir: Path) -> Dict[str, JSONDict]:
+    """Schemas on disk, keyed by path under the directory minus .json --
+    recursive, to match how the baseline side lists them."""
     loaded: Dict[str, JSONDict] = {}
     if not schemas_dir.exists():
         return loaded
-    for path in sorted(schemas_dir.glob("*.json")):
+    for path in sorted(schemas_dir.rglob("*.json")):
         value = _load_json(path)
         if value is not None:
-            loaded[path.stem] = value
+            loaded[path.relative_to(schemas_dir).with_suffix("").as_posix()] = value
     return loaded
 
 
@@ -683,7 +702,8 @@ def _selftest_baseline_resolution(ok: bool) -> bool:
 
     # 2. CI push (branch != default) -> merge-base with the default branch
     push_env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push", "GITHUB_REF_NAME": "topic"}
-    base = _resolve_baseline(push_env, _fake_git({"merge-base HEAD origin/trunk": "d" * 40}),
+    base = _resolve_baseline(push_env, _fake_git({"merge-base HEAD origin/trunk": "d" * 40,
+                                                 "rev-parse HEAD": "a" * 40}),
                              lambda _env: {"repository": {"default_branch": "trunk"}})
     ok = _check(ok, "CI push resolves merge-base with the default branch",
                 base.sha == "d" * 40 and "merge-base with origin/trunk" in base.method, base)
@@ -701,14 +721,24 @@ def _selftest_baseline_resolution(ok: bool) -> bool:
 
     # 2b. workflow_dispatch takes the same path (it is neither push nor pull_request)
     dispatch_env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch"}
-    base = _resolve_baseline(dispatch_env, _fake_git({"merge-base HEAD origin/main": "e" * 40}), lambda _env: {})
+    base = _resolve_baseline(dispatch_env, _fake_git({"merge-base HEAD origin/main": "e" * 40,
+                                                     "rev-parse HEAD": "a" * 40}), lambda _env: {})
     ok = _check(ok, "CI workflow_dispatch resolves merge-base with origin/main",
                 base.sha == "e" * 40, base)
 
     # 3. local -> merge-base with origin/main
-    base = _resolve_baseline({}, _fake_git({"merge-base HEAD origin/main": "f" * 40}), lambda _env: {})
+    base = _resolve_baseline({}, _fake_git({"merge-base HEAD origin/main": "f" * 40,
+                                            "rev-parse HEAD": "a" * 40}), lambda _env: {})
     ok = _check(ok, "local resolves merge-base with origin/main",
                 base.sha == "f" * 40 and base.method.startswith("local"), base)
+
+    # 3b. a merge-base equal to HEAD (dispatch on the default branch, an
+    # undiverged ref) is X-vs-X, not a baseline -- whatever the event is
+    same = _fake_git({"merge-base": "a" * 40, "rev-parse HEAD": "a" * 40})
+    for label, env_ in (("CI workflow_dispatch", dispatch_env), ("local", {})):
+        base = _resolve_baseline(env_, same, lambda _env: {})
+        ok = _check(ok, f"{label}: merge-base equal to HEAD is not accepted as a baseline",
+                    base.sha is None and "HEAD itself" in base.method, base)
 
     # 4. unresolvable -> no sha, reason carried; SKIP locally, FAIL in CI
     nothing = _fake_git({})
