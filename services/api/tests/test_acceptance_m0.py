@@ -36,11 +36,15 @@ from steward_api.app import create_app
 from steward_api.store import REPLAYED_DETAIL, PostgresRunStore
 from steward_queue import NOOP_TASK_TYPE, TaskState, Worker, connect, get_task, upgrade_to_head
 from steward_queue.db import QueueConnection
-from steward_telemetry import Span, SpanOutcome
+from steward_schemas import RunCreate
+from steward_telemetry import Span, SpanOutcome, new_trace_id
 
 pytestmark = pytest.mark.acceptance
 
 TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+UNREACHABLE_DSN = "postgresql://steward@127.0.0.1:1/steward"
+"""A DSN nothing listens on: the cheapest way to make creation fail for real."""
 
 POLL_INTERVAL = timedelta(milliseconds=50)
 POLL_TIMEOUT = timedelta(seconds=30)
@@ -95,11 +99,18 @@ class RecordedSpan:
     detail: str | None = None
 
     def record(self, outcome: SpanOutcome, detail: str | None = None) -> None:
-        self.outcome, self.detail = outcome, detail
+        if self.outcome is None:  # first outcome wins, as in the Langfuse span
+            self.outcome, self.detail = outcome, detail
 
 
 class RecordingTracer:
-    """A `Tracer` that keeps its spans, so the scenario can assert on them."""
+    """A `Tracer` that keeps its spans, so the scenario can assert on them.
+
+    Honours the same exit rule the `Span` contract states and `LangfuseTracer`
+    implements: a block that raises ends its span `ERROR`, a clean one ends it
+    `OK`, and an outcome the caller already recorded wins. Without that this
+    tracer would agree with the real one only on the happy path.
+    """
 
     def __init__(self) -> None:
         self.spans: list[RecordedSpan] = []
@@ -108,7 +119,12 @@ class RecordingTracer:
     def run_span(self, *, trace_id: str, run_id: UUID, goal: str) -> Iterator[Span]:
         span = RecordedSpan(trace_id=trace_id, run_id=run_id, goal=goal)
         self.spans.append(span)
-        yield span
+        try:
+            yield span
+        except Exception as exc:
+            span.record(SpanOutcome.ERROR, f"{type(exc).__name__}: {exc}")
+            raise
+        span.record(SpanOutcome.OK)
 
     @contextmanager
     def task_span(self, *, trace_id: str, run_id: UUID, task_id: UUID, task_type: str) -> Iterator[Span]:
@@ -209,8 +225,33 @@ def test_a_replayed_idempotency_key_does_not_start_a_second_run(
     tasks = conn.execute(SELECT_RUN_TASKS, {"run_id": UUID(first["id"])}).fetchall()
     conn.rollback()
     assert len(tasks) == 1
-    # The replay is traced as a replay rather than as a second creation.
+    # The replay is traced as a replay rather than as a second creation...
     assert [span.detail for span in tracer.spans] == [None, REPLAYED_DETAIL]
+    # ...and on the original run's trace. The replay generated a run id and a
+    # trace id that the transaction then discarded; a span carrying those would
+    # sit on a trace no run points at, and the original run's trace would show
+    # nothing of the retry (#27).
+    assert [span.run_id for span in tracer.spans] == [UUID(first["id"])] * 2
+    assert [span.trace_id for span in tracer.spans] == [first["trace_id"]] * 2
+
+
+def test_a_creation_that_fails_is_still_traced(tracer: RecordingTracer) -> None:
+    """I7: a failed creation is a trace with an error, not a missing trace.
+
+    Nothing was persisted, so the span carries the identity the attempt
+    generated -- the only one that ever named the work -- which is checked here
+    by its derivation, since no response exists to read the run id from.
+    """
+    store = PostgresRunStore(UNREACHABLE_DSN, tracer=tracer)
+
+    with pytest.raises(Exception, match="connection"):
+        asyncio.run(store.create_run(RunCreate(goal="noop"), None))
+
+    [span] = tracer.spans
+    assert span.outcome is SpanOutcome.ERROR
+    assert span.detail is not None
+    assert span.goal == "noop"
+    assert span.trace_id == new_trace_id(seed=str(span.run_id))
 
 
 def test_reusing_a_key_for_a_different_request_is_a_409(client: TestClient, conn: QueueConnection) -> None:

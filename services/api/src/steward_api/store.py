@@ -152,17 +152,58 @@ class PostgresRunStore:
     def _create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
         """The run row and its task, committed together (I8).
 
-        The span wraps the whole attempt, including the transaction, so a
-        creation that fails is a trace with an error rather than no trace at
-        all. On an idempotency replay the transaction is a no-op -- `create_run`
-        returns the original row and `enqueue` deduplicates on the payload the
-        original was enqueued with -- and the span says so instead of pretending
-        work happened. `record.id != run_id` is how a replay is detected: the
-        id this call generated is on the row only if this call created it.
+        Two properties pull in opposite directions here. The span has to exist
+        even when creation fails -- a failure is a trace with an error, not a
+        missing trace -- and it has to name the run it describes, which on an
+        idempotency replay is the *original* run, not the identity this call
+        generated and then discarded (#27). Opening the span first satisfied
+        only the first, and put replay spans on a trace no run points at.
+
+        So the attempt is resolved first and the span opened over its outcome:
+        a persisted record names the span (its own run id, trace id and goal),
+        and a failure -- which persisted no run at all -- falls back to the
+        identity this call generated, the only one that ever named the work.
+        The captured failure is re-raised inside the span, so the tracer marks
+        it `ERROR` on the way out exactly as it did before. The cost is that
+        the span no longer brackets the transaction and so measures nothing;
+        identity is the guarantee (I7), duration was incidental.
+
+        `record.id != run_id` is how a replay is detected: the id this call
+        generated is on the row only if this call created it. A replay's
+        transaction is a no-op -- `create_run` returns the original row and
+        `enqueue` deduplicates on the payload the original was enqueued with --
+        and the span says so instead of pretending work happened. A replay with
+        a different body raises inside that same span, so the conflict is an
+        error on the original run's trace rather than on an orphan.
         """
         run_id = uuid4()
         trace_id = new_trace_id(seed=str(run_id))
-        with self._tracer.run_span(trace_id=trace_id, run_id=run_id, goal=spec.goal) as span:
+        outcome = self._persist(spec, run_id=run_id, trace_id=trace_id, idempotency_key=idempotency_key)
+        if isinstance(outcome, RunRecord):
+            span_trace_id, span_run_id, span_goal = outcome.trace_id, outcome.id, outcome.goal
+        else:
+            span_trace_id, span_run_id, span_goal = trace_id, run_id, spec.goal
+        with self._tracer.run_span(trace_id=span_trace_id, run_id=span_run_id, goal=span_goal) as span:
+            if not isinstance(outcome, RunRecord):
+                raise outcome
+            run = to_response(outcome)
+            if outcome.id != run_id:
+                if idempotency_key is not None and not _same_request(run, spec):
+                    raise IdempotencyKeyReused(idempotency_key, run)
+                span.record(SpanOutcome.OK, REPLAYED_DETAIL)
+        return run
+
+    def _persist(
+        self, spec: RunCreate, *, run_id: UUID, trace_id: str, idempotency_key: str | None
+    ) -> RunRecord | Exception:
+        """The run row and its first task in one transaction, with a failure
+        returned rather than raised.
+
+        Returned because the span that must record the failure cannot be opened
+        until the row this call is about is known, and opening it earlier is
+        what put replay spans on a discarded identity. The caller re-raises.
+        """
+        try:
             with connect(self._dsn) as conn:
                 record = create_run(
                     conn,
@@ -175,12 +216,9 @@ class PostgresRunStore:
                 )
                 enqueue(conn, self._first_task(record))
                 conn.commit()
-            run = to_response(record)
-            if record.id != run_id:
-                if idempotency_key is not None and not _same_request(run, spec):
-                    raise IdempotencyKeyReused(idempotency_key, run)
-                span.record(SpanOutcome.OK, REPLAYED_DETAIL)
-        return run
+        except Exception as exc:
+            return exc
+        return record
 
     def _first_task(self, record: RunRecord) -> TaskSpec:
         """The task the run's goal expands to.
