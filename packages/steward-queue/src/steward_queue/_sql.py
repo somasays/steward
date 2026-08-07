@@ -308,6 +308,18 @@ SET_STATEMENT_TIMEOUT = """
 SELECT set_config('statement_timeout', %(milliseconds)s, false)
 """
 
+# Sent over a *different* connection from the one being ended -- that is the
+# point of addressing a backend by pid rather than calling a method on a
+# connection object (worker.py, SPEC.md D7). Terminate rather than cancel:
+# cancelling only reaches a backend that is running a statement, and the
+# session this ends is typically idle inside a transaction it will never
+# commit, still holding the locks the worker needs to record the outcome.
+# Returns false when the backend has already gone, which is a fine outcome and
+# not an error.
+TERMINATE_BACKEND = """
+SELECT pg_terminate_backend(%(pid)s)
+"""
+
 COUNT_AUDIT_FOR_ENTITY = """
 SELECT count(*) FROM audit_log WHERE entity_type = %(entity_type)s AND entity_id = %(entity_id)s
 """

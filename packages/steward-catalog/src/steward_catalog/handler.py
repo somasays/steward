@@ -141,10 +141,10 @@ def _scan_usage() -> RunBudget:
     construction, so reporting one would make the harness fail always -- and a
     harness that always fails is one that gets ignored. The consequence is that
     `runs.used_wall_clock` under-reports a scan, so wall-clock is enforced by
-    the runtime -- the worker's `asyncio.timeout` and both connections'
-    `statement_timeout`, all derived from `spec.budget.wall_clock` -- and never
-    by this number. Measuring it for N6 needs a usage field the idempotency
-    comparison excludes, which belongs with the agent loop.
+    the runtime -- the worker's deadline over the thread this handler runs on,
+    plus both connections' budget-derived timeouts (SPEC.md §13, D7) -- and
+    never by this number. Measuring it for N6 needs a usage field the
+    idempotency comparison excludes, which belongs with the agent loop.
     """
     return RunBudget(steps=SCAN_STEPS, tokens=NO_USAGE_TOKENS, cost_usd=Decimal("0"), wall_clock=timedelta(0))
 

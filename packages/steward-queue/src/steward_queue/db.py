@@ -46,15 +46,16 @@ def statement_timeout_ms(budget: timedelta) -> int:
 def connect(dsn: str, *, statement_timeout: timedelta | None = None) -> QueueConnection:
     """Open a queue connection. Manual commit: the caller owns transactions.
 
-    `statement_timeout` makes a wall-clock budget enforceable rather than
-    merely hoped for. The worker's `asyncio.timeout` can only cancel at an
-    await point, and a psycopg call is a blocking C call running in a worker
-    thread -- a handler waiting on a lock or a pathological query would sit
-    there past its budget, holding the worker slot until its lease expired.
-    Setting the cap server-side means Postgres aborts the statement and the
-    blocked thread actually returns, so the budget guard has something to
-    interrupt (I12). Passed as a libpq connection option, so it applies to
-    every statement on the connection without a per-transaction `SET`.
+    `statement_timeout` is one of the three bounds a wall-clock budget rests on
+    (SPEC.md §13, D7). It is the cheapest: Postgres aborts the statement, so a
+    handler waiting on a lock or a pathological query comes back at its cap
+    instead of holding a worker slot until its lease expires -- and it comes
+    back on its own thread, where the exception is the handler's to unwind
+    (I12). It is not the last word, because it bounds a statement rather than
+    an execution: a handler that never calls the database, or calls it N times,
+    is bounded by the worker's deadline instead. Passed as a libpq connection
+    option, so it applies to every statement on the connection without a
+    per-transaction `SET`.
     """
     if statement_timeout is None:
         return psycopg.connect(dsn, autocommit=False)
@@ -73,3 +74,29 @@ def set_statement_timeout(conn: QueueConnection, budget: timedelta) -> None:
     `budget_exceeded` into a task nobody could write a result for.
     """
     conn.execute(_sql.SET_STATEMENT_TIMEOUT, {"milliseconds": str(statement_timeout_ms(budget))})
+
+
+def terminate_backend(conn: QueueConnection, backend_pid: int) -> bool:
+    """Have Postgres end the session running on `backend_pid`.
+
+    The interesting part is what this is *not*: it is not a method on the
+    connection being ended. The worker uses it to dispose of the session of a
+    handler running on another thread, and psycopg connections are not
+    thread-safe -- so the only thing that crosses the thread boundary is the
+    backend's pid, an integer, and the disposal travels over the caller's own
+    connection. A connection object is therefore never reachable from two
+    contexts at once, by construction rather than by timing (SPEC.md §13, D7).
+
+    Terminating rather than cancelling is what makes it useful. The session
+    being abandoned is usually idle inside a transaction nobody will ever
+    commit -- there is no statement to cancel, and its row locks would block
+    the very statements the worker needs to record the outcome. Ending the
+    session drops the transaction and the locks with it, which is also what
+    turns "the abandoned handler's writes are uncommitted" into "the abandoned
+    handler can no longer write".
+
+    Returns whether Postgres found the backend; one that has already finished
+    is a false, not an error.
+    """
+    row = conn.execute(_sql.TERMINATE_BACKEND, {"pid": backend_pid}).fetchone()
+    return bool(row is not None and row[0])

@@ -6,6 +6,9 @@ each one has to satisfy the registry contract on its own.
 """
 
 import asyncio
+import contextlib
+import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,6 +16,7 @@ from datetime import timedelta
 from decimal import Decimal
 from uuid import UUID
 
+import psycopg
 import pytest
 from steward_queue import (
     NOOP_TASK_TYPE,
@@ -21,6 +25,7 @@ from steward_queue import (
     TaskState,
     Worker,
     claim,
+    connect,
     get_run,
     get_task,
     requeue_stale,
@@ -29,7 +34,7 @@ from steward_queue import (
 )
 from steward_queue.db import QueueConnection
 from steward_queue.registry import TaskContext
-from steward_queue.worker import BUDGET_EXCEEDED
+from steward_queue.worker import BUDGET_EXCEEDED, DEADLINE_GRACE
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
 from steward_telemetry import Span, SpanOutcome
 
@@ -41,17 +46,22 @@ EXPLODES = "test.explodes_on_demand"
 REPORTS_FAILURE = "test.reports_failure"
 SLEEPS = "test.sleeps"
 BLOCKS_IN_THE_DRIVER = "test.blocks_in_the_driver"
+BLOCKS_THE_INTERPRETER = "test.blocks_the_interpreter"
+SPENDS_THE_CAP_TWICE = "test.spends_the_cap_twice"
 UNREGISTERED = "test.unregistered"
 REPORTS_ITS_LEASE = "test.reports_its_lease"
 
 TINY_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(milliseconds=20))
 SHORT_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(milliseconds=250))
+ONE_SECOND_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(seconds=1))
+TWO_SECOND_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(seconds=2))
 
 SELECT_TASK_RESULT = "SELECT result FROM tasks WHERE id = %s"
 SELECT_TASK_LAST_ERROR = "SELECT last_error FROM tasks WHERE id = %s"
 SELECT_CHECKPOINTS = "SELECT step, state FROM checkpoints WHERE task_id = %s ORDER BY step"
 SELECT_AUDIT_ACTIONS = "SELECT action FROM audit_log WHERE entity_id = %s ORDER BY id"
 SELECT_PG_SLEEP = "SELECT pg_sleep(%(seconds)s)"
+SELECT_BACKEND_STATE = "SELECT state FROM pg_stat_activity WHERE pid = %(pid)s"
 SELECT_LEASE_HEADROOM_SECONDS = """
 SELECT EXTRACT(EPOCH FROM (lease_expires_at - now())) FROM tasks WHERE id = %(id)s
 """
@@ -114,6 +124,62 @@ async def blocks_in_the_driver(ctx: TaskContext) -> TaskResult:
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
 
 
+@dataclass(frozen=True)
+class HandlerSighting:
+    """Where a handler ran: which thread, and which Postgres backend it held."""
+
+    thread_ident: int
+    backend_pid: int
+
+
+_sightings: list[HandlerSighting] = []
+
+
+@task_handler(BLOCKS_THE_INTERPRETER, sample_payload={"seconds": 0.0})
+async def blocks_the_interpreter(ctx: TaskContext) -> TaskResult:
+    """Writes, then blocks in Python with an open transaction, then writes again.
+
+    The case neither timeout can reach: `asyncio.timeout` needs an await point
+    and `statement_timeout` needs a running statement, and `time.sleep` offers
+    neither. Only the worker's own deadline can end this task, and only by
+    leaving the thread behind -- which is why the checkpoints bracket the sleep,
+    so a test can check whether an abandoned handler's writes ever land.
+
+    It reports where it ran so the test can observe the two contexts directly.
+    Payload-driven, so the sample payload (zero seconds) is instant, and both
+    checkpoints are upserted at fixed steps, so it is idempotent under H1.
+    """
+    write_checkpoint(ctx.connection, ctx.spec.task_id, step=0, state={"phase": "before"})
+    _sightings.append(HandlerSighting(threading.get_ident(), ctx.connection.info.backend_pid))
+    time.sleep(float(ctx.spec.payload["seconds"]))
+    write_checkpoint(ctx.connection, ctx.spec.task_id, step=1, state={"phase": "after"})
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(SPENDS_THE_CAP_TWICE, sample_payload={"seconds": 0.0})
+async def spends_the_cap_twice(ctx: TaskContext) -> TaskResult:
+    """Runs a slow statement on a second connection, then one on its own.
+
+    The shape `scan_source` has in production: a customer's database read
+    through a connection whose `statement_timeout` is the *whole* budget,
+    followed by local work under a second `statement_timeout` that is also the
+    whole budget. Two caps, one task (#42). Payload-driven -- the sample
+    payload names no second database and sleeps for zero seconds, so it stays
+    instant and writes nothing.
+    """
+    seconds = float(ctx.spec.payload["seconds"])
+    dsn = ctx.spec.payload.get("dsn")
+    if dsn is not None:
+        other = connect(str(dsn), statement_timeout=ctx.spec.budget.wall_clock)
+        try:
+            with contextlib.suppress(psycopg.Error):
+                other.execute(SELECT_PG_SLEEP, {"seconds": seconds})
+        finally:
+            other.close()
+    ctx.connection.execute(SELECT_PG_SLEEP, {"seconds": seconds})
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
 @task_handler(REPORTS_FAILURE, sample_payload={})
 async def reports_failure(ctx: TaskContext) -> TaskResult:
     """Returns a typed failure instead of raising -- the other failure path."""
@@ -164,6 +230,35 @@ class RecordingTracer:
 
 def audit_actions(conn: QueueConnection, task_id: UUID) -> list[str]:
     return [row[0] for row in conn.execute(SELECT_AUDIT_ACTIONS, (str(task_id),)).fetchall()]
+
+
+def backend_state(conn: QueueConnection, backend_pid: int) -> str | None:
+    """What Postgres says the handler's session is doing, or None once it is gone."""
+    row = conn.execute(SELECT_BACKEND_STATE, {"pid": backend_pid}).fetchone()
+    conn.commit()  # end the read transaction so the next read sees fresh state
+    return None if row is None else str(row[0])
+
+
+def checkpoints(conn: QueueConnection, task_id: UUID) -> list[tuple[int, object]]:
+    rows = conn.execute(SELECT_CHECKPOINTS, (task_id,)).fetchall()
+    conn.commit()
+    return [(row[0], row[1]) for row in rows]
+
+
+def state_of(conn: QueueConnection, task_id: UUID) -> TaskState | None:
+    task = get_task(conn, task_id)
+    conn.commit()
+    return None if task is None else task.state
+
+
+async def until(condition: Callable[[], bool], *, within: float = 20.0) -> float:
+    """Poll `condition` until it holds; return how long that took."""
+    started = time.monotonic()
+    while time.monotonic() - started < within:
+        if condition():
+            return time.monotonic() - started
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"condition did not hold within {within}s")
 
 
 async def drain(worker: Worker) -> None:
@@ -278,7 +373,10 @@ class TestFailurePaths:
     ) -> None:
         # The hole `asyncio.timeout` alone leaves open (#3 review): a handler
         # blocked in psycopg has no await point to cancel at, so the budget has
-        # to be enforced server-side or it is not enforced at all.
+        # to be enforced server-side or it is not enforced at all. What comes
+        # back from the driver is a `QueryCanceled`, and reporting *that* would
+        # file an overrun under "handler raised" -- so the runtime names it for
+        # what it is, which is what I12 asks of a hard cap (#42).
         spec = queued(
             task_type=BLOCKS_IN_THE_DRIVER,
             payload={"seconds": 30.0},
@@ -292,7 +390,7 @@ class TestFailurePaths:
         assert task is not None and task.state is TaskState.DEAD
         row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
         assert row is not None
-        assert "QueryCanceled" in row[0]["detail"]  # Postgres aborted it, not the lease
+        assert row[0]["title"] == BUDGET_EXCEEDED
 
     async def test_recording_an_outcome_is_not_bound_by_the_handlers_budget(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
@@ -486,9 +584,170 @@ class TestRunRollup:
         assert [row[0] for row in transitions].count("run.status_changed") == 2
 
 
-@pytest.mark.parametrize("task_type", [EXPLODES, REPORTS_FAILURE, BLOCKS_IN_THE_DRIVER])
+@pytest.mark.parametrize(
+    "task_type",
+    [EXPLODES, REPORTS_FAILURE, BLOCKS_IN_THE_DRIVER, BLOCKS_THE_INTERPRETER, SPENDS_THE_CAP_TWICE],
+)
 def test_scaffolding_handlers_are_registered(task_type: str) -> None:
     assert task_type in REGISTRY
+
+
+class TestWallClockIsOneCap:
+    """H4's wall-clock half: the published cap is the bound, whatever the handler does.
+
+    Before #42 it was neither. `asyncio.timeout` wrapped handlers that never
+    await, so it never fired; what was left were `statement_timeout`s each set
+    to the *whole* budget, on each of the two connections a scan uses. A
+    handler blocking in Python was unbounded; a handler making two slow calls
+    cost two caps.
+    """
+
+    async def test_a_handler_spending_the_cap_twice_is_still_capped_once(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        spec = queued(
+            task_type=SPENDS_THE_CAP_TWICE,
+            payload={"seconds": 30.0, "dsn": dsn},
+            budget=TWO_SECOND_WALL_CLOCK,
+            max_attempts=1,
+        )
+        started = time.monotonic()
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+        elapsed = time.monotonic() - started
+
+        cap = TWO_SECOND_WALL_CLOCK.wall_clock.total_seconds()
+        assert cap <= elapsed < 2 * cap, f"took {elapsed:.2f}s against a {cap:.0f}s cap"
+        assert state_of(conn, spec.task_id) is TaskState.DEAD
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        assert row is not None
+        assert row[0]["title"] == BUDGET_EXCEEDED
+
+    async def test_a_handler_blocking_the_interpreter_is_terminated_near_its_cap(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """The margin, measured: cap + grace + one bookkeeping transaction.
+
+        The handler holds the interpreter for six times its budget and nothing
+        can make it stop, so the bound has to come from the worker not waiting.
+        """
+        _sightings.clear()
+        cap = ONE_SECOND_WALL_CLOCK.wall_clock.total_seconds()
+        spec = queued(
+            task_type=BLOCKS_THE_INTERPRETER,
+            payload={"seconds": 6.0},
+            budget=ONE_SECOND_WALL_CLOCK,
+            max_attempts=1,
+        )
+        started = time.monotonic()
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+        elapsed = time.monotonic() - started
+
+        margin = elapsed - cap
+        assert margin < 1.0, f"margin was {margin:.2f}s over a {cap:.0f}s cap"
+        assert margin >= DEADLINE_GRACE.total_seconds()  # the thread was given its chance first
+        assert state_of(conn, spec.task_id) is TaskState.DEAD
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        assert row is not None
+        assert row[0]["title"] == BUDGET_EXCEEDED
+        assert row[0]["budget"]["wall_clock"] == "PT1S"  # the cap travels with the problem
+        conn.commit()
+
+    async def test_the_handler_and_the_worker_never_share_a_connection(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """The safety property, observed rather than asserted.
+
+        Mid-flight, the handler holds an *open transaction* containing its
+        first checkpoint, on a backend of its own, on a thread that is not the
+        event loop's -- while the worker has already committed `running` to the
+        same task row. One psycopg connection cannot do both: a shared
+        connection would have committed or discarded the handler's write along
+        with the worker's. That the two are independent is what the old
+        `asyncio.to_thread` shape could not offer, and it is why the worker can
+        end the attempt without ever touching what the handler is using.
+
+        Afterwards the handler's session is gone: the worker had Postgres end
+        it, so an abandoned handler is not merely expected not to write -- it
+        cannot.
+        """
+        _sightings.clear()
+        spec = queued(
+            task_type=BLOCKS_THE_INTERPRETER,
+            payload={"seconds": 6.0},
+            budget=ONE_SECOND_WALL_CLOCK,
+            max_attempts=1,
+        )
+        execution = asyncio.create_task(Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once())
+
+        await until(lambda: bool(_sightings))
+        [sighting] = _sightings
+        assert sighting.thread_ident != threading.get_ident()  # off the loop, which stayed free
+        assert backend_state(conn, sighting.backend_pid) == "idle in transaction"
+        assert state_of(conn, spec.task_id) is TaskState.RUNNING  # committed by the other session
+        assert checkpoints(conn, spec.task_id) == []  # while the handler's write is still pending
+
+        assert await execution == 1
+        assert backend_state(conn, sighting.backend_pid) is None
+        assert checkpoints(conn, spec.task_id) == []
+        task = get_task(conn, spec.task_id)
+        conn.commit()
+        assert task is not None
+        assert task.state is TaskState.DEAD and task.attempts == 1
+
+
+class TestWorkerStaysResponsive:
+    """N1: an executing worker is still a working worker.
+
+    A handler used to run on the event loop, so for its whole duration the
+    worker could neither reap another worker's expired leases nor notice a
+    SIGTERM. Both are now bounded by a poll interval instead of a task.
+    """
+
+    async def test_expired_leases_are_reaped_while_a_handler_runs(
+        self,
+        dsn: str,
+        conn: QueueConnection,
+        open_conn: Callable[[], QueueConnection],
+        queued: Callable[..., TaskSpec],
+    ) -> None:
+        stale = queued(task_type=NOOP_TASK_TYPE, payload={"n": 700})
+        crashed = open_conn()
+        claim(crashed, worker_id="crashed", lease=EXPIRED_LEASE, task_types=[NOOP_TASK_TYPE])
+        crashed.commit()
+        crashed.close()  # the crash: claimed, never executed, lease already expired
+
+        blocking = queued(task_type=BLOCKS_THE_INTERPRETER, payload={"seconds": 6.0})
+        stop = asyncio.Event()
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=50))
+        loop_task = asyncio.create_task(worker.run_forever(stop))
+        try:
+            await until(lambda: state_of(conn, blocking.task_id) is TaskState.RUNNING)
+            await until(lambda: state_of(conn, stale.task_id) is TaskState.PENDING, within=5.0)
+            assert state_of(conn, blocking.task_id) is TaskState.RUNNING  # still working on it
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop_task, timeout=5)
+
+    async def test_shutdown_does_not_wait_out_the_handler(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        _sightings.clear()
+        spec = queued(task_type=BLOCKS_THE_INTERPRETER, payload={"seconds": 6.0})
+        stop = asyncio.Event()
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=50))
+        loop_task = asyncio.create_task(worker.run_forever(stop))
+
+        await until(lambda: state_of(conn, spec.task_id) is TaskState.RUNNING)
+        stop.set()
+        started = time.monotonic()
+        await asyncio.wait_for(loop_task, timeout=5)
+        assert time.monotonic() - started < 1.0  # not the handler's remaining seconds
+
+        # The attempt is left where a reaper can find it (N1) rather than
+        # failed: nothing about it exceeded a budget.
+        assert state_of(conn, spec.task_id) is TaskState.RUNNING
+        [sighting] = _sightings
+        await until(lambda: backend_state(conn, sighting.backend_pid) is None)
 
 
 class TestLeaseCoversBudget:

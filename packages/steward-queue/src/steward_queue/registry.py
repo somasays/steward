@@ -14,6 +14,12 @@ Registering a handler is a promise with four clauses:
    database work goes through `ctx.connection`, and the handler never commits
    or rolls back: the worker owns the transaction so that the handler's writes,
    the task's terminal state, and the audit row commit together (I7, I8).
+   `ctx.connection` belongs to the thread the handler is called on and to
+   nothing else -- the worker opens it there, closes it there, and never
+   touches it from the event loop (SPEC.md §13, D7). A handler may block on it
+   freely; blocking costs it its own budget and no one else's responsiveness.
+   What a handler must not do is hand the connection to a thread of its own,
+   which would recreate on the inside the sharing this contract removes.
 2. **Idempotence.** Executing the handler twice with the same `TaskSpec` must
    leave the same end state. Writes are upserts keyed on natural keys; a
    handler must not read its own side effects to decide what to do next
