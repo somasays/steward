@@ -159,11 +159,10 @@ class PostgresRunStore:
         generated and then discarded (#27). Opening the span first satisfied
         only the first, and put replay spans on a trace no run points at.
 
-        So the attempt is resolved first and the span opened over its outcome:
-        a persisted record names the span (its own run id, trace id and goal),
-        and a failure -- which persisted no run at all -- falls back to the
-        identity this call generated, the only one that ever named the work.
-        The captured failure is re-raised inside the span, so the tracer marks
+        So the transaction is resolved first and the span opened over its
+        result: a persisted record names the span (its own run id, trace id and
+        goal), and a failure -- which persisted no run at all -- is re-raised
+        inside a span on the identity this call generated, so the tracer marks
         it `ERROR` on the way out exactly as it did before. The cost is that
         the span no longer brackets the transaction and so measures nothing;
         identity is the guarantee (I7), duration was incidental.
@@ -178,16 +177,17 @@ class PostgresRunStore:
         """
         run_id = uuid4()
         trace_id = new_trace_id(seed=str(run_id))
-        outcome = self._persist(spec, run_id=run_id, trace_id=trace_id, idempotency_key=idempotency_key)
-        if isinstance(outcome, RunRecord):
-            span_trace_id, span_run_id, span_goal = outcome.trace_id, outcome.id, outcome.goal
-        else:
-            span_trace_id, span_run_id, span_goal = trace_id, run_id, spec.goal
-        with self._tracer.run_span(trace_id=span_trace_id, run_id=span_run_id, goal=span_goal) as span:
-            if not isinstance(outcome, RunRecord):
-                raise outcome
-            run = to_response(outcome)
-            if outcome.id != run_id:
+        try:
+            record = self._persist(spec, run_id=run_id, trace_id=trace_id, idempotency_key=idempotency_key)
+        except Exception:
+            # Nothing was persisted, so the identity this call generated is the
+            # only one that ever named the work. Re-raising inside the span is
+            # what makes the tracer record the failure, exactly as before.
+            with self._tracer.run_span(trace_id=trace_id, run_id=run_id, goal=spec.goal):
+                raise
+        with self._tracer.run_span(trace_id=record.trace_id, run_id=record.id, goal=record.goal) as span:
+            run = to_response(record)
+            if record.id != run_id:
                 if idempotency_key is not None and not _same_request(run, spec):
                     raise IdempotencyKeyReused(idempotency_key, run)
                 span.record(SpanOutcome.OK, REPLAYED_DETAIL)
@@ -195,29 +195,24 @@ class PostgresRunStore:
 
     def _persist(
         self, spec: RunCreate, *, run_id: UUID, trace_id: str, idempotency_key: str | None
-    ) -> RunRecord | Exception:
-        """The run row and its first task in one transaction, with a failure
-        returned rather than raised.
+    ) -> RunRecord:
+        """The run row and its first task, committed together (I8).
 
-        Returned because the span that must record the failure cannot be opened
-        until the row this call is about is known, and opening it earlier is
-        what put replay spans on a discarded identity. The caller re-raises.
+        Separate from `_create_run` only so the run this call is about is known
+        -- returned or raised -- before anything opens a span about it.
         """
-        try:
-            with connect(self._dsn) as conn:
-                record = create_run(
-                    conn,
-                    goal=spec.goal,
-                    payload=spec.payload,
-                    budget=self._budget,
-                    run_id=run_id,
-                    trace_id=trace_id,
-                    idempotency_key=idempotency_key,
-                )
-                enqueue(conn, self._first_task(record))
-                conn.commit()
-        except Exception as exc:
-            return exc
+        with connect(self._dsn) as conn:
+            record = create_run(
+                conn,
+                goal=spec.goal,
+                payload=spec.payload,
+                budget=self._budget,
+                run_id=run_id,
+                trace_id=trace_id,
+                idempotency_key=idempotency_key,
+            )
+            enqueue(conn, self._first_task(record))
+            conn.commit()
         return record
 
     def _first_task(self, record: RunRecord) -> TaskSpec:
