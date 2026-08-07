@@ -40,10 +40,22 @@ jobs:
   gitleaks:
     name: secret scan (G4)
     runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.24.3
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The gitleaks action scans only the event's commit range, which errors out
+      # on pull_request events ("stderr is not empty", 0 bytes scanned) and exits 1
+      # on a scan that never happened. G4 promises full history on every event, so
+      # invoke the CLI directly and scan the whole repo the same way every time.
+      - name: Install gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan full history
+        run: gitleaks git --no-banner --redact --exit-code 1 .
