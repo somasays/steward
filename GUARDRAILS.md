@@ -9,7 +9,7 @@ Coverage rule: **every N-row and I-row in ARCHITECTURE.md is protected by at lea
 Checks are tiered by *how* they measure, because different properties fail at different speeds:
 
 - **Tier S — static architecture checks**: seconds, every commit, no environment needed
-- **Tier H — behavioral harnesses**: minutes, every PR, real components against Dockerized fixtures
+- **Tier H — behavioral harnesses**: minutes, every PR, real components against an ephemeral Postgres (`pgserver` ships the binaries — no Docker, on a laptop or in CI)
 - **Tier B — benchmarks & evals**: PR when affected paths change, plus nightly; golden datasets and load fixtures
 - **Tier P — production fitness**: continuous, on the live system
 - **Hygiene (G)** — generic code health. Blocking, but deliberately *not* called a fitness function: it protects code quality, not this system's architecture
@@ -28,7 +28,7 @@ Checks are tiered by *how* they measure, because different properties fail at di
 | S6 | Contract compatibility | I3, N9 | `check_contracts.py` — regenerates JSON Schema for every published Pydantic contract and the exported OpenAPI spec, diffs each against its committed snapshot in `contracts/`; a stdlib differ (no external oasdiff binary) classifies removed model/property/path/method, type changes, new-required properties, and enum narrowing as breaking (FAIL), any other drift as a stale snapshot (FAIL), match as PASS | active |
 | S7 | File-graph coverage | doc consistency | `check_filegraph.py` — `scripts/fitness/filegraph.json` maps every file pattern to its impacted files; changing a file means updating/verifying its dependents (workflow law, CLAUDE.md); S7 fails if any tracked file is outside the graph | active |
 
-### Tier H — behavioral harnesses (every PR; `pytest -m invariants` / `-m acceptance` against Docker fixtures)
+### Tier H — behavioral harnesses (every PR; `pytest -m invariants` / `-m acceptance` against an ephemeral Postgres)
 
 These run real components — Postgres, the queue, the runtime with a stub LLM — and assert system behavior. They bind to *registries* (task handlers, repositories, agents), so a newly added component is on the leash automatically.
 
