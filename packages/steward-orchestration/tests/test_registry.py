@@ -16,6 +16,7 @@ import pytest
 from pydantic import ValidationError
 from steward_orchestration import (
     DisallowedTaskType,
+    EmptyRunPlan,
     GoalParams,
     GoalRegistration,
     InvalidGoalPayload,
@@ -56,6 +57,7 @@ def _registration(
         planner=planner,
         allowed_task_types=allowed,
         budget=BUDGET,
+        sample_payload={"table": "public.users"},
     )
 
 
@@ -136,6 +138,17 @@ def test_a_planner_cannot_plan_outside_its_allowlist() -> None:
     assert "profile_table" in str(excinfo.value)
 
 
+def test_a_planner_that_plans_nothing_is_rejected() -> None:
+    # `_default_planner` fans out one task per unit of `limit`; zero is a
+    # planner returning no tasks, the exact shape a conditional planner with a
+    # missed branch would take at runtime.
+    with pytest.raises(EmptyRunPlan) as excinfo:
+        _registration().plan({"table": "t", "limit": 0})
+
+    assert excinfo.value.goal == "fixture_goal"
+    assert "fixture_goal" in str(excinfo.value)
+
+
 def test_an_allowed_expansion_becomes_queue_specs_under_the_goals_budget() -> None:
     # Per-task caps are the goal's caps today; see `task_specs` on why that is a
     # placeholder until run-level budget enforcement lands with the agent loop.
@@ -180,7 +193,13 @@ def test_registered_goals_are_sorted_names() -> None:
 
 
 def test_registering_a_goal_makes_it_plannable(isolated_registry: None) -> None:
-    @goal("fixture_goal", params_model=Params, allowed_task_types=["profile_table"], budget=BUDGET)
+    @goal(
+        "fixture_goal",
+        params_model=Params,
+        allowed_task_types=["profile_table"],
+        budget=BUDGET,
+        sample_payload={"table": "public.users"},
+    )
     def plan(params: Params) -> tuple[PlannedTask, ...]:
         return (PlannedTask(task_type="profile_table", payload={"table": params.table}),)
 
@@ -197,10 +216,22 @@ def test_a_goal_name_cannot_be_registered_twice(isolated_registry: None) -> None
     def plan(params: Params) -> tuple[PlannedTask, ...]:
         return ()
 
-    goal("fixture_goal", params_model=Params, allowed_task_types=["profile_table"], budget=BUDGET)(plan)
+    goal(
+        "fixture_goal",
+        params_model=Params,
+        allowed_task_types=["profile_table"],
+        budget=BUDGET,
+        sample_payload={"table": "public.users"},
+    )(plan)
 
     with pytest.raises(ValueError, match="already registered"):
-        goal("fixture_goal", params_model=Params, allowed_task_types=["profile_table"], budget=BUDGET)(plan)
+        goal(
+            "fixture_goal",
+            params_model=Params,
+            allowed_task_types=["profile_table"],
+            budget=BUDGET,
+            sample_payload={"table": "public.users"},
+        )(plan)
 
 
 def test_a_goal_cannot_be_registered_with_an_empty_allowlist(isolated_registry: None) -> None:
@@ -210,4 +241,10 @@ def test_a_goal_cannot_be_registered_with_an_empty_allowlist(isolated_registry: 
         return ()
 
     with pytest.raises(ValueError, match="empty task-type allowlist"):
-        goal("fixture_goal", params_model=Params, allowed_task_types=[], budget=BUDGET)(plan)
+        goal(
+            "fixture_goal",
+            params_model=Params,
+            allowed_task_types=[],
+            budget=BUDGET,
+            sample_payload={"table": "public.users"},
+        )(plan)

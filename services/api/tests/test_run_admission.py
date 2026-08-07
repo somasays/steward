@@ -14,20 +14,30 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Iterator
+from datetime import timedelta
+from decimal import Decimal
 
 import pgserver
 import pytest
 from fastapi.testclient import TestClient
 from steward_api.app import create_app
 from steward_api.store import PostgresRunStore
-from steward_orchestration import NOOP_BUDGET
+from steward_orchestration import NOOP_BUDGET, GoalParams, PlannedTask
+from steward_orchestration.registry import goal, unregister
 from steward_queue import connect, upgrade_to_head
 from steward_queue.db import QueueConnection
+from steward_schemas import RunBudget
 
 PROBLEM_CONTENT_TYPE = "application/problem+json"
 
 COUNT_RUNS = "SELECT count(*) FROM runs"
 COUNT_TASKS = "SELECT count(*) FROM tasks"
+
+EMPTY_PLAN_GOAL = "plans_nothing"
+
+EMPTY_PLAN_BUDGET = RunBudget(
+    steps=1, tokens=1, cost_usd=Decimal("0.01"), wall_clock=timedelta(seconds=1)
+)
 
 
 @pytest.fixture(scope="session")
@@ -55,6 +65,41 @@ def conn(dsn: str) -> Iterator[QueueConnection]:
 def db_client(dsn: str) -> Iterator[TestClient]:
     with TestClient(create_app(PostgresRunStore(dsn))) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def db_client_no_raise(dsn: str) -> Iterator[TestClient]:
+    # `EmptyRunPlan` is a programming error, mapped the same way
+    # `DisallowedTaskType` is: nothing in problem_details.py catches it, so it
+    # reaches Starlette's default 500 handling. The default `TestClient`
+    # re-raises server exceptions instead of turning them into a response,
+    # which is right for debugging but wrong for a test asserting on the
+    # status code a real deployment would actually return.
+    with TestClient(create_app(PostgresRunStore(dsn)), raise_server_exceptions=False) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def plans_nothing_goal() -> Iterator[str]:
+    """Register a goal whose planner always returns zero tasks -- the exact
+    shape a conditional planner with a missed branch takes at runtime -- then
+    undo the registration so it cannot leak into another test.
+    """
+
+    @goal(
+        EMPTY_PLAN_GOAL,
+        params_model=GoalParams,
+        allowed_task_types=["noop"],
+        budget=EMPTY_PLAN_BUDGET,
+        sample_payload={},
+    )
+    def plan(params: GoalParams) -> tuple[PlannedTask, ...]:
+        return ()
+
+    try:
+        yield EMPTY_PLAN_GOAL
+    finally:
+        unregister(EMPTY_PLAN_GOAL)
 
 
 def _counts(conn: QueueConnection) -> tuple[int, int]:
@@ -113,6 +158,21 @@ def test_a_rejected_request_creates_no_run_and_no_task(db_client: TestClient, co
     invalid = db_client.post("/v1/runs", json={"goal": "noop", "payload": {"echo": []}})
 
     assert (unknown.status_code, invalid.status_code) == (422, 422)
+    assert _counts(conn) == before
+
+
+def test_a_planner_that_plans_nothing_creates_no_run_and_no_task(
+    db_client_no_raise: TestClient, conn: QueueConnection, plans_nothing_goal: str
+) -> None:
+    # Issue #37: a planner that expands to zero tasks used to be accepted and
+    # committed as a run nothing could ever move out of `pending`. It is now a
+    # 500 -- a planner planning nothing is a bug, not a bad request -- and,
+    # like every other rejection, it must leave nothing behind.
+    before = _counts(conn)
+
+    resp = db_client_no_raise.post("/v1/runs", json={"goal": plans_nothing_goal})
+
+    assert resp.status_code == 500
     assert _counts(conn) == before
 
 

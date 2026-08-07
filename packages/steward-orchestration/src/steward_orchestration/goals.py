@@ -59,6 +59,7 @@ class NoopParams(GoalParams):
     params_model=NoopParams,
     allowed_task_types=[NOOP_TASK_TYPE],
     budget=NOOP_BUDGET,
+    sample_payload={"echo": "steward"},
 )
 def plan_noop(params: NoopParams) -> tuple[PlannedTask, ...]:
     """Expand `noop` into the single task M0's exit criterion flows through."""

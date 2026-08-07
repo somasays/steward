@@ -6,9 +6,25 @@ milestone is checked the moment it is registered, with no test to remember to
 edit. It is the reason orchestration does not import the queue at runtime --
 the two packages agree on task-type *names*, and this is where that agreement
 is verified instead of assumed.
+
+`test_every_registered_planner_is_deterministic` binds the same way: it is
+ARCHITECTURE.md §4's "planners are deterministic and pure" turned into a check
+(issue #37), run against every registration's required `sample_payload`
+(GUARDRAILS.md §3, the same registry-bound shape H1 uses).
 """
 
-from steward_orchestration import NOOP_GOAL, NOOP_TASK_TYPE, NoopParams, get_goal, plan_run, registered_goals
+from uuid import uuid4
+
+from steward_orchestration import (
+    NOOP_GOAL,
+    NOOP_TASK_TYPE,
+    GoalParams,
+    NoopParams,
+    PlannedTask,
+    get_goal,
+    plan_run,
+    registered_goals,
+)
 from steward_queue import registered_types
 
 
@@ -46,3 +62,54 @@ def test_noop_accepts_an_empty_payload() -> None:
 
     assert plan.tasks[0].payload == {"echo": ""}
     assert NoopParams().echo == ""
+
+
+def test_the_registry_has_subjects() -> None:
+    # A harness bound to a registry must fail loudly on zero subjects rather
+    # than pass on none, the same guard `steward_queue`'s H1 harness carries.
+    assert registered_goals(), "no registered goals to check determinism on"
+
+
+def test_every_registered_planner_is_deterministic() -> None:
+    """ARCHITECTURE.md §4: planners are deterministic and pure code, but
+    nothing checked it -- a planner reading `uuid4()` or the clock registered
+    happily. Each registration's own `sample_payload` (required at
+    registration, GUARDRAILS.md §3) is run through the planner twice; the
+    resulting `PlannedTask`s are compared in full.
+
+    `PlannedTask` carries no generated identity of its own -- `task_type`,
+    `payload` and `max_attempts`, all supplied by the planner -- so a plain
+    tuple comparison covers everything the planner is answerable for. The ids
+    `RunPlan.task_specs` mints (`task_id`, `run_id`) come from `uuid4()` calls
+    made *after* planning, on the plan's output, never from the planner
+    itself, so they are out of scope here by construction, not by omission.
+    """
+    for name in registered_goals():
+        registration = get_goal(name)
+
+        first = registration.plan(registration.sample_payload).tasks
+        second = registration.plan(registration.sample_payload).tasks
+
+        assert first == second, f"goal {name!r} planned different tasks across two runs"
+
+
+def test_the_comparison_would_catch_a_nondeterministic_planner() -> None:
+    """Determinism checks must be falsifiable: a planner reaching for `uuid4()`
+    has to make the comparison above fail, or a green result proves nothing.
+
+    Exercised directly against a throwaway planner rather than a real
+    registration, so this test does not depend on any goal staying
+    non-deterministic-free to prove the check works.
+    """
+
+    class Params(GoalParams):
+        pass
+
+    def reads_uuid4(params: Params) -> tuple[PlannedTask, ...]:
+        return (PlannedTask(task_type="noop", payload={"id": str(uuid4())}),)
+
+    params = Params()
+    first = tuple(reads_uuid4(params))
+    second = tuple(reads_uuid4(params))
+
+    assert first != second
