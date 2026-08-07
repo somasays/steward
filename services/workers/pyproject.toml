@@ -1,9 +1,19 @@
 [project]
 name = "steward-workers"
 version = "0.1.0"
-description = "Steward worker entrypoints (one per agent type). Skeleton only."
+description = "Steward worker entrypoints: claim tasks from the Postgres queue and execute them."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "steward-queue",
+    "steward-telemetry",
+]
+
+[project.scripts]
+steward-worker = "steward_workers.__main__:main"
+
+[tool.uv.sources]
+steward-queue = { workspace = true }
+steward-telemetry = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]
