@@ -5,8 +5,8 @@ I5: SQL is never assembled from strings. Nothing here is an f-string, a
 server-side parameter binding (`%(name)s` placeholders, bound by psycopg).
 That is also what keeps ruff S608 (S3) quiet without a single pragma.
 
-Private module on purpose: SQL text is an implementation detail of
-`steward_queue.queue`, not part of this package's public surface.
+Private module on purpose: SQL text is an implementation detail of the modules
+that run these statements, not part of this package's public surface.
 """
 
 # The `ON CONFLICT` clause is the idempotency-key contract (SPEC.md §8): a

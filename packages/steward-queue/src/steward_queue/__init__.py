@@ -6,11 +6,14 @@ atomically, which removes ghost tasks and lost tasks as a category (I8). Every
 function here takes the caller's connection and never commits it, so that
 guarantee is structural rather than a convention reviewers have to police.
 
-The three moving parts:
+The moving parts, one module per aggregate behind this façade:
 
-* `queue` -- enqueue, claim (`FOR UPDATE SKIP LOCKED`), complete, fail with
-  exponential backoff and dead-lettering, and lease recovery. Each state
-  mutation writes its audit row on the same connection (I7).
+* `tasks` -- enqueue, claim (`FOR UPDATE SKIP LOCKED`), complete, fail with
+  exponential backoff and dead-lettering, and lease recovery.
+* `runs` -- creation with an idempotency key, status, and spend against the
+  run's budget.
+* `checkpoints` -- agent state persisted between steps.
+* `audit` -- the audit row each of those writes on its own connection (I7).
 * `registry` -- task type -> handler, with the contract handlers sign
   (idempotence, sample payload, state probe). The H1 harness iterates it, so
   new handlers are leashed on registration.
@@ -26,6 +29,7 @@ Schema lives in `migrations`; `migrate.upgrade_to_head` applies it.
 """
 
 from steward_queue.backoff import retry_delay
+from steward_queue.checkpoints import write_checkpoint
 from steward_queue.db import DSN_ENV, QueueConnection, connect
 from steward_queue.handlers import NOOP_TASK_TYPE
 from steward_queue.migrate import downgrade_to_base, upgrade_to_head
@@ -39,24 +43,6 @@ from steward_queue.models import (
     TaskRecord,
     TaskState,
 )
-from steward_queue.queue import (
-    DEFAULT_LEASE,
-    TaskNotClaimable,
-    claim,
-    complete,
-    create_run,
-    dedup_key_for,
-    enqueue,
-    fail,
-    get_run,
-    get_task,
-    mark_running,
-    requeue_stale,
-    rollup_run_status,
-    set_run_status,
-    start_run,
-    write_checkpoint,
-)
 from steward_queue.registry import (
     REGISTRY,
     HandlerRegistration,
@@ -68,6 +54,19 @@ from steward_queue.registry import (
     get_handler,
     registered_types,
     task_handler,
+)
+from steward_queue.runs import create_run, get_run, rollup_run_status, set_run_status, start_run
+from steward_queue.tasks import (
+    DEFAULT_LEASE,
+    TaskNotClaimable,
+    claim,
+    complete,
+    dedup_key_for,
+    enqueue,
+    fail,
+    get_task,
+    mark_running,
+    requeue_stale,
 )
 from steward_queue.worker import Worker
 

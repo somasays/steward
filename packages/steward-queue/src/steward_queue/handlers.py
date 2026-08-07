@@ -11,7 +11,7 @@ from decimal import Decimal
 
 from steward_schemas import RunBudget, TaskResult, TaskStatus
 
-from steward_queue.queue import write_checkpoint
+from steward_queue.checkpoints import write_checkpoint
 from steward_queue.registry import TaskContext, task_handler
 
 NOOP_TASK_TYPE = "noop"
