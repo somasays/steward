@@ -34,7 +34,7 @@ from steward_queue import (
     write_checkpoint,
 )
 from steward_queue.db import QueueConnection
-from steward_queue.execution import EXECUTION_FAILED
+from steward_queue.execution import EXECUTION_FAILED, HANDLER_FAILED
 from steward_queue.registry import TaskContext
 from steward_queue.worker import BUDGET_EXCEEDED, DEADLINE_GRACE
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
@@ -51,6 +51,7 @@ BLOCKS_IN_THE_DRIVER = "test.blocks_in_the_driver"
 BLOCKS_THE_INTERPRETER = "test.blocks_the_interpreter"
 SPENDS_THE_CAP_TWICE = "test.spends_the_cap_twice"
 SWALLOWS_A_DATABASE_ERROR = "test.swallows_a_database_error"
+LEAKS_CANCELLATION = "test.leaks_cancellation"
 UNREGISTERED = "test.unregistered"
 REPORTS_ITS_LEASE = "test.reports_its_lease"
 
@@ -208,6 +209,26 @@ async def swallows_a_database_error(ctx: TaskContext) -> TaskResult:
     if ctx.spec.payload.get("swallow"):
         with contextlib.suppress(psycopg.Error):
             ctx.connection.execute(SELECT_DIVIDE_BY_ZERO)
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(LEAKS_CANCELLATION, sample_payload={"leak": False})
+async def leaks_cancellation(ctx: TaskContext) -> TaskResult:
+    """Lets a bare `CancelledError` escape -- the routine bug behind #55.
+
+    Awaiting a task that has been cancelled raises `CancelledError` in the
+    awaiter without cancelling it, which is exactly what an inner `wait_for` or
+    `TaskGroup` around the LLM gateway leaks when a handler neither absorbs it
+    nor re-raises it as its own error. It is raised on the handler thread's own
+    event loop, so it says nothing about the worker's.
+
+    Payload-driven, so the sample payload is an instant, idempotent no-op that
+    writes nothing under H1.
+    """
+    if ctx.spec.payload.get("leak"):
+        inner = asyncio.create_task(asyncio.sleep(30))
+        inner.cancel()
+        await inner
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
 
 
@@ -566,6 +587,42 @@ class TestExecutionFailures:
         assert state_of(conn, spec.task_id) is TaskState.PENDING
 
 
+class TestCancellationIsTaskScoped:
+    """#55: a handler's `CancelledError` is one task's bug, not the process ending.
+
+    The handler runs `asyncio.run` on an event loop of its own, so cancellation
+    escaping it carries no information about the worker's loop. Grouped with
+    `SystemExit` and `KeyboardInterrupt` it travelled out of the future the poll
+    loop reads and killed the worker -- the #45 shape through the one door #45
+    left open, and reachable by any handler that awaits.
+    """
+
+    async def test_a_handler_leaking_cancellation_fails_that_task_and_leaves_the_worker_polling(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        leaking = queued(task_type=LEAKS_CANCELLATION, payload={"leak": True}, max_attempts=1)
+
+        stop = asyncio.Event()
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=20), retry_base_delay=NO_BACKOFF)
+        loop_task = asyncio.create_task(worker.run_forever(stop))
+        try:
+            await until(lambda: state_of(conn, leaking.task_id) is TaskState.DEAD)
+
+            # Enqueued only now, so claiming it proves the loop is still
+            # polling rather than that it had two tasks in one batch.
+            healthy = queued(task_type=NOOP_TASK_TYPE, payload={"n": 904})
+            await until(lambda: state_of(conn, healthy.task_id) is TaskState.SUCCEEDED)
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop_task, timeout=5)
+
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (leaking.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None
+        assert row[0]["title"] == HANDLER_FAILED  # the handler's own bug, named as such
+        assert row[0]["detail"].startswith("CancelledError")
+
+
 class TestConcurrency:
     async def test_two_workers_never_execute_a_task_twice(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
@@ -734,6 +791,7 @@ class TestRunRollup:
         BLOCKS_THE_INTERPRETER,
         SPENDS_THE_CAP_TWICE,
         SWALLOWS_A_DATABASE_ERROR,
+        LEAKS_CANCELLATION,
     ],
 )
 def test_scaffolding_handlers_are_registered(task_type: str) -> None:
