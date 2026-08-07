@@ -36,7 +36,12 @@ from steward_queue import (
 from steward_queue.db import QueueConnection
 from steward_queue.execution import EXECUTION_FAILED
 from steward_queue.registry import TaskContext
-from steward_queue.worker import BUDGET_EXCEEDED, DEADLINE_GRACE
+from steward_queue.worker import (
+    BOOKKEEPING_CONNECTION_FAILED,
+    BUDGET_EXCEEDED,
+    CONNECT_RETRY_ATTEMPTS,
+    DEADLINE_GRACE,
+)
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
 from steward_telemetry import Span, SpanOutcome
 
@@ -564,6 +569,185 @@ class TestExecutionFailures:
         assert requeue_stale(conn) == [(spec.task_id, TaskState.PENDING)]
         conn.commit()
         assert state_of(conn, spec.task_id) is TaskState.PENDING
+
+
+def break_worker_connections(
+    monkeypatch: pytest.MonkeyPatch, error: BaseException, *, times: int | None = None
+) -> None:
+    """Make `execute`'s own bookkeeping connect fail -- not `_claim`'s or `_reap`'s.
+
+    #45's regression test (`break_handler_connections` above) only reaches
+    `execution.connect`, the handler's own -- its docstring says so. #56 is
+    that a task opens two connections *before* the handler ever runs: `_claim`
+    and `execute`'s bookkeeping one, both fatal until this. `_claim` and
+    `_reap` call `connect(dsn)` with no `statement_timeout`; `execute` always
+    passes one (`self._lease`). That is the one thing to key on, since nothing
+    else about the call differs.
+
+    `times=None` fails every attempt, exercising exhaustion past the retry
+    bound; a small int lets a later attempt through, exercising the retry
+    succeeding.
+    """
+    attempts = itertools.count()
+
+    def failing(dsn: str, *, statement_timeout: timedelta | None = None) -> QueueConnection:
+        if statement_timeout is not None and (times is None or next(attempts) < times):
+            raise error
+        return connect(dsn, statement_timeout=statement_timeout)
+
+    monkeypatch.setattr("steward_queue.worker.connect", failing)
+
+
+class TestWorkerConnectionFailures:
+    """#56: the worker's own connections can fail too, not just the handler's.
+
+    A task opens up to four connections across a poll -- `_claim`'s, `_reap`'s,
+    `execute`'s bookkeeping one, and the handler's (#45 covers the last). #45's
+    regression test forced the failure at `execution.connect` only, leaving
+    `worker.connect` working, which is a narrower case than genuine
+    `max_connections` exhaustion: that kills the worker at `_claim` or
+    `execute`, before the handler's connection is ever reached. These force it
+    at `worker.connect` instead.
+    """
+
+    async def test_a_bookkeeping_connection_that_never_opens_leaves_the_task_to_lease_recovery(
+        self,
+        dsn: str,
+        conn: QueueConnection,
+        queued: Callable[..., TaskSpec],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`execute`'s connect can fail after `_claim` has already committed the claim.
+
+        Unlike `_claim` -- which has no task in hand and is left to exit
+        (SPEC.md §13 D7) -- a task IS claimed here, so the worker must not die
+        over it. Every retry fails, so `_start`/`mark_running` never runs and
+        the row is left `claimed` rather than `running` -- it never got that
+        far. The bounded retry gives up rather than blocking the loop, and
+        with no connection left to write on, the attempt is left exactly where
+        #53's "recorded by neither context" case leaves one: unrecorded, still
+        owned, reclaimed by `requeue_stale` at lease expiry.
+        """
+        spec = queued(task_type=NOOP_TASK_TYPE, payload={"n": 950})
+        [claimed] = claim(conn, worker_id="w1")
+        conn.commit()
+        break_worker_connections(monkeypatch, psycopg.OperationalError("too many connections"))
+
+        tracer = RecordingTracer()
+        worker = Worker(dsn, "w1", tracer=tracer)
+        assert await worker.execute(claimed) is True  # handled, not raised
+
+        assert state_of(conn, spec.task_id) is TaskState.CLAIMED
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None and row[0] is None  # nothing was ever written
+
+        [span] = tracer.spans
+        assert span.outcome is SpanOutcome.ERROR
+        assert span.detail == BOOKKEEPING_CONNECTION_FAILED
+
+        conn.execute(EXPIRE_LEASE, (spec.task_id,))  # the lease this attempt was left to
+        conn.commit()
+        assert requeue_stale(conn) == [(spec.task_id, TaskState.PENDING)]
+        conn.commit()
+        assert state_of(conn, spec.task_id) is TaskState.PENDING
+
+    async def test_a_bookkeeping_connection_that_opens_on_retry_still_runs_the_task(
+        self,
+        dsn: str,
+        conn: QueueConnection,
+        queued: Callable[..., TaskSpec],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Proves the retry loop itself: losing a race for one slot is not exhaustion.
+
+        Without this, the retry in `_connect_for_execute` is dead code the
+        exhaustion test above never walks past the first attempt.
+        """
+        assert CONNECT_RETRY_ATTEMPTS > 1  # otherwise this test asserts nothing about a retry
+        spec = queued(task_type=NOOP_TASK_TYPE, payload={"n": 951})
+        [claimed] = claim(conn, worker_id="w1")
+        conn.commit()
+        break_worker_connections(
+            monkeypatch, psycopg.OperationalError("too many connections"), times=CONNECT_RETRY_ATTEMPTS - 1
+        )
+
+        assert await Worker(dsn, "w1").execute(claimed) is True
+
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.SUCCEEDED
+
+    async def test_connection_exhaustion_does_not_crash_the_poll_loop(
+        self,
+        dsn: str,
+        conn: QueueConnection,
+        queued: Callable[..., TaskSpec],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The loop-survival half of #56, mirroring #45's own shape.
+
+        `_claim` succeeds (it is untouched by `break_worker_connections`), so
+        the task reaches `execute` and only then finds every connection
+        refused -- exhausting the retry -- while the loop keeps polling and a
+        second, healthy task still completes.
+        """
+        broken = queued(task_type=NOOP_TASK_TYPE, payload={"n": 952}, max_attempts=1)
+        break_worker_connections(
+            monkeypatch, psycopg.OperationalError("too many connections"), times=CONNECT_RETRY_ATTEMPTS
+        )
+
+        stop = asyncio.Event()
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=20), retry_base_delay=NO_BACKOFF)
+        loop_task = asyncio.create_task(worker.run_forever(stop))
+        try:
+            await until(lambda: state_of(conn, broken.task_id) is TaskState.CLAIMED)
+
+            # Enqueued only now, so claiming and succeeding it proves the loop
+            # is still polling, not that it had two tasks in one batch.
+            healthy = queued(task_type=NOOP_TASK_TYPE, payload={"n": 953})
+            await until(lambda: state_of(conn, healthy.task_id) is TaskState.SUCCEEDED)
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop_task, timeout=5)
+
+    async def test_the_reaper_survives_a_connection_it_cannot_open(
+        self,
+        dsn: str,
+        conn: QueueConnection,
+        queued: Callable[..., TaskSpec],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`_reap`'s connect is a fourth call site with the same exposure (#56).
+
+        `_claim` and `_reap` are indistinguishable by call signature -- neither
+        passes `statement_timeout` -- so `break_worker_connections` (keyed on
+        that) cannot target one without the other. This runs `_reap_forever`
+        directly instead of the full loop, so `_claim` is never called at all
+        and a plain, unconditional connect failure only ever hits `_reap`: the
+        assertion is that the reaper outlives a connection it cannot open and
+        still reclaims a stale lease once one succeeds.
+        """
+        spec = queued(task_type=NOOP_TASK_TYPE, payload={"n": 954})
+        claim(conn, worker_id="ghost", lease=EXPIRED_LEASE)
+        conn.commit()
+
+        attempts = itertools.count()
+
+        def flaky(dsn_: str, *, statement_timeout: timedelta | None = None) -> QueueConnection:
+            if next(attempts) < 2:
+                raise psycopg.OperationalError("too many connections")
+            return connect(dsn_, statement_timeout=statement_timeout)
+
+        monkeypatch.setattr("steward_queue.worker.connect", flaky)
+
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=20))
+        stop = asyncio.Event()
+        reaper_task = asyncio.create_task(worker._reap_forever(stop))
+        try:
+            await until(lambda: state_of(conn, spec.task_id) is TaskState.PENDING)
+        finally:
+            stop.set()
+            await asyncio.wait_for(reaper_task, timeout=5)
 
 
 class TestConcurrency:
