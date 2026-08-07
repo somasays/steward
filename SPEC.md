@@ -257,7 +257,7 @@ question ──► query analysis ──► parallel: Qdrant top-40 (filtered)
 
 - **Query analysis** (small/fast model): extracts filters (source, sensitivity, asset type) and rewrites the question into one semantic query + zero or more lexical identifier queries.
 - **Fusion:** reciprocal-rank fusion (k=60) — robust to score-scale mismatch between engines, no tuning burden.
-- **Rerank:** cross-encoder (`bge-reranker-v2-m3` on vLLM — same allowlist rule as every other production model) over the fused top-40.
+- **Rerank:** cross-encoder (`bge-reranker-v2-m3` on vLLM) over the fused top-40. It reaches the gateway as a `steward-rerank` alias, which joins §6's table — and therefore the startup check's required set — when retrieval lands in M2.
 - **Agentic search:** the Librarian doesn't get one shot. It can reformulate and re-search, drill into specific assets, and run bounded verification SQL — the retrieval trail is captured in the trace and returned with the answer.
 
 ### 5.3 Retrieval quality targets (eval-gated, see §9)
@@ -285,7 +285,7 @@ All model access goes through a **LiteLLM proxy** deployment. Agent code sees on
 | `steward-classify` | Classifier | `hosted_vllm/qwen3-7b-classify` (fine-tune-ready) | two endpoints, then `steward-fast` | — |
 | `steward-embed` | embeddings | `hosted_vllm/bge-m3` | two endpoints | `text-embedding-3-large` — dev mode, never production |
 
-The committed routing table is `packages/steward-llm/src/steward_llm/config/litellm.production.yaml`, checked on every commit by S9; the endpoints it may name are `approved_endpoints.yaml`, which a deployment overrides wholesale via `STEWARD_LLM_APPROVED_ENDPOINTS`.
+The committed routing table is `packages/steward-llm/src/steward_llm/defaults/litellm.production.yaml`, checked on every commit by S9; the endpoints it may name are `approved_endpoints.yaml`, which a deployment overrides wholesale via `STEWARD_LLM_APPROVED_ENDPOINTS`.
 
 **Fallback chains stay inside the allowlist.** Losing hosted providers means losing the fallback that used to answer "what if a model is unavailable", so each alias is served by two approved endpoints and LiteLLM routes around a failed one — redundancy replaces provider diversity (D8). An alias may fall back to another alias; it may never fall back out of the deployment.
 

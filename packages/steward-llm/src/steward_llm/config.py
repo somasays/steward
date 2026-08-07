@@ -20,6 +20,10 @@ Three decisions worth stating:
 * **A missing `api_base` is a refusal.** It is the quietest form of the mistake: with
   no base URL, `model: claude-sonnet-5` resolves to the provider's own hosted API and
   the config never mentions a URL at all.
+* **Pass-through routes are routing too.** `general_settings.pass_through_endpoints`
+  maps a proxy path onto a target URL without going near `model_list`, so it faces the
+  same allowlist. What this module does not model is a *future* LiteLLM key that can
+  route; GUARDRAILS §5 names that as review-enforced rather than claiming otherwise.
 """
 
 from __future__ import annotations
@@ -60,9 +64,12 @@ APPROVED_ENDPOINTS_ENV = "STEWARD_LLM_APPROVED_ENDPOINTS"
 
 MODE_ENV = "STEWARD_DEPLOYMENT_MODE"
 
-CONFIG_DIR = Path(__file__).parent / "config"
-COMMITTED_CONFIG = CONFIG_DIR / "litellm.production.yaml"
-COMMITTED_ALLOWLIST = CONFIG_DIR / "approved_endpoints.yaml"
+DEFAULTS_DIR = Path(__file__).parent / "defaults"
+"""Data, not a module: named `defaults/` rather than `config/` so it can never shadow
+this module, which is where the refusal lives."""
+
+COMMITTED_CONFIG = DEFAULTS_DIR / "litellm.production.yaml"
+COMMITTED_ALLOWLIST = DEFAULTS_DIR / "approved_endpoints.yaml"
 
 PRODUCTION_ALIASES = frozenset(
     {
@@ -74,6 +81,10 @@ PRODUCTION_ALIASES = frozenset(
 )
 """The aliases SPEC §6 routes on. A production config missing one fails at boot rather
 than at the first call that needs it."""
+
+PASS_THROUGH_MODEL = "openai/pass-through"
+"""The synthetic model name a pass-through route is judged as: it has no model of its
+own, only a target URL, and the URL is the whole question."""
 
 SELF_HOSTED_MODEL_PREFIXES = ("hosted_vllm/", "openai/")
 """LiteLLM provider prefixes that address an OpenAI-compatible server by URL. Any other
@@ -91,8 +102,9 @@ class InvalidGatewayConfig(GatewayConfigError):
 
 @dataclass(frozen=True, slots=True)
 class ModelBinding:
-    """One `model_list` entry: the alias callers use, the model LiteLLM routes to, and
-    the base URL it is sent to (absent when the provider decides)."""
+    """One destination the gateway can reach: the alias callers use, the model LiteLLM
+    routes to, and the base URL it is sent to (absent when the provider decides). A
+    pass-through route is one of these too, judged entirely on its target."""
 
     alias: str
     model: str
@@ -157,18 +169,51 @@ def _validate_binding(binding: ModelBinding, allowlist: EndpointAllowlist) -> No
 
 
 def parse_litellm_config(document: object, source: str) -> tuple[ModelBinding, ...]:
-    """`model_list` -> bindings. Every shape this does not recognise is a refusal.
+    """Every destination a config can send a prompt to, as bindings.
 
-    The parser is deliberately shallow: it reads the two fields that decide where a
-    prompt goes and does not reimplement LiteLLM's config semantics. But it refuses
-    what it cannot read, because a config it skipped past is a config it did not check.
+    Two keys can name one: `model_list`, and `general_settings.pass_through_endpoints`,
+    which maps a proxy path straight onto a target URL and is therefore routing under
+    another name — a config with a clean `model_list` and a pass-through to a hosted API
+    would otherwise pass. Both come back as bindings so both face the same allowlist.
+
+    The parser stays shallow: it reads the fields that decide where a prompt goes and
+    does not reimplement LiteLLM's config semantics. What it cannot read it refuses,
+    because a config it skipped past is a config it did not check. What it does *not*
+    model is a future LiteLLM key that routes — see GUARDRAILS.md §5, which names that
+    as review-enforced rather than pretending this parser is exhaustive.
     """
     if not isinstance(document, dict):
         raise InvalidGatewayConfig(f"{source}: expected a YAML mapping at the top level")
     entries = document.get("model_list")
     if not isinstance(entries, list) or not entries:
         raise InvalidGatewayConfig(f"{source}: model_list must be a non-empty list")
-    return tuple(_binding(entry, source, index) for index, entry in enumerate(entries))
+    models = tuple(_binding(entry, source, index) for index, entry in enumerate(entries))
+    return models + _pass_through_bindings(document.get("general_settings"), source)
+
+
+def _pass_through_bindings(settings: object, source: str) -> tuple[ModelBinding, ...]:
+    """`general_settings.pass_through_endpoints` -> bindings judged on their target URL."""
+    if settings is None:
+        return ()
+    if not isinstance(settings, dict):
+        raise InvalidGatewayConfig(f"{source}: general_settings is not a mapping")
+    routes = settings.get("pass_through_endpoints")
+    if routes is None:
+        return ()
+    if not isinstance(routes, list):
+        raise InvalidGatewayConfig(f"{source}: pass_through_endpoints must be a list")
+    bindings: list[ModelBinding] = []
+    for index, route in enumerate(routes):
+        where = f"{source}: pass_through_endpoints[{index}]"
+        if not isinstance(route, dict):
+            raise InvalidGatewayConfig(f"{where} is not a mapping")
+        path, target = route.get("path"), route.get("target")
+        if not isinstance(path, str) or not path:
+            raise InvalidGatewayConfig(f"{where} has no path")
+        if not isinstance(target, str) or not target:
+            raise InvalidGatewayConfig(f"{where} has no target")
+        bindings.append(ModelBinding(alias=f"pass_through {path}", model=PASS_THROUGH_MODEL, api_base=target))
+    return tuple(bindings)
 
 
 def _binding(entry: object, source: str, index: int) -> ModelBinding:

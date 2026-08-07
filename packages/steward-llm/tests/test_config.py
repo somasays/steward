@@ -147,6 +147,87 @@ class TestDevelopmentMode:
             gateway.mode_from_env({MODE_ENV: "dev"})
 
 
+class TestPassThroughRoutes:
+    """`pass_through_endpoints` maps a proxy path onto a target URL without touching
+    `model_list` — routing under another name, so it faces the same allowlist."""
+
+    def route(self, target: str) -> dict[str, object]:
+        return {"general_settings": {"pass_through_endpoints": [{"path": "/vertex", "target": target}]}}
+
+    def parsed(self, target: str) -> tuple[ModelBinding, ...]:
+        document: dict[str, object] = {
+            "model_list": [
+                {
+                    "model_name": alias,
+                    "litellm_params": {"model": "hosted_vllm/qwen3-8b", "api_base": APPROVED},
+                }
+                for alias in sorted(PRODUCTION_ALIASES)
+            ]
+        }
+        document.update(self.route(target))
+        return parse_litellm_config(document, "test")
+
+    def test_a_route_to_a_hosted_api_refuses(self) -> None:
+        with pytest.raises(NonApprovedEndpoint, match="pass_through /vertex"):
+            GatewayConfig(
+                mode=DeploymentMode.PRODUCTION,
+                source="test",
+                allowlist=ALLOWLIST,
+                bindings=self.parsed("https://generativelanguage.googleapis.com/v1beta"),
+            )
+
+    def test_a_route_to_an_approved_endpoint_is_accepted(self) -> None:
+        assert (
+            GatewayConfig(
+                mode=DeploymentMode.PRODUCTION,
+                source="test",
+                allowlist=ALLOWLIST,
+                bindings=self.parsed(APPROVED),
+            )
+            .bindings[-1]
+            .alias
+            == "pass_through /vertex"
+        )
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            "pass_through_endpoints",
+            {"pass_through_endpoints": {"path": "/vertex"}},
+            {"pass_through_endpoints": ["/vertex"]},
+            {"pass_through_endpoints": [{"target": "http://vllm:8000"}]},
+            {"pass_through_endpoints": [{"path": "/vertex"}]},
+            {"pass_through_endpoints": [{"path": "/vertex", "target": 8000}]},
+        ],
+    )
+    def test_an_unreadable_route_refuses(self, settings: object) -> None:
+        with pytest.raises(InvalidGatewayConfig):
+            parse_litellm_config(
+                {
+                    "model_list": [
+                        {
+                            "model_name": "steward-fast",
+                            "litellm_params": {"model": "hosted_vllm/x", "api_base": APPROVED},
+                        }
+                    ],
+                    "general_settings": settings,
+                },
+                "test",
+            )
+
+    def test_a_config_without_routes_gains_no_bindings(self) -> None:
+        base = {
+            "model_list": [
+                {
+                    "model_name": "steward-fast",
+                    "litellm_params": {"model": "hosted_vllm/x", "api_base": APPROVED},
+                }
+            ]
+        }
+        assert len(parse_litellm_config(base, "test")) == 1
+        assert len(parse_litellm_config({**base, "general_settings": {"master_key": "x"}}, "test")) == 1
+
+
 class TestParsing:
     def test_it_reads_alias_model_and_base(self) -> None:
         document = {
