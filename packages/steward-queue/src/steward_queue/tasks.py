@@ -6,7 +6,7 @@ Two rules hold for every function here and are the reason the module exists:
   is therefore transactional with whatever domain change motivated it (I8) --
   there is no code path that can publish a task for a state change that never
   committed, or lose one that did.
-* **A state mutation and its audit row are one write.** `audit._audit` runs on
+* **A state mutation and its audit row are one write.** `audit.write_audit` runs on
   the same connection, between the mutation and the caller's commit, so I7
   holds by construction rather than by reviewer attention.
 
@@ -38,7 +38,7 @@ from steward_schemas import ProblemDetails, TaskResult, TaskSpec
 
 from steward_queue import _sql
 from steward_queue._rows import _budget_from, _budget_params, _require_row
-from steward_queue.audit import TASK_ENTITY, _audit
+from steward_queue.audit import TASK_ENTITY, write_audit
 from steward_queue.backoff import DEFAULT_BASE_DELAY, DEFAULT_FACTOR, DEFAULT_MAX_DELAY, retry_delay
 from steward_queue.db import QueueConnection
 from steward_queue.models import (
@@ -114,7 +114,7 @@ def enqueue(
         ).fetchone()
         deduped_id: UUID = _require_row(existing, "dedup conflict without an existing row")[0]
         return deduped_id
-    _audit(
+    write_audit(
         conn,
         actor=actor,
         action="task.enqueued",
@@ -175,7 +175,7 @@ def claim(
                 trace_id=row[12],
             )
         )
-        _audit(
+        write_audit(
             conn,
             actor=actor,
             action="task.claimed",
@@ -213,7 +213,7 @@ def mark_running(
     ).fetchone()
     if row is None:
         raise TaskNotClaimable(f"task {task_id} is not claimed by {claimed_by or 'any worker'}")
-    _audit(
+    write_audit(
         conn,
         actor=actor,
         action="task.started",
@@ -255,7 +255,7 @@ def complete(
         raise TaskNotClaimable(f"task {result.task_id} is not held by {claimed_by or 'any worker'}")
     run_id: UUID = row[0]
     previous = TaskState(row[1])
-    _audit(
+    write_audit(
         conn,
         actor=actor,
         action="task.succeeded",
@@ -320,7 +320,7 @@ def fail(
         )
         after = {"state": landed.value, "attempts": attempts}
     run_id: UUID = _require_row(outcome.fetchone(), "task transition returned no row")[0]
-    _audit(
+    write_audit(
         conn,
         actor=actor,
         action=action,
@@ -359,7 +359,7 @@ def requeue_stale(
         recovered.append((task_id, state))
         if state is TaskState.DEAD:
             finished.add(run_id)
-        _audit(
+        write_audit(
             conn,
             actor=actor,
             action="task.lease_expired",

@@ -13,6 +13,7 @@ from alembic import command
 from alembic.config import Config
 from steward_queue import RunStatus, TaskState
 from steward_queue.migrate import MIGRATIONS_DIR, downgrade_to_base, upgrade_to_head
+from steward_schemas import AssetLifecycle, AssetType, SourceEngine
 
 SELECT_TABLES = "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
 SELECT_INDEXES = "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
@@ -31,8 +32,19 @@ WHERE attrelid = %(table)s::regclass AND attname = %(column)s
 """
 
 QUEUE_TABLES = {"runs", "tasks", "checkpoints", "audit_log"}
+CATALOG_TABLES = {"sources", "assets", "columns"}
+ALL_TABLES = QUEUE_TABLES | CATALOG_TABLES
 
 QUOTED_LITERAL = re.compile(r"'([^']*)'")
+
+INSERT_SOURCE = """
+INSERT INTO sources (id, workspace_id, name, engine, host, database_name,
+                     include_schemas, exclude_schemas, dsn_secret_ref)
+VALUES (gen_random_uuid(), '00000000-0000-0000-0000-000000000000', 'probe', 'postgres',
+        'db.example.com', 'analytics', '{}'::text[], '{}'::text[], %(ref)s)
+"""
+
+A_DSN_WITH_A_PASSWORD = "postgresql://steward:hunter2@db.example.com:5432/analytics"
 
 
 def names(dsn: str, sql: str) -> set[str]:
@@ -100,12 +112,51 @@ def test_task_state_enum_matches_the_check_constraint(scratch_dsn: str) -> None:
     assert allowed_values(scratch_dsn, "tasks", "state") == {s.value for s in TaskState}
 
 
+def test_the_catalog_revision_creates_its_tables_and_natural_keys(scratch_dsn: str) -> None:
+    # I8: re-registering a source or rescanning a database converges on the
+    # existing row because the database will not hold a second one.
+    upgrade_to_head(scratch_dsn)
+    assert CATALOG_TABLES <= names(scratch_dsn, SELECT_TABLES)
+    assert {"sources_natural_key", "assets_natural_key", "columns_natural_key"} <= names(
+        scratch_dsn, SELECT_INDEXES
+    )
+
+
+def test_a_source_row_cannot_hold_a_dsn(scratch_dsn: str) -> None:
+    """N7/I5: a credential is not merely discouraged in `sources`, it is
+    rejected by the database.
+
+    The column holds a `scheme:name` reference into the secret store; every DSN
+    shape carries `/` and `@`, which the CHECK does not admit. This is the
+    constraint that makes "a DSN with a password must be impossible to read
+    back out of the database" (issue #20) a property of the schema rather than
+    of whoever writes the next INSERT.
+    """
+    upgrade_to_head(scratch_dsn)
+    with psycopg.connect(scratch_dsn) as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(INSERT_SOURCE, {"ref": A_DSN_WITH_A_PASSWORD})
+        conn.rollback()
+        conn.execute(INSERT_SOURCE, {"ref": "env:STEWARD_SOURCE_DSN"})  # the reference form is fine
+        conn.rollback()
+
+
+def test_catalog_enums_match_their_check_constraints(scratch_dsn: str) -> None:
+    # Same one-vocabulary rule the queue's state enums are held to: a lifecycle
+    # the code can produce and the database rejects is a bug waiting for a scan.
+    upgrade_to_head(scratch_dsn)
+    assert allowed_values(scratch_dsn, "sources", "engine") == {e.value for e in SourceEngine}
+    assert allowed_values(scratch_dsn, "assets", "asset_type") == {t.value for t in AssetType}
+    assert allowed_values(scratch_dsn, "assets", "lifecycle") == {lc.value for lc in AssetLifecycle}
+    assert allowed_values(scratch_dsn, "columns", "lifecycle") == {lc.value for lc in AssetLifecycle}
+
+
 def test_migrations_are_reversible_and_reappliable(scratch_dsn: str) -> None:
     upgrade_to_head(scratch_dsn)
     downgrade_to_base(scratch_dsn)
-    assert names(scratch_dsn, SELECT_TABLES) & QUEUE_TABLES == set()
+    assert names(scratch_dsn, SELECT_TABLES) & ALL_TABLES == set()
     upgrade_to_head(scratch_dsn)
-    assert QUEUE_TABLES <= names(scratch_dsn, SELECT_TABLES)
+    assert ALL_TABLES <= names(scratch_dsn, SELECT_TABLES)
 
 
 def test_a_config_without_a_url_fails_loudly(scratch_dsn: str) -> None:

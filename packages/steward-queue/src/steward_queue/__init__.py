@@ -29,9 +29,10 @@ there is no window where a finished run still reads as running.
 Schema lives in `migrations`; `migrate.upgrade_to_head` applies it.
 """
 
+from steward_queue.audit import write_audit
 from steward_queue.backoff import retry_delay
 from steward_queue.checkpoints import write_checkpoint
-from steward_queue.db import DSN_ENV, QueueConnection, connect
+from steward_queue.db import DSN_ENV, QueueConnection, connect, statement_timeout_ms
 from steward_queue.handlers import NOOP_TASK_TYPE
 from steward_queue.migrate import downgrade_to_base, upgrade_to_head
 from steward_queue.models import (
@@ -111,7 +112,9 @@ __all__ = [
     "rollup_run_status",
     "set_run_status",
     "start_run",
+    "statement_timeout_ms",
     "task_handler",
     "upgrade_to_head",
+    "write_audit",
     "write_checkpoint",
 ]

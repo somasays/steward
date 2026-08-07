@@ -23,7 +23,7 @@ from steward_telemetry import new_trace_id
 
 from steward_queue import _sql
 from steward_queue._rows import _budget_from, _budget_params, _require_row
-from steward_queue.audit import RUN_ENTITY, _audit
+from steward_queue.audit import RUN_ENTITY, write_audit
 from steward_queue.db import QueueConnection
 from steward_queue.models import SYSTEM_ACTOR, Actor, RunRecord, RunStatus
 
@@ -85,7 +85,7 @@ def create_run(
         ).fetchone()
         return _run_record(_require_row(existing, "idempotency conflict without an existing row"))
     record = _run_record(row)
-    _audit(
+    write_audit(
         conn,
         actor=actor,
         action="run.created",
@@ -111,7 +111,7 @@ def set_run_status(
     row = conn.execute(_sql.UPDATE_RUN_STATUS, {"id": run_id, "status": status.value}).fetchone()
     if row is None:
         raise LookupError(f"no such run: {run_id}")
-    _audit(
+    write_audit(
         conn,
         actor=actor,
         action="run.status_changed",
@@ -130,7 +130,7 @@ def _record_run_status(
     *,
     actor: Actor,
 ) -> None:
-    _audit(
+    write_audit(
         conn,
         actor=actor,
         action="run.status_changed",
@@ -215,7 +215,7 @@ def _record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, ac
         },
     ).fetchone()
     before = _require_row(row, "run usage update returned no row")
-    _audit(
+    write_audit(
         conn,
         actor=actor,
         action="run.usage_recorded",
