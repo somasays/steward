@@ -173,12 +173,16 @@ class RunPlan:
         Every task carries the whole run budget, which is the placeholder the
         queue's per-task caps already imply and *not* the end state: with a
         fan-out plan it means N tasks may each spend the run's cap, so a run
-        could exceed the budget the API reports for it. Nothing in M1 fans out
-        yet (`noop` plans one task), and the fix is run-level enforcement --
-        the accumulated `runs.used_*` totals compared against `runs.budget_*`
-        by the runtime -- which lands with the agent loop that H4's
-        step/token/cost half measures (I12, N6). The first goal that fans out
-        (#20) must not ship before it.
+        could exceed the budget the API reports for it. No registered goal fans
+        out -- `noop` and `scan_source` each plan exactly one task, and for a
+        one-task plan the per-task cap *is* the run cap, so what the API
+        advertises is what the run can spend. The catalog (#20) shipped
+        single-task for precisely this reason (#37).
+
+        The fix, before any goal fans out, is run-level enforcement: the
+        accumulated `runs.used_*` totals compared against `runs.budget_*` by
+        the runtime, which lands with the agent loop that H4's
+        step/token/cost half measures (I12, N6).
         """
         return tuple(
             TaskSpec(

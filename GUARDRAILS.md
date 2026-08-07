@@ -45,7 +45,7 @@ These run real components — Postgres, the queue, the runtime with a stub LLM �
 | H8 | Index rebuild convergence | I1, N9 | wipe Qdrant + ES, run rebuild job → search results identical to pre-wipe golden results | M2 |
 | H9 | Citation resolution | N2, FR8 | every citation in every golden answer resolves to a live asset/document id | M3 |
 | H10 | Governance gating | I13, FR9 | governance actions land in `pending_review` unless a policy explicitly auto-approves; the policy id is on the audit row | M1 |
-| H11 | Milestone acceptance | FR1–FR10 | executable exit criterion of each shipped milestone (SPEC §12); once shipped, runs forever | active (M0: API → queue → worker → succeeded) |
+| H11 | Milestone acceptance | FR1–FR10 | executable exit criterion of each shipped milestone (SPEC §12); once shipped, runs forever | active (M0: API → queue → worker → succeeded. M1 slice 1, issue #20: register a Postgres source → scan → assets and columns paged back over the API, against a real second database on a read-only role; includes the I5 write-fails proof, the byte-identical rescan, the `missing` lifecycle, and no credential readable from the database or any response) |
 
 ### Tier B — benchmarks & evals (affected-path PRs + nightly)
 
@@ -93,7 +93,7 @@ Build-vs-buy rule: a check is hand-rolled only when no maintained tool has the s
 | I2 gateway-only model access | S1 |
 | I3 typed, versioned contracts | S6, S5, G2 |
 | I4 dependency flow | S1 |
-| I5 read-only sources, no string SQL | S3 (+ read-only role: fixture harness asserts writes fail — part of H11 M1 scenario) |
+| I5 read-only sources, no string SQL | S3 (+ read-only role: H11's M1 scenario and `packages/steward-catalog/tests/test_read_only.py` both attempt a write on the connection a scan opens and assert Postgres' `42501`, not a session flag's `25006`) |
 | I6 masking | H7 (+ by construction via typed prompt-builder inputs, G2) |
 | I7 traced & audited | H5, H6 |
 | I8 idempotent, transactional tasks | H1, H3 |
@@ -143,7 +143,7 @@ Not everything reduces to a check. The `architecture-guardian` subagent and huma
 
 ## 5. Enforcement status
 
-Active now: S1, S3–S8 (S1/S3 tool-backed: import-linter + ruff; S4–S8 stdlib), H1, H3, H4 (wall-clock; step/token/cost with the M1 agent loop), H11 (M0 exit criterion), G1–G5 (G2 covers `packages/` and `services/` in one `--strict` invocation, issue #17). S2 skips until there is a runtime to bound. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced in the meantime: I6 (until masking lands, M1) and the span-tree half of I7/H6 (until the M1 agent loop) — the `architecture-guardian`'s explicit responsibility.
+Active now: S1, S3–S8 (S1/S3 tool-backed: import-linter + ruff; S4–S8 stdlib), H1, H3, H4 (wall-clock; step/token/cost with the M1 agent loop), H11 (M0 and M1-slice-1 exit criteria), G1–G5 (G2 covers `packages/` and `services/` in one `--strict` invocation, issue #17). S2 skips until there is a runtime to bound. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced in the meantime: I6 (until masking lands, M1) and the span-tree half of I7/H6 (until the M1 agent loop) — the `architecture-guardian`'s explicit responsibility.
 
 ## 6. Guardrail freeze (in force from 2026-08-07, M1)
 

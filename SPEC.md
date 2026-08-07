@@ -131,6 +131,7 @@ packages/
   steward-schemas/     # Pydantic models: API contracts, tool I/O, events (zero heavy deps)
   steward-queue/       # Postgres task queue: migrations, transactional enqueue, SKIP LOCKED claiming, worker loop
   steward-orchestration/ # Goal registry + deterministic planners: name, input schema, planner, allowed task types, budget
+  steward-catalog/     # Deterministic metadata catalog: secret resolution, read-only source inspection, convergent persistence
   steward-agents/      # Agent runtime: owned contracts (tools, budgets, results); LangGraph contained here
   steward-retrieval/   # Hybrid search client: Qdrant + ES + fusion + rerank
   steward-llm/         # Thin LiteLLM client wrapper: typed completions, structured output helpers
@@ -139,8 +140,13 @@ packages/
 services/
   api/                 # FastAPI app
   workers/             # Worker entrypoints (one per agent type)
-  connectors/          # Source connectors (SQLAlchemy-based, read-only)
 ```
+
+The source connector planned for `services/connectors/` landed in
+`packages/steward-catalog` instead (issue #20). A connector is a library the
+scan handler calls, not a process anything deploys, and putting it under
+`services/` would have made a package import a service — the one direction I4
+forbids. `services/` stays as it was: entrypoints only.
 
 ---
 
@@ -291,6 +297,17 @@ checkpoints      — agent state snapshots (task_id, step, state JSONB)
 audit_log        — every state-changing action (actor: human|agent|policy, before/after)
 ```
 
+The catalog half of that list landed with issue #20 and carries three schema-level
+guarantees worth naming. `sources` is unique on (workspace, engine, host,
+database, schema filter), `assets` on (source, schema, name) and `columns` on
+(asset, name), so re-registering a source or rescanning a database converges on
+the existing row rather than duplicating it (I8). `sources.dsn_secret_ref` has a
+CHECK admitting `scheme:name` references only — every DSN shape fails it — so a
+credential cannot be written to the database at all (N7). And there is no
+`last_seen_at`: a timestamp touched by every scan would make "a rescan with no
+upstream change leaves byte-identical state" false by construction. What was
+seen when is what `audit_log` records.
+
 Notable choices: profiles and documents are **append-only versioned** (stewardship history is a feature — "what did this table look like in March?"); the task queue lives in Postgres rather than a broker (see [D2](#13-key-design-decisions)); `audit_log` is written from the same transactions as the mutations they record; `runs.trace_id` is `NOT NULL` and `runs.idempotency_key` is uniquely indexed, so an untraceable run and a duplicated `POST /v1/runs` are both unrepresentable rather than merely discouraged.
 
 ---
@@ -329,6 +346,15 @@ POST   /v1/runs                          # M0 skeleton: generic goal-based run c
 GET    /v1/runs/{id}                     # status, task tree, cost, trace link
 POST   /v1/runs/{id}:cancel
 ```
+
+`POST /v1/sources` is idempotent on the source's natural key and answers 201 the
+first time, 200 on a repeat, so a client can tell whether it created anything
+without a second request. `POST /v1/sources/{id}/scan` answers 202 either way:
+if a scan of that source is already pending or running it returns that run
+rather than starting a second, decided under a transaction-scoped advisory lock
+so two simultaneous requests serialise instead of both starting one.
+`GET /v1/assets` pages by opaque cursor over `(schema, name, id)` — a total
+order, so a scan committing between two pages cannot make a client skip an asset.
 
 `POST /v1/runs` is M0's entry point: a generic `{goal, payload}` body returning 202. The run row and the tasks its goal plans are written in one transaction (I8), so a 202 is a guarantee that work is queued, not a promise to queue it later; a worker then executes the task and the run's status follows its tasks (`pending → running → succeeded|failed`) in the transaction that settles the last one. The expansion is the goal registry's (§3.1): the endpoint validates `goal` and `payload` against the registration and rejects anything unregistered or schema-invalid with problem details before a run exists (#19). Goal-specific endpoints (`POST /v1/sources/{id}/scan`, above) land in M1 and are expected to become the primary way runs get created; whether `POST /v1/runs` stays as a generic escape hatch or narrows to goal-specific endpoints only is an open question for that milestone.
 
