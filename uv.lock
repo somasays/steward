@@ -11,6 +11,7 @@ members = [
     "steward-agents",
     "steward-api",
     "steward-llm",
+    "steward-orchestration",
     "steward-queue",
     "steward-retrieval",
     "steward-schemas",
@@ -1417,6 +1418,7 @@ version = "0.1.0"
 source = { editable = "services/api" }
 dependencies = [
     { name = "fastapi" },
+    { name = "steward-orchestration" },
     { name = "steward-queue" },
     { name = "steward-schemas" },
     { name = "steward-telemetry" },
@@ -1432,6 +1434,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "steward-orchestration", editable = "packages/steward-orchestration" },
     { name = "steward-queue", editable = "packages/steward-queue" },
     { name = "steward-schemas", editable = "packages/steward-schemas" },
     { name = "steward-telemetry", editable = "packages/steward-telemetry" },
@@ -1454,6 +1457,25 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [{ name = "steward-schemas", editable = "packages/steward-schemas" }]
+
+[[package]]
+name = "steward-orchestration"
+version = "0.1.0"
+source = { editable = "packages/steward-orchestration" }
+dependencies = [
+    { name = "steward-schemas" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "steward-queue" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "steward-schemas", editable = "packages/steward-schemas" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "steward-queue", editable = "packages/steward-queue" }]
 
 [[package]]
 name = "steward-queue"

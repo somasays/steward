@@ -74,6 +74,7 @@ select = ["E", "F", "I", "UP", "B", "S608", "TID251"]
 root_packages = [
     "steward_agents",
     "steward_llm",
+    "steward_orchestration",
     "steward_queue",
     "steward_retrieval",
     "steward_schemas",
@@ -86,14 +87,14 @@ root_packages = [
 [[tool.importlinter.contracts]]
 name = "services import packages, never the reverse (I4)"
 type = "forbidden"
-source_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_schemas", "steward_sdk", "steward_telemetry"]
+source_modules = ["steward_agents", "steward_llm", "steward_orchestration", "steward_queue", "steward_retrieval", "steward_schemas", "steward_sdk", "steward_telemetry"]
 forbidden_modules = ["steward_api", "steward_workers"]
 
 [[tool.importlinter.contracts]]
 name = "steward-agents depends only on its declared edges (I4)"
 type = "forbidden"
 source_modules = ["steward_agents"]
-forbidden_modules = ["steward_queue", "steward_retrieval", "steward_sdk"]
+forbidden_modules = ["steward_orchestration", "steward_queue", "steward_retrieval", "steward_sdk"]
 
 # steward-queue's one package edge beyond schemas: steward-telemetry. The worker
 # opens a task span per execution and every run gets a trace id, so the queue
@@ -103,19 +104,24 @@ forbidden_modules = ["steward_queue", "steward_retrieval", "steward_sdk"]
 name = "steward-queue depends only on steward-schemas and steward-telemetry (I4)"
 type = "forbidden"
 source_modules = ["steward_queue"]
-forbidden_modules = ["steward_agents", "steward_llm", "steward_retrieval", "steward_sdk"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_orchestration", "steward_retrieval", "steward_sdk"]
 
+# steward-orchestration is a leaf below: the goal registry knows task *type
+# names* and nothing about how tasks are stored or executed, and the queue --
+# which dispatches task types -- must never learn which goals exist (issue #19).
+# The forbidden edge above and this package's membership below are the two
+# halves of that statement.
 [[tool.importlinter.contracts]]
 name = "leaf packages depend only on steward-schemas (I4)"
 type = "forbidden"
-source_modules = ["steward_llm", "steward_retrieval", "steward_sdk", "steward_telemetry"]
-forbidden_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_sdk", "steward_telemetry"]
+source_modules = ["steward_llm", "steward_orchestration", "steward_retrieval", "steward_sdk", "steward_telemetry"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_orchestration", "steward_queue", "steward_retrieval", "steward_sdk", "steward_telemetry"]
 
 [[tool.importlinter.contracts]]
 name = "steward-schemas is independent: pydantic + stdlib only (I4)"
 type = "forbidden"
 source_modules = ["steward_schemas"]
-forbidden_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_sdk", "steward_telemetry"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_orchestration", "steward_queue", "steward_retrieval", "steward_sdk", "steward_telemetry"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -125,6 +131,7 @@ mypy_path = [
     "packages/steward-schemas/src",
     "packages/steward-agents/src",
     "packages/steward-llm/src",
+    "packages/steward-orchestration/src",
     "packages/steward-queue/src",
     "packages/steward-retrieval/src",
     "packages/steward-sdk/src",
