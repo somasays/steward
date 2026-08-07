@@ -123,7 +123,7 @@ def main() -> int:
                     "" if has_evals else "activates in M2 (no evals/ yet)"),
         # Hygiene
         _tool_check("G1", "lint & format", ["uv", "run", "ruff", "check", "."], not_installed),
-        _tool_check("G2", "strict types", ["uv", "run", "mypy", "--strict", "packages"],
+        _tool_check("G2", "strict types", ["uv", "run", "mypy", "--strict", "packages", "services"],
                     not_installed or ("" if has_packages else "no packages/ yet")),
         _tool_check("G3", "tests & coverage",
                     ["uv", "run", "pytest", "-q", "-m", "not acceptance",
