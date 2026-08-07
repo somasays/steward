@@ -138,16 +138,35 @@ def bind_idempotency_key(
     when it is given a key, so the two never race each other for the same key
     either -- an INSERT and this UPDATE contending for one key resolve through
     the lock, not through Postgres surfacing a raw `UniqueViolation`.
+
+    A fourth state the UPDATE alone cannot tell apart from a plain conflict:
+    this run may already carry a *different* key of its own -- one column
+    holds one key, so a second, independent request retrying under its own
+    fresh key can reach a run single-flight admitted under someone else's.
+    That is not a conflict (nothing named `idempotency_key` disagrees about
+    what this run is), it is the schema's one-key-per-run limit, so the run
+    is returned unchanged rather than raised on: the caller still gets back
+    the run it asked about, it just cannot also be found by this second key
+    later.
     """
     conn.execute(_sql.LOCK_IDEMPOTENCY_KEY, {"key": idempotency_key})
     row = conn.execute(
         _sql.BIND_IDEMPOTENCY_KEY, {"id": run_id, "idempotency_key": idempotency_key}
     ).fetchone()
     if row is None:
-        existing = conn.execute(
+        owner = conn.execute(
             _sql.SELECT_RUN_BY_IDEMPOTENCY_KEY, {"idempotency_key": idempotency_key}
         ).fetchone()
-        return _run_record(_require_row(existing, "idempotency key bind found no owner"))
+        if owner is not None:
+            # Either this run already carries this exact key (self, a no-op
+            # replay) or some other run does (a genuine conflict for the
+            # caller to resolve) -- either way, the key names a run, and this
+            # is it.
+            return _run_record(owner)
+        # The key names nothing yet, so the UPDATE's own predicate is what
+        # failed: this run's column already holds a different key.
+        current = conn.execute(_sql.SELECT_RUN, {"id": run_id}).fetchone()
+        return _run_record(_require_row(current, f"no run with id {run_id}"))
     record = _run_record(row)
     write_audit(
         conn,

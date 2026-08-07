@@ -803,6 +803,29 @@ class TestBindIdempotencyKey:
         assert fetched is not None and fetched.idempotency_key is None
         assert audit_actions(conn) == ["run.created", "run.created"]  # no bind was recorded
 
+    def test_a_run_already_carrying_a_different_key_is_returned_unchanged(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        """The state neither predicate alone tells apart from a plain
+        conflict: this run already has its own key, and the key being bound
+        is fresh -- owned by nobody, so the lookup fallback finds no row. That
+        must return the run as-is, not raise: one column holds one key, and a
+        second independent request retrying under its own key can reach a run
+        single-flight admitted under someone else's."""
+        created = create_run(
+            conn, goal="scan_source", payload={"source_id": "a"}, budget=budget, idempotency_key="k1"
+        )
+        conn.commit()
+
+        result = bind_idempotency_key(conn, created.id, "k2")
+        conn.commit()
+
+        assert result.id == created.id
+        assert result.payload == created.payload
+        fetched = get_run(conn, created.id)
+        assert fetched is not None and fetched.idempotency_key == "k1"  # unchanged, not overwritten
+        assert audit_actions(conn) == ["run.created"]  # no bind was recorded
+
     def test_a_bound_key_then_replayed_through_create_run_finds_the_same_run(
         self, conn: QueueConnection, budget: RunBudget
     ) -> None:
