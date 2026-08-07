@@ -84,6 +84,7 @@ WHERE entity_type IN ('source', 'asset', 'column') ORDER BY id
 """
 COUNT_REFUNDS_ROWS = "SELECT count(*) FROM assets WHERE name = 'refunds'"
 SELECT_SOURCE_ROW = "SELECT * FROM sources"
+COUNT_RUNS = "SELECT count(*) FROM runs"
 
 SOURCE_BODY: dict[str, Any] = {
     "name": "acceptance-warehouse",
@@ -92,6 +93,15 @@ SOURCE_BODY: dict[str, Any] = {
     "database": SOURCE_DATABASE,
     "dsn_secret_ref": f"env:{SECRET_ENV}",
     "include_schemas": ["sales"],
+}
+
+# A different natural key (host) so it registers as a second, distinct
+# source (SourceKey is engine+host+database+schemas, not name) -- issue #44's
+# cross-source idempotency-key tests need two sources, not two names for one.
+OTHER_SOURCE_BODY: dict[str, Any] = {
+    **SOURCE_BODY,
+    "name": "acceptance-other",
+    "host": "acceptance2.internal",
 }
 
 
@@ -240,6 +250,14 @@ def registered(client: TestClient) -> str:
     return source_id
 
 
+@pytest.fixture
+def registered_other(client: TestClient) -> str:
+    created = client.post("/v1/sources", json=OTHER_SOURCE_BODY)
+    assert created.status_code == 201
+    source_id: str = created.json()["id"]
+    return source_id
+
+
 def test_a_registered_source_is_scanned_and_readable_over_the_api(
     client: TestClient, dsn: str, registered: str
 ) -> None:
@@ -276,6 +294,70 @@ def test_a_second_scan_request_while_one_is_in_flight_returns_that_run(
 
     assert (first.status_code, second.status_code) == (202, 202)
     assert first.json()["id"] == second.json()["id"]
+
+
+def test_an_idempotency_key_retried_while_in_flight_binds_and_stops_a_later_duplicate(
+    client: TestClient, conn: QueueConnection, dsn: str, registered: str
+) -> None:
+    """Issue #44, the full three-request scenario. An in-flight scan is what
+    routes a keyed request through `claim_single_flight` instead of
+    `create_run` -- the path that used to leave the key unbound. The first
+    request here starts that in-flight scan without a key (standing in for
+    "some other trigger already started it"); what matters is that the key
+    only ever reaches the server while a scan of this source is running.
+    """
+    unkeyed = client.post(f"/v1/sources/{registered}/scan")
+    assert unkeyed.status_code == 202
+    run_id = unkeyed.json()["id"]
+    headers = {"Idempotency-Key": "scan-retry-1"}
+
+    # Retry #1 while in flight: must bind the key and return the same run.
+    retry_one = client.post(f"/v1/sources/{registered}/scan", headers=headers)
+    assert retry_one.status_code == 202
+    assert retry_one.json()["id"] == run_id
+
+    # Retry #2 while still in flight: the key is already bound; still a no-op.
+    retry_two = client.post(f"/v1/sources/{registered}/scan", headers=headers)
+    assert retry_two.status_code == 202
+    assert retry_two.json()["id"] == run_id
+
+    drain(client, Worker(dsn, "m1-acceptance-worker"), run_id)
+
+    # Retry #3 after completion: the bound key must find the original run
+    # instead of starting a second scan.
+    retry_three = client.post(f"/v1/sources/{registered}/scan", headers=headers)
+    assert retry_three.status_code == 202
+    assert retry_three.json()["id"] == run_id
+    assert scalar(conn, COUNT_RUNS) == 1
+
+
+def test_a_key_bound_to_a_different_source_still_409s_while_the_other_scan_is_in_flight(
+    client: TestClient, conn: QueueConnection, registered: str, registered_other: str
+) -> None:
+    """Single-flight dedupes on (goal, payload); the idempotency key dedupes
+    on the key -- they can disagree. A key already bound to one source's run
+    must not be silently attached to a different source's, even when that
+    second source's own scan is independently in flight and reaches the
+    single-flight branch rather than `create_run`'s."""
+    headers = {"Idempotency-Key": "scan-retry-cross"}
+    owner = client.post(f"/v1/sources/{registered}/scan", headers=headers)
+    assert owner.status_code == 202
+
+    other_in_flight = client.post(f"/v1/sources/{registered_other}/scan")
+    assert other_in_flight.status_code == 202
+
+    conflict = client.post(f"/v1/sources/{registered_other}/scan", headers=headers)
+
+    assert conflict.status_code == 409
+    assert conflict.json()["instance"] == f"/v1/runs/{owner.json()['id']}"
+    assert scalar(conn, COUNT_RUNS) == 2  # no run was created or rebound for the conflict
+
+
+def scalar(conn: QueueConnection, sql: str) -> object:
+    row = conn.execute(sql).fetchone()
+    conn.rollback()
+    assert row is not None
+    return row[0]
 
 
 def test_rescanning_an_unchanged_source_leaves_byte_identical_state(
