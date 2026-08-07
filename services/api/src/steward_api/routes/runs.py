@@ -50,6 +50,15 @@ _NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
 _CONFLICT_RESPONSE: dict[int | str, dict[str, Any]] = {
     409: {"model": ProblemDetails, "description": "Idempotency key reused with a different request"}
 }
+# The catch-all handler in problem_details.py (issue #39): a planner that
+# clears registration's eager check (issue #39) but still misbehaves on a
+# particular payload -- planning nothing, or outside its allowlist -- is a
+# programming error, not a client error, and reaches this document instead of
+# a bare 500. The body never carries the exception; the reason is server-side
+# in the log only.
+_INTERNAL_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
+    500: {"model": ProblemDetails, "description": "Unexpected server error"}
+}
 
 
 def build_router(store: RunStore) -> APIRouter:
@@ -63,7 +72,7 @@ def build_router(store: RunStore) -> APIRouter:
         "",
         status_code=status.HTTP_202_ACCEPTED,
         response_model=Run,
-        responses={**_CONFLICT_RESPONSE, **_GOAL_REJECTED_RESPONSE},
+        responses={**_CONFLICT_RESPONSE, **_GOAL_REJECTED_RESPONSE, **_INTERNAL_ERROR_RESPONSE},
     )
     async def create_run(
         body: RunCreate,

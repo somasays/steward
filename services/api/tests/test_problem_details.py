@@ -2,9 +2,30 @@
 including FastAPI's default validation-error handling, returns the same
 `steward_schemas.ProblemDetails` shape as `application/problem+json`."""
 
+import logging
+from uuid import UUID
+
+import pytest
 from fastapi.testclient import TestClient
+from steward_api.app import create_app
+from steward_schemas import Run, RunCreate
 
 PROBLEM_CONTENT_TYPE = "application/problem+json"
+
+_SECRET_DETAIL = "wrong number of turnips in the silo: 42"
+
+
+class _ExplodingStore:
+    """A `RunStore` whose every method raises with detail no client should
+    ever see -- issue #39's "unexpected server error" case, decoupled from
+    any specific planner bug so the catch-all handler is proven generic
+    rather than special-cased to `EmptyRunPlan`/`DisallowedTaskType`."""
+
+    async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
+        raise RuntimeError(_SECRET_DETAIL)
+
+    async def get_run(self, run_id: UUID) -> Run | None:
+        raise RuntimeError(_SECRET_DETAIL)
 
 
 def test_validation_error_is_problem_details_shape(client: TestClient) -> None:
@@ -39,3 +60,31 @@ def test_unknown_route_is_problem_details_shape(client: TestClient) -> None:
     body = resp.json()
     assert body["status"] == 404
     assert body["title"]
+
+
+def test_an_unexpected_server_error_is_sanitized_problem_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Issue #39: a programming error that escapes a route handler used to
+    # reach Starlette's default 500 handling -- undocumented, and not
+    # `application/problem+json`. It is now caught and reported generically,
+    # with nothing of the underlying exception in the body -- the detail is
+    # not dropped, it goes to the server log instead.
+    with caplog.at_level(logging.ERROR, logger="steward_api.problem_details"):
+        with TestClient(create_app(_ExplodingStore()), raise_server_exceptions=False) as client:
+            resp = client.post("/v1/runs", json={"goal": "noop"})
+
+    assert resp.status_code == 500
+    assert resp.headers["content-type"] == PROBLEM_CONTENT_TYPE
+    body = resp.json()
+    assert body["status"] == 500
+    assert body["type"] == "urn:steward:internal-error"
+    assert body["title"]
+    assert _SECRET_DETAIL not in resp.text
+    assert "RuntimeError" not in resp.text
+    assert body.get("detail") is None
+
+    [record] = caplog.records
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
+    assert _SECRET_DETAIL in caplog.text

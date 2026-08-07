@@ -10,6 +10,7 @@ build a JSON error body by hand.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 
 from fastapi import FastAPI, Request, status
@@ -21,6 +22,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from steward_schemas import ProblemDetails
 
 PROBLEM_CONTENT_TYPE = "application/problem+json"
+
+_logger = logging.getLogger(__name__)
+
+INTERNAL_ERROR_TYPE = "urn:steward:internal-error"
+"""Every unexpected server error's `type`, whatever raised it -- deliberately
+one type for all of them, since the body carries no exception message and no
+goal or planner detail (SPEC.md §8); the real detail goes to the log only."""
 
 
 class ProblemDetailsError(Exception):
@@ -139,6 +147,26 @@ def install_problem_details(app: FastAPI) -> None:
         problem = ProblemDetails(
             title=str(exc.detail) if exc.detail else "HTTP error",
             status=exc.status_code,
+            instance=request.url.path,
+        )
+        return _problem_response(problem)
+
+    @app.exception_handler(Exception)
+    async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        # Registered against the base `Exception`, this becomes Starlette's
+        # `ServerErrorMiddleware` handler (see starlette.applications), so it
+        # is the one path left uncovered by the handlers above: a programming
+        # error that escapes a route -- e.g. `EmptyRunPlan` or
+        # `DisallowedTaskType` reaching this deep is defense in depth,
+        # registration (issue #39) rejects the common case before a goal is
+        # even reachable, but any other bug below the route lands here too.
+        # The client gets a generic, sanitized document; the exception itself
+        # -- type, message, traceback -- goes to the log only.
+        _logger.error("unhandled error on %s %s", request.method, request.url.path, exc_info=exc)
+        problem = ProblemDetails(
+            type=INTERNAL_ERROR_TYPE,
+            title="Internal server error",
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             instance=request.url.path,
         )
         return _problem_response(problem)
