@@ -18,12 +18,19 @@ from steward_schemas.catalog import AssetDetail, AssetPage
 from steward_schemas.column import Column
 from steward_schemas.errors import ProblemDetails
 from steward_schemas.run import Run, RunCreate, RunStatus
-from steward_schemas.source import DEFAULT_EXCLUDED_SCHEMAS, Source, SourceCreate, SourceEngine
+from steward_schemas.source import (
+    DEFAULT_EXCLUDED_SCHEMAS,
+    SECRET_REF_PATTERN,
+    Source,
+    SourceCreate,
+    SourceEngine,
+)
 from steward_schemas.task import TaskResult, TaskSpec, TaskStatus
 
 __all__ = [
     "CONTRACTS",
     "DEFAULT_EXCLUDED_SCHEMAS",
+    "SECRET_REF_PATTERN",
     "AgentSpec",
     "Asset",
     "AssetDetail",

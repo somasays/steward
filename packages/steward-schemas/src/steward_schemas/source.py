@@ -8,6 +8,22 @@ from pydantic import Field
 
 from steward_schemas._base import SchemaModel
 
+# The shape of a secret reference: `scheme:name`, and nothing else.
+#
+# Published here, on the contract, because this is the outermost place the rule
+# can be enforced. A DSN fails it — `postgresql://u:p@h/db` carries `/` and `@`
+# — so a client that posts a credential is rejected at the boundary with a 422
+# naming only the field.
+#
+# That matters more than it looks. The same rule is a CHECK constraint on
+# `sources.dsn_secret_ref` (migration `0003_catalog`), and if the boundary let a
+# DSN through, the database would be the thing to reject it — raising a
+# `CheckViolation` whose message quotes the failing row, credential included,
+# into the API's error log (N7). Defence in depth only works when the outer
+# layer holds; this constant is that layer, and `steward_catalog.secrets`
+# compiles this exact string rather than a second copy of it.
+SECRET_REF_PATTERN = r"^[a-z][a-z0-9_]*:[A-Za-z0-9_.-]+$"
+
 DEFAULT_EXCLUDED_SCHEMAS: tuple[str, ...] = ("information_schema", "pg_catalog")
 """Schemas a scan skips unless the registration says otherwise.
 
@@ -49,7 +65,11 @@ class SourceCreate(SchemaModel):
     engine: SourceEngine
     host: str
     database: str
-    dsn_secret_ref: str
+    dsn_secret_ref: str = Field(pattern=SECRET_REF_PATTERN)
+    """A `scheme:name` reference. Constrained here so that posting a DSN is a
+    422 at the boundary rather than a database CHECK violation whose message
+    would carry the credential into the API's log (N7)."""
+
     include_schemas: tuple[str, ...] = ()
     exclude_schemas: tuple[str, ...] = Field(default=DEFAULT_EXCLUDED_SCHEMAS)
     scan_schedule: str | None = None

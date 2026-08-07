@@ -707,9 +707,7 @@ class TestSingleFlightAdmission:
         assert claim_single_flight(conn, goal="scan_source", payload={"source_id": "b"}) is None
         conn.rollback()
 
-    def test_a_finished_run_is_not_in_flight(
-        self, conn: QueueConnection, budget: RunBudget
-    ) -> None:
+    def test_a_finished_run_is_not_in_flight(self, conn: QueueConnection, budget: RunBudget) -> None:
         # Otherwise a source could never be rescanned: the first scan would
         # keep answering for every request that followed it.
         payload = {"source_id": "a"}

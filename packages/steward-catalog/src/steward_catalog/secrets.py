@@ -29,6 +29,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
+from steward_schemas import SECRET_REF_PATTERN
+
 __all__ = [
     "ENV_SCHEME",
     "SECRET_REF",
@@ -39,10 +41,16 @@ __all__ = [
     "SecretResolver",
 ]
 
-SECRET_REF = re.compile(r"^([a-z][a-z0-9_]*):([A-Za-z0-9_.-]+)$")
-"""`scheme:name`. Kept identical to the CHECK constraint in migration
-`0003_catalog` -- the database and this module reject the same strings, so a
-reference that survived a write is one this module can parse."""
+SECRET_REF = re.compile(SECRET_REF_PATTERN)
+"""`scheme:name`, compiled from the contract's own pattern -- not restated.
+
+`steward_schemas.SECRET_REF_PATTERN` is the single authority: the
+`POST /v1/sources` contract validates against it, the `sources.dsn_secret_ref`
+CHECK enforces it in the database, and this module parses with it. Three
+enforcement points, one rule -- so a reference that survived a write is always
+one this module can take apart, and a DSN is rejected at the outermost of the
+three, before it can reach a log (N7).
+"""
 
 ENV_SCHEME = "env"
 """The only scheme M1 resolves: the name is an environment variable."""
@@ -122,10 +130,9 @@ class EnvSecretResolver:
     environ: Mapping[str, str] | None = None
 
     def resolve(self, ref: str) -> Secret:
-        match = SECRET_REF.match(ref)
-        if match is None:
+        if SECRET_REF.match(ref) is None:
             raise MalformedSecretRef(ref, "not a scheme:name secret reference")
-        scheme, name = match.group(1), match.group(2)
+        scheme, _, name = ref.partition(":")
         if scheme != ENV_SCHEME:
             raise MalformedSecretRef(ref, f"unsupported secret scheme {scheme!r}")
         source = os.environ if self.environ is None else self.environ

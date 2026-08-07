@@ -113,9 +113,7 @@ class CatalogStore(Protocol):
         different request."""
         ...
 
-    async def list_assets(
-        self, *, source_id: UUID | None, cursor: str | None, limit: int
-    ) -> AssetPage:
+    async def list_assets(self, *, source_id: UUID | None, cursor: str | None, limit: int) -> AssetPage:
         """One page of assets, in a total, stable order. Raises `InvalidCursor`
         for a cursor this API did not issue."""
         ...
@@ -214,9 +212,7 @@ class PostgresCatalogStore:
     async def start_scan(self, source_id: UUID, idempotency_key: str | None) -> tuple[Run, bool]:
         return await asyncio.to_thread(self._start_scan, source_id, idempotency_key)
 
-    async def list_assets(
-        self, *, source_id: UUID | None, cursor: str | None, limit: int
-    ) -> AssetPage:
+    async def list_assets(self, *, source_id: UUID | None, cursor: str | None, limit: int) -> AssetPage:
         return await asyncio.to_thread(self._list_assets, source_id, cursor, limit)
 
     async def get_asset(self, asset_id: UUID) -> AssetDetail | None:
@@ -362,9 +358,7 @@ class InMemoryCatalogStore:
             self._scans[source_id] = run
             return run, True
 
-    async def list_assets(
-        self, *, source_id: UUID | None, cursor: str | None, limit: int
-    ) -> AssetPage:
+    async def list_assets(self, *, source_id: UUID | None, cursor: str | None, limit: int) -> AssetPage:
         if cursor is not None:
             decode_cursor(cursor)  # a bad cursor is a rejection here too
         return AssetPage(items=())

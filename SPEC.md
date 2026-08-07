@@ -170,6 +170,16 @@ discover_schema ──► profile_table (×N, fan-out per table)
                                 └─► propose_quality_rules
 ```
 
+**That DAG is the target shape, not what `scan_source` plans today.** As shipped
+(issue #20) it plans **exactly one** task — the metadata scan — and the reason is
+a budget one: `RunPlan.task_specs` gives every planned task the *run's* budget,
+so an N-way fan-out lets a single run spend N times the cap the API published for
+it (I12). With one task the per-task cap the queue enforces *is* the run cap, so
+the advertised budget is the real bound. The fan-out above lands once run-level
+budget reservation does — accumulated `runs.used_*` checked against
+`runs.budget_*` by the runtime, which arrives with the agent loop H4's
+step/token/cost half measures (issue #37). No goal may fan out before then.
+
 - Tasks are rows in Postgres. Workers claim them with `SELECT ... FOR UPDATE SKIP LOCKED`, giving exactly-once *claiming* with at-least-once *execution* — so **every task handler must be idempotent** (all writes are upserts keyed on natural keys; indexing uses deterministic document IDs).
 - Task state machine: `pending → claimed → running → (succeeded | failed | dead)`. Failures retry with exponential backoff up to `max_attempts`; `dead` tasks page via alerting and can be replayed.
 

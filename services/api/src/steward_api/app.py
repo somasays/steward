@@ -13,9 +13,7 @@ from steward_api.routes.sources import build_router as build_sources_router
 from steward_api.store import InMemoryRunStore, RunStore
 
 
-def create_app(
-    run_store: RunStore | None = None, catalog_store: CatalogStore | None = None
-) -> FastAPI:
+def create_app(run_store: RunStore | None = None, catalog_store: CatalogStore | None = None) -> FastAPI:
     """Build the API app around a `RunStore` and a `CatalogStore`.
 
     The defaults are the in-memory stores, which is what the OpenAPI export and

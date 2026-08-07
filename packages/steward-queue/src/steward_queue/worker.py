@@ -146,11 +146,29 @@ class Worker:
             conn.commit()
         return len(recovered)
 
+    def _lease_for(self, task: ClaimedTask) -> timedelta:
+        """A lease long enough to cover the budget it is supervising.
+
+        The lease and the wall-clock budget are two different bounds and the
+        reaper only knows about the first, so a task whose budget exceeds the
+        worker's lease gets taken back by `requeue_stale` while it is still
+        legitimately running -- and then re-executed concurrently, with the
+        original executor's `complete` failing `TaskNotClaimable` and its
+        writes discarded. Retried under the same lease it fails identically,
+        so the task can exhaust `max_attempts` and dead-letter without ever
+        succeeding, entirely inside the budget the API published for it.
+
+        Taking the larger of the two makes the budget the effective bound
+        again: the runtime cancels a task for exceeding its cap (I12), never
+        for outliving a lease that was shorter than the cap.
+        """
+        return max(self._lease, task.spec.budget.wall_clock)
+
     def _start(self, conn: QueueConnection, task: ClaimedTask) -> None:
         tasks.mark_running(
             conn,
             task.spec.task_id,
-            lease=self._lease,
+            lease=self._lease_for(task),
             claimed_by=self._worker_id,
             actor=self._actor,
         )

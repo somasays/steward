@@ -129,10 +129,23 @@ def _problem(problem_type: str, title: str, detail: str, status: int) -> Problem
 
 def _failed(spec: TaskSpec, error: ProblemDetails) -> TaskResult:
     """A typed failure. The task's own transaction has written nothing."""
-    return TaskResult(task_id=spec.task_id, status=TaskStatus.FAILED, usage=_no_usage(), error=error)
+    return TaskResult(task_id=spec.task_id, status=TaskStatus.FAILED, usage=_scan_usage(), error=error)
 
 
-def _no_usage() -> RunBudget:
+def _scan_usage() -> RunBudget:
+    """What a scan reports having spent: one step, no tokens, no money.
+
+    `wall_clock` is reported as zero rather than measured, and that is a trade
+    with a visible cost. H1 compares this handler's returned result byte for
+    byte across two executions; a real duration differs between them by
+    construction, so reporting one would make the harness fail always -- and a
+    harness that always fails is one that gets ignored. The consequence is that
+    `runs.used_wall_clock` under-reports a scan, so wall-clock is enforced by
+    the runtime -- the worker's `asyncio.timeout` and both connections'
+    `statement_timeout`, all derived from `spec.budget.wall_clock` -- and never
+    by this number. Measuring it for N6 needs a usage field the idempotency
+    comparison excludes, which belongs with the agent loop.
+    """
     return RunBudget(steps=SCAN_STEPS, tokens=NO_USAGE_TOKENS, cost_usd=Decimal("0"), wall_clock=timedelta(0))
 
 
@@ -209,11 +222,22 @@ def _scan(
         with inspect(secret, spec.budget.wall_clock) as inspector:
             observed = inspector.inspect(source.key.schemas)
     except psycopg.Error as exc:
-        # Sanitized on purpose: psycopg renders the conninfo it failed on, and
-        # this detail is persisted to `tasks.last_error` and reachable over the
-        # API. The real message goes to the log, where the credential's own
-        # redaction is not the only thing standing between it and a client.
-        _logger.warning("source %s could not be inspected", payload.source_id, exc_info=exc)
+        # Neither the response nor the log gets the exception itself. psycopg
+        # renders the conninfo it failed on, which means its message can carry
+        # the credential -- and `tasks.last_error` is served over the API while
+        # the log is shipped off the box. Every other credential guarantee in
+        # this package is structural (`Secret` redacts, the column has a CHECK,
+        # the connector takes `Secret` not `str`); trusting a driver's error
+        # formatting would be the one that is not. So the type is logged and
+        # the text is dropped: an operator gets `OperationalError on source X`,
+        # which is what they act on, and the SQLSTATE, which is what they
+        # diagnose with (N7).
+        _logger.warning(
+            "source %s could not be inspected: %s (sqlstate %s)",
+            payload.source_id,
+            type(exc).__name__,
+            getattr(exc, "sqlstate", None),
+        )
         return _failed(
             spec,
             _problem(
@@ -229,7 +253,7 @@ def _scan(
     return TaskResult(
         task_id=spec.task_id,
         status=TaskStatus.SUCCEEDED,
-        usage=_no_usage(),
+        usage=_scan_usage(),
         output={
             "source_id": str(payload.source_id),
             "assets": len(observed),

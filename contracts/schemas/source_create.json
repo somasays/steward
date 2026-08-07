@@ -19,6 +19,7 @@
       "type": "string"
     },
     "dsn_secret_ref": {
+      "pattern": "^[a-z][a-z0-9_]*:[A-Za-z0-9_.-]+$",
       "title": "Dsn Secret Ref",
       "type": "string"
     },

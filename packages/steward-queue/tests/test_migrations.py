@@ -13,7 +13,7 @@ from alembic import command
 from alembic.config import Config
 from steward_queue import RunStatus, TaskState
 from steward_queue.migrate import MIGRATIONS_DIR, downgrade_to_base, upgrade_to_head
-from steward_schemas import AssetLifecycle, AssetType, SourceEngine
+from steward_schemas import SECRET_REF_PATTERN, AssetLifecycle, AssetType, SourceEngine
 
 SELECT_TABLES = "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
 SELECT_INDEXES = "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
@@ -139,6 +139,24 @@ def test_a_source_row_cannot_hold_a_dsn(scratch_dsn: str) -> None:
         conn.rollback()
         conn.execute(INSERT_SOURCE, {"ref": "env:STEWARD_SOURCE_DSN"})  # the reference form is fine
         conn.rollback()
+
+
+def test_the_secret_reference_check_matches_the_published_contract(scratch_dsn: str) -> None:
+    """One rule, three enforcement points -- and this is what stops them drifting.
+
+    `steward_schemas.SECRET_REF_PATTERN` is validated by `SourceCreate`, parsed
+    by `steward_catalog.secrets`, and enforced by this constraint. If the
+    contract loosened and the column did not, a credential would be caught only
+    by the database, whose rejection message quotes the failing row (N7).
+    """
+    upgrade_to_head(scratch_dsn)
+    with psycopg.connect(scratch_dsn) as conn:
+        row = conn.execute(
+            SELECT_CHECK_CONSTRAINT,
+            {"table": "sources", "constraint": "sources_dsn_secret_ref_check"},
+        ).fetchone()
+    assert row is not None
+    assert SECRET_REF_PATTERN in row[0]
 
 
 def test_catalog_enums_match_their_check_constraints(scratch_dsn: str) -> None:

@@ -41,6 +41,26 @@ def test_a_registration_response_carries_a_reference_and_no_credential(client: T
     assert not any("password" in key or "dsn" == key for key in body)
 
 
+def test_posting_a_dsn_instead_of_a_reference_is_rejected_at_the_boundary(
+    client: TestClient,
+) -> None:
+    """N7, and the reason the constraint is on the *contract* and not only on
+    the column.
+
+    Without it the request reaches the INSERT, Postgres rejects it, and the
+    `CheckViolation` it raises quotes the failing row -- password included --
+    into the API's error log on its way to a sanitized 500. Rejecting at the
+    boundary means the credential never leaves the request.
+    """
+    rejected = client.post(
+        "/v1/sources",
+        json={**SOURCE_BODY, "dsn_secret_ref": "postgresql://steward:hunter2@db.internal:5432/analytics"},
+    )
+
+    assert rejected.status_code == 422
+    assert "hunter2" not in rejected.text  # the rejection does not echo the value back
+
+
 def test_a_source_body_must_name_an_engine_steward_supports(client: TestClient) -> None:
     rejected = client.post("/v1/sources", json={**SOURCE_BODY, "engine": "sqlite"})
 

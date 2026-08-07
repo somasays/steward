@@ -42,6 +42,7 @@ REPORTS_FAILURE = "test.reports_failure"
 SLEEPS = "test.sleeps"
 BLOCKS_IN_THE_DRIVER = "test.blocks_in_the_driver"
 UNREGISTERED = "test.unregistered"
+REPORTS_ITS_LEASE = "test.reports_its_lease"
 
 TINY_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(milliseconds=20))
 SHORT_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(milliseconds=250))
@@ -51,6 +52,28 @@ SELECT_TASK_LAST_ERROR = "SELECT last_error FROM tasks WHERE id = %s"
 SELECT_CHECKPOINTS = "SELECT step, state FROM checkpoints WHERE task_id = %s ORDER BY step"
 SELECT_AUDIT_ACTIONS = "SELECT action FROM audit_log WHERE entity_id = %s ORDER BY id"
 SELECT_PG_SLEEP = "SELECT pg_sleep(%(seconds)s)"
+SELECT_LEASE_HEADROOM_SECONDS = """
+SELECT EXTRACT(EPOCH FROM (lease_expires_at - now())) FROM tasks WHERE id = %(id)s
+"""
+
+
+@task_handler(REPORTS_ITS_LEASE, sample_payload={})
+async def reports_its_lease(ctx: TaskContext) -> TaskResult:
+    """Reports how much lease its own task row has left, while it runs.
+
+    The worker commits `mark_running` before calling a handler, so by the time
+    this executes the lease it was granted is readable from the row -- which
+    makes the worker's lease decision observable state rather than something a
+    test has to reach into a private method for. Idempotent: it reads, it never
+    writes, and the value is excluded from the result so H1's byte-identical
+    comparison is not made unfalsifiable by a moving clock.
+    """
+    row = ctx.connection.execute(SELECT_LEASE_HEADROOM_SECONDS, {"id": ctx.spec.task_id}).fetchone()
+    _observed_lease_headroom.append(float(row[0]) if row is not None and row[0] is not None else 0.0)
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+_observed_lease_headroom: list[float] = []
 
 
 @task_handler(EXPLODES, sample_payload={"boom": False})
@@ -466,3 +489,40 @@ class TestRunRollup:
 @pytest.mark.parametrize("task_type", [EXPLODES, REPORTS_FAILURE, BLOCKS_IN_THE_DRIVER])
 def test_scaffolding_handlers_are_registered(task_type: str) -> None:
     assert task_type in REGISTRY
+
+
+class TestLeaseCoversBudget:
+    """A lease must outlive the budget it supervises (I12, N1).
+
+    The reaper only knows about leases. A task whose wall-clock budget exceeds
+    the worker's lease would be handed back by `requeue_stale` while it is
+    still legitimately inside its cap, then executed a second time
+    concurrently -- and the first executor's `complete` rejected as
+    `TaskNotClaimable`, discarding its writes. Retried under the same lease it
+    fails identically, so the task can exhaust `max_attempts` and dead-letter
+    without ever having exceeded the budget the API published for it.
+    """
+
+    async def test_a_budget_longer_than_the_lease_extends_the_lease(
+        self, dsn: str, queued: Callable[..., TaskSpec]
+    ) -> None:
+        _observed_lease_headroom.clear()
+        generous = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(minutes=30))
+        queued(task_type=REPORTS_ITS_LEASE, payload={}, budget=generous)
+
+        await Worker(dsn, "lease-worker", lease=timedelta(minutes=5)).run_once()
+
+        [headroom] = _observed_lease_headroom
+        assert headroom > timedelta(minutes=5).total_seconds()
+
+    async def test_a_budget_inside_the_lease_leaves_the_lease_alone(
+        self, dsn: str, queued: Callable[..., TaskSpec]
+    ) -> None:
+        _observed_lease_headroom.clear()
+        tight = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(seconds=30))
+        queued(task_type=REPORTS_ITS_LEASE, payload={}, budget=tight)
+
+        await Worker(dsn, "lease-worker", lease=timedelta(minutes=5)).run_once()
+
+        [headroom] = _observed_lease_headroom
+        assert timedelta(minutes=4).total_seconds() < headroom <= timedelta(minutes=5).total_seconds()
