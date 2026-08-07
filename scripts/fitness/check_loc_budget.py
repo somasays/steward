@@ -14,12 +14,21 @@ BUDGET = 2000
 TARGET = "packages/steward-agents"
 
 
+EMPTY_THRESHOLD = 50
+
+
 def run() -> CheckResult:
     base = repo_root() / TARGET
     if not base.exists():
         return CheckResult("S2", "runtime size budget", "SKIP", [], f"{TARGET} not created yet")
     total = sum(effective_loc(p) for p in iter_python_files(base) if not is_test_path(p))
     detail = f"{total}/{BUDGET} effective LOC"
+    if total < EMPTY_THRESHOLD:
+        # A budget check over a skeleton measures nothing. Reporting PASS here would
+        # read as "the runtime fits" when no runtime exists yet -- the same hollow-green
+        # failure mode the G4 scan had. Skip honestly until there is a runtime to bound.
+        return CheckResult("S2", "runtime size budget", "SKIP", [],
+                           f"{TARGET} is still a skeleton ({total} LOC); budget applies from M1")
     if total > BUDGET:
         return CheckResult("S2", "runtime size budget", "FAIL",
                            [Finding(TARGET, 0, f"runtime is {total} LOC, budget {BUDGET} (I9)")], detail)
