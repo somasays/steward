@@ -224,15 +224,39 @@ def _consume(finished: asyncio.Future[_Executed]) -> None:
         finished.exception()
 
 
+class _WallClockExpired(Exception):
+    """The cap's own timeout, told apart from every other `TimeoutError`.
+
+    Since 3.11 `socket.timeout`, `asyncio.TimeoutError` and the `OSError`
+    subclass are one class, so a customer database's `connect_timeout` firing
+    five seconds into a half-hour budget arrives at `_classify` as the same type
+    an overrun does. Raised only by `_bounded`, and only when the cap it set is
+    the thing that fired, so the type is evidence rather than a guess (#57).
+
+    An `Exception`, deliberately: `_run_handler` answers for `Exception`, and a
+    sentinel outside that is #55 with a different name.
+    """
+
+
 async def _bounded(coro: Awaitable[TaskResult], budget: timedelta) -> TaskResult:
     """Run a handler under its wall-clock cap, on the thread's own event loop.
 
     This is the cheap half of enforcement and it only reaches handlers that
     await. The expensive half -- a handler that never yields -- is the loop's
     deadline, which does not depend on the handler cooperating at all.
+
+    A `TimeoutError` leaving here is re-raised as itself unless `asyncio.timeout`
+    reports that it expired -- the handler's own timeouts are the handler's, and
+    only the cap's is the cap's.
     """
-    async with asyncio.timeout(budget.total_seconds()):
-        return await coro
+    cap = asyncio.timeout(budget.total_seconds())
+    try:
+        async with cap:
+            return await coro
+    except TimeoutError as exc:
+        if not cap.expired():
+            raise
+        raise _WallClockExpired(f"wall-clock cap of {budget} reached") from exc
 
 
 def spawn(
@@ -366,12 +390,21 @@ def _run_handler(
 def _classify(exc: BaseException, budget: RunBudget, elapsed: float) -> ProblemDetails:
     """Name the failure a handler ended on -- overrun, or genuine fault.
 
-    Anything raised at or past the cap is the cap: a driver-blocked handler
-    surfaces its overrun as the connection's `QueryCanceled`, and reporting
-    that as "handler raised" would hide the one failure mode I12 exists to
-    make visible. Below the cap the exception is the handler's own.
+    Two shapes are the cap, and each is recognised by what it can offer.
+    `_WallClockExpired` is the in-band one: `_bounded` raises it only when the
+    timeout *it* set fired, so the type is proof. A driver-blocked handler has
+    no such signal -- its overrun arrives as the connection's `QueryCanceled`,
+    which is what a cancelled statement always looks like -- so it is recognised
+    by the clock, and reporting it as "handler raised" would hide the one
+    failure mode I12 exists to make visible.
+
+    What is deliberately *not* here is `isinstance(exc, TimeoutError)`. Since
+    3.11 that is also `socket.timeout`, so it filed an unreachable customer
+    database as `budget_exceeded` against a cap nothing had approached: an
+    operator sent to the budget instead of the host, and an H4 assertion a
+    non-budget failure could satisfy (#57).
     """
-    if isinstance(exc, TimeoutError) or elapsed >= budget.wall_clock.total_seconds():
+    if isinstance(exc, _WallClockExpired) or elapsed >= budget.wall_clock.total_seconds():
         return _budget_exceeded(budget)
     return _problem(HANDLER_FAILED, f"{type(exc).__name__}: {exc}")
 
