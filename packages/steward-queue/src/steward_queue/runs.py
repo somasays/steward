@@ -166,7 +166,12 @@ def bind_idempotency_key(
         # The key names nothing yet, so the UPDATE's own predicate is what
         # failed: this run's column already holds a different key.
         current = conn.execute(_sql.SELECT_RUN, {"id": run_id}).fetchone()
-        return _run_record(_require_row(current, f"no run with id {run_id}"))
+        if current is None:
+            # Not "the schema drifted" (that's what `_require_row` guards
+            # elsewhere) -- a caller-supplied `run_id` naming nothing at all.
+            # Same typed shape `set_run_status` uses for the same condition.
+            raise LookupError(f"no such run: {run_id}")
+        return _run_record(current)
     record = _run_record(row)
     write_audit(
         conn,

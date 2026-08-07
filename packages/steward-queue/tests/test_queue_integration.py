@@ -826,6 +826,15 @@ class TestBindIdempotencyKey:
         assert fetched is not None and fetched.idempotency_key == "k1"  # unchanged, not overwritten
         assert audit_actions(conn) == ["run.created"]  # no bind was recorded
 
+    def test_a_missing_run_id_raises_a_typed_lookup_error(
+        self, conn: QueueConnection
+    ) -> None:
+        """Not the schema drifting -- a caller-supplied `run_id` that names
+        nothing at all. Same typed shape `set_run_status` uses for the same
+        condition, not a bare `RuntimeError`."""
+        with pytest.raises(LookupError, match="no such run"):
+            bind_idempotency_key(conn, uuid4(), "fresh-key")
+
     def test_a_bound_key_then_replayed_through_create_run_finds_the_same_run(
         self, conn: QueueConnection, budget: RunBudget
     ) -> None:
