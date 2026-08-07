@@ -34,6 +34,7 @@ COUNT_RUNS = "SELECT count(*) FROM runs"
 COUNT_TASKS = "SELECT count(*) FROM tasks"
 
 EMPTY_PLAN_GOAL = "plans_conditionally"
+DISALLOWED_TYPE_GOAL = "plans_conditionally_outside_allowlist"
 
 EMPTY_PLAN_BUDGET = RunBudget(
     steps=1, tokens=1, cost_usd=Decimal("0.01"), wall_clock=timedelta(seconds=1)
@@ -54,6 +55,18 @@ class ConditionalPlanParams(GoalParams):
     """
 
     make_tasks: bool = True
+
+
+class ConditionalAllowlistParams(GoalParams):
+    """Plans `task_type`, which defaults to an allowed one.
+
+    Same shape as `ConditionalPlanParams`, for `DisallowedTaskType` rather
+    than `EmptyRunPlan`: the sample plans `"noop"` (allowed), so registration
+    passes; a request naming a different `task_type` plans outside the
+    allowlist, which eager registration cannot see coming.
+    """
+
+    task_type: str = "noop"
 
 
 @pytest.fixture(scope="session")
@@ -124,6 +137,34 @@ def plans_conditionally_goal() -> Iterator[str]:
         yield EMPTY_PLAN_GOAL
     finally:
         unregister(EMPTY_PLAN_GOAL)
+
+
+@pytest.fixture
+def plans_conditionally_outside_allowlist_goal() -> Iterator[str]:
+    """Register a goal whose sample payload plans an allowed task -- so it
+    passes registration's eager check -- but whose planner plans a
+    caller-chosen task type for a *different* payload. Undoes the
+    registration so it cannot leak into another test.
+
+    The `DisallowedTaskType` counterpart to `plans_conditionally_goal`: same
+    defense-in-depth case, the other rejection eager registration cannot rule
+    out.
+    """
+
+    @goal(
+        DISALLOWED_TYPE_GOAL,
+        params_model=ConditionalAllowlistParams,
+        allowed_task_types=["noop"],
+        budget=EMPTY_PLAN_BUDGET,
+        sample_payload={"task_type": "noop"},
+    )
+    def plan(params: ConditionalAllowlistParams) -> tuple[PlannedTask, ...]:
+        return (PlannedTask(task_type=params.task_type, payload={}),)
+
+    try:
+        yield DISALLOWED_TYPE_GOAL
+    finally:
+        unregister(DISALLOWED_TYPE_GOAL)
 
 
 def _counts(conn: QueueConnection) -> tuple[int, int]:
@@ -205,6 +246,29 @@ def test_a_planner_that_plans_nothing_creates_no_run_and_no_task(
     assert body["type"] == "urn:steward:internal-error"
     assert "EmptyRunPlan" not in resp.text
     assert plans_conditionally_goal not in resp.text
+    assert _counts(conn) == before
+
+
+def test_a_planner_that_plans_outside_its_allowlist_creates_no_run_and_no_task(
+    db_client_no_raise: TestClient, conn: QueueConnection, plans_conditionally_outside_allowlist_goal: str
+) -> None:
+    # The `DisallowedTaskType` counterpart to the `EmptyRunPlan` case above:
+    # a planner that names a task type outside its own registered allowlist
+    # is a programming error the same way, caught the same way, and must
+    # leave nothing behind the same way.
+    before = _counts(conn)
+
+    resp = db_client_no_raise.post(
+        "/v1/runs",
+        json={"goal": plans_conditionally_outside_allowlist_goal, "payload": {"task_type": "drop_table"}},
+    )
+
+    assert resp.status_code == 500
+    assert resp.headers["content-type"] == PROBLEM_CONTENT_TYPE
+    body = resp.json()
+    assert body["type"] == "urn:steward:internal-error"
+    assert "DisallowedTaskType" not in resp.text
+    assert "drop_table" not in resp.text
     assert _counts(conn) == before
 
 

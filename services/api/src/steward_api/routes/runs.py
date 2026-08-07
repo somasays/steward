@@ -50,12 +50,12 @@ _NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
 _CONFLICT_RESPONSE: dict[int | str, dict[str, Any]] = {
     409: {"model": ProblemDetails, "description": "Idempotency key reused with a different request"}
 }
-# The catch-all handler in problem_details.py (issue #39): a planner that
-# clears registration's eager check (issue #39) but still misbehaves on a
-# particular payload -- planning nothing, or outside its allowlist -- is a
-# programming error, not a client error, and reaches this document instead of
-# a bare 500. The body never carries the exception; the reason is server-side
-# in the log only.
+# The catch-all handler in problem_details.py (issue #39) covers every route,
+# including this one: a planner that clears registration's eager check but
+# still misbehaves on a particular payload -- planning nothing, or outside
+# its allowlist -- is a programming error, not a client error, and reaches
+# this document instead of a bare 500. The body never carries the exception;
+# the reason is server-side in the log only.
 _INTERNAL_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
     500: {"model": ProblemDetails, "description": "Unexpected server error"}
 }
@@ -99,7 +99,7 @@ def build_router(store: RunStore) -> APIRouter:
     @router.get(
         "/{run_id}",
         response_model=Run,
-        responses={**_NOT_FOUND_RESPONSE, **_VALIDATION_ERROR_RESPONSE},
+        responses={**_NOT_FOUND_RESPONSE, **_VALIDATION_ERROR_RESPONSE, **_INTERNAL_ERROR_RESPONSE},
     )
     async def get_run(run_id: UUID) -> Run:
         run = await store.get_run(run_id)
