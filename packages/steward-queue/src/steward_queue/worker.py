@@ -21,6 +21,16 @@ If the worker dies between 1 and 3 the task sits with an expired lease and
 `tasks.requeue_stale` returns it to `pending` -- a crash costs a retry, never a
 task (N1, H3).
 
+Which connections a crash-loop can still reach (#56, SPEC.md §13 D7)
+----------------------------------------------------------------------
+A task opens up to four connections across a poll: `_claim`'s, `_reap`'s,
+`execute`'s bookkeeping one, and the handler's own (`execution`). `_claim`
+has no task in hand, so a connection failure there is left fatal -- see its
+docstring. The other three are covered: `_reap_forever` survives a broken
+connection and retries on its own poll interval; `execute` retries its own
+connect briefly and, failing that, leaves the attempt to lease recovery
+instead of the worker; the handler's is `execution`'s to answer for (#45).
+
 What this module is not
 -----------------------
 Running a handler is a job of its own and lives in `execution`: the thread it
@@ -43,6 +53,7 @@ import time
 from collections.abc import Sequence
 from datetime import timedelta
 
+import psycopg
 from steward_schemas import ProblemDetails, TaskResult
 from steward_telemetry import NoopTracer, Span, SpanOutcome, Tracer
 
@@ -72,6 +83,12 @@ DEFAULT_POLL_INTERVAL = timedelta(milliseconds=200)
 
 UNKNOWN_TYPE = "no handler registered for task type"
 WORKER_STOPPING = "worker stopping"
+BOOKKEEPING_CONNECTION_FAILED = "worker could not open its bookkeeping connection"
+
+CONNECT_RETRY_ATTEMPTS = 3
+CONNECT_RETRY_DELAY = timedelta(milliseconds=150)
+"""Bounded retry for `execute`'s connect, aimed at losing a slot, not exhaustion
+(#56, SPEC.md §13 D7). Rationale on `_connect_for_execute`, next to the code."""
 
 
 class Worker:
@@ -136,8 +153,27 @@ class Worker:
                 await reaper
 
     async def _reap_forever(self, stop: asyncio.Event) -> None:
+        """Reap on every interval, surviving a connection this worker cannot open.
+
+        `_reap`'s connect is a fourth call site with the same exposure as
+        `_claim`'s and `execute`'s (#56), but no task in hand to fail and no
+        caller reading its result -- this coroutine is created once and only
+        ever awaited at shutdown (`run_forever`'s `finally`). Left uncaught, a
+        connection failure here does not crash the worker; it silently ends
+        the reaper and no lease is recovered until shutdown, which is worse
+        than fatal because nothing signals it. The catch costs nothing this
+        loop was not already going to pay: the next interval is a bounded
+        retry it runs anyway, and every other worker's own reaper covers the
+        same stale tasks in the meantime (N1, P4).
+
+        Scoped to `OperationalError` deliberately, not `psycopg.Error`: this is
+        the connection-refusal shape #56 is about, and a broader catch would
+        also swallow a genuine bug in `requeue_stale`'s SQL (a `ProgrammingError`)
+        every interval instead of surfacing it.
+        """
         while not stop.is_set():
-            await self.reap_stale()
+            with contextlib.suppress(psycopg.OperationalError):
+                await self.reap_stale()
             await self._idle(stop)
 
     async def _idle(self, stop: asyncio.Event) -> None:
@@ -148,6 +184,18 @@ class Worker:
     # --- synchronous halves, always called off the event loop ---
 
     def _claim(self) -> list[ClaimedTask]:
+        """Claim this worker's next batch. A connection failure here is left fatal.
+
+        Unlike `execute`'s connect, there is no task in hand yet -- nothing is
+        stranded by exiting, because nothing was claimed. Retrying in-process
+        would also duplicate a policy that belongs to the process supervisor
+        (systemd, Kubernetes), not the worker, and would hide the failure from
+        it: an operator watching restarts sees a crash-loop; one watching a
+        worker that silently never claims anything sees nothing at all. It is
+        also the misconfiguration canary -- a bad DSN fails here, loudly, on
+        the very first poll, rather than becoming a worker that polls forever
+        and claims nothing (#56, SPEC.md §13 D7).
+        """
         with connect(self._dsn) as conn:
             claimed = tasks.claim(
                 conn,
@@ -265,8 +313,19 @@ class Worker:
         `stop` is honoured while a handler runs: a worker asked to shut down
         leaves the attempt to its lease rather than waiting out the budget, so
         SIGTERM latency is a poll interval instead of a task duration (N1).
+
+        A task IS claimed by the time this runs, unlike `_claim`, which has
+        none to answer for -- so a connection this worker cannot open here is
+        not left to kill the worker (#56, SPEC.md §13 D7). `_connect_for_execute`
+        retries briefly; if the pool stays out of room past that, `mark_running`
+        never runs, so the row is left `claimed` -- not `running` -- for
+        `requeue_stale` rather than recorded, because there is no connection
+        left to record it on.
         """
-        conn = await asyncio.to_thread(connect, self._dsn, statement_timeout=self._lease)
+        conn = await asyncio.to_thread(self._connect_for_execute)
+        if conn is None:
+            self._span_unopened(task)
+            return True
         try:
             with self._tracer.task_span(
                 trace_id=task.trace_id,
@@ -280,6 +339,54 @@ class Worker:
             return False
         finally:
             await asyncio.to_thread(conn.close)
+
+    def _connect_for_execute(self) -> QueueConnection | None:
+        """Open the worker's bookkeeping connection, tolerating a transient refusal.
+
+        A task is already claimed by the time `execute` calls this, so a
+        connection failure here has a task-scoped answer that `_claim` does
+        not have (SPEC.md §13, D7): leave the attempt where lease recovery
+        finds it instead of taking the worker down over a task it already
+        owns. The retry is aimed at the shape #56 found still reachable after
+        #45 -- losing a race for the last slot in the pool, not genuine
+        `max_connections` exhaustion -- so it stays short: `CONNECT_RETRY_ATTEMPTS`
+        attempts, `CONNECT_RETRY_DELAY` apart. The worst case (every attempt
+        refused) is on the order of one poll interval, not a fraction of
+        one -- it can delay how promptly `run_once` returns and `run_forever`
+        rechecks `stop` by about that much -- but it is nowhere near a task's
+        multi-minute lease, which is the bound that actually matters here.
+
+        Always called off the event loop (`execute` runs it via `to_thread`),
+        so the retry's `time.sleep` blocks only this thread. `None` tells the
+        caller the pool stayed out of room past the bound: `requeue_stale`
+        reclaims the task at lease expiry, the same "recorded by neither
+        context" outcome #53 already accepts, reached from a different seam.
+        """
+        for attempt in range(CONNECT_RETRY_ATTEMPTS):
+            try:
+                return connect(self._dsn, statement_timeout=self._lease)
+            except psycopg.OperationalError:
+                if attempt == CONNECT_RETRY_ATTEMPTS - 1:
+                    return None
+                time.sleep(CONNECT_RETRY_DELAY.total_seconds())
+        return None  # pragma: no cover -- unreachable; the loop always returns before falling off
+
+    def _span_unopened(self, task: ClaimedTask) -> None:
+        """Mark a span for an attempt that never got a connection to record on.
+
+        The task row is untouched here: `execute`'s connect failure leaves the
+        attempt exactly where a thread that took the handoff and then failed to
+        write also leaves it (#53) -- unrecorded, still owned, and reclaimed by
+        `requeue_stale` at lease expiry. Nothing else can write a terminal state
+        without a connection to write it on.
+        """
+        with self._tracer.task_span(
+            trace_id=task.trace_id,
+            run_id=task.spec.run_id,
+            task_id=task.spec.task_id,
+            task_type=task.spec.task_type,
+        ) as span:
+            span.record(SpanOutcome.ERROR, BOOKKEEPING_CONNECTION_FAILED)
 
     async def _execute_on(
         self, conn: QueueConnection, task: ClaimedTask, span: Span, stop: asyncio.Event | None
