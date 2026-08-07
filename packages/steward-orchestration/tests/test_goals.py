@@ -21,6 +21,7 @@ from uuid import uuid4
 import steward_catalog
 from steward_orchestration import (
     NOOP_GOAL,
+    NOOP_TASK_BUDGET,
     NOOP_TASK_TYPE,
     SCAN_SOURCE_GOAL,
     SCAN_SOURCE_TASK_TYPE,
@@ -83,9 +84,11 @@ def test_noop_accepts_an_empty_payload() -> None:
 
 
 def test_scan_source_plans_exactly_one_task() -> None:
-    """I12, and the constraint issue #37 put on this slice: with one task, the
-    per-task cap the queue enforces is the run cap the API advertises. A plan
-    that grew a second task would silently double what a run may spend."""
+    """One task, whose declared budget is the run's whole budget -- the
+    degenerate reservation, and the only shape in which the two may be equal
+    (issue #48). A second task would now have to be funded out of the same
+    pot, or `plan` refuses the expansion; before #48 it would silently have
+    doubled what a run may spend."""
     plan = plan_run(SCAN_SOURCE_GOAL, {"source_id": SOURCE_ID})
 
     assert [(task.task_type, dict(task.payload)) for task in plan.tasks] == [
@@ -93,6 +96,23 @@ def test_scan_source_plans_exactly_one_task() -> None:
     ]
     assert plan.budget == get_goal(SCAN_SOURCE_GOAL).budget
     assert [spec.budget for spec in plan.task_specs(uuid4())] == [plan.budget]
+    assert plan.reserved() == plan.budget
+
+
+def test_every_registered_goals_plan_fits_the_budget_it_advertises() -> None:
+    """I12 over the whole registry, not the two goals this file names.
+
+    `plan` refuses an unaffordable expansion, so this cannot fail for a
+    registered goal on its own sample -- which is the point: it states the
+    property a reader would otherwise have to infer, and it will fail the
+    moment someone weakens the check rather than only when a planner
+    misbehaves.
+    """
+    for name in registered_goals():
+        registration = get_goal(name)
+        plan = registration.plan(registration.sample_payload)
+        assert plan.reserved().over(plan.budget) == (), name
+        assert all(task.budget.over(plan.budget) == () for task in plan.tasks), name
 
 
 def test_scan_source_rejects_a_payload_that_is_not_a_source_id() -> None:
@@ -118,7 +138,7 @@ def test_every_registered_planner_is_deterministic() -> None:
     resulting `PlannedTask`s are compared in full.
 
     `PlannedTask` carries no generated identity of its own -- `task_type`,
-    `payload` and `max_attempts`, all supplied by the planner -- so a plain
+    `budget`, `payload` and `max_attempts`, all supplied by the planner -- so a plain
     tuple comparison covers everything the planner is answerable for. The ids
     `RunPlan.task_specs` mints (`task_id`, `run_id`) come from `uuid4()` calls
     made *after* planning, on the plan's output, never from the planner
@@ -146,7 +166,7 @@ def test_the_comparison_would_catch_a_nondeterministic_planner() -> None:
         pass
 
     def reads_uuid4(params: Params) -> tuple[PlannedTask, ...]:
-        return (PlannedTask(task_type="noop", payload={"id": str(uuid4())}),)
+        return (PlannedTask(task_type="noop", budget=NOOP_TASK_BUDGET, payload={"id": str(uuid4())}),)
 
     params = Params()
     first = tuple(reads_uuid4(params))
