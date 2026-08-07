@@ -29,6 +29,11 @@ worker executes. Everything that turns one into the other is declared here, at
    checked against: `tests/test_goals.py` runs every registered planner twice
    on its sample payload and asserts equal output, so a planner that calls
    `uuid4()` or reads the clock fails the moment it registers, not by review.
+   `goal()` itself runs the sample through `.plan()` once at registration
+   (issue #39): a sample that does not match the schema, a planner that plans
+   nothing, or one that plans outside its own allowlist now fails at import,
+   before the goal is reachable, instead of on whichever request hits it
+   first.
 
 Where this lives is a decision, not an accident. Planners do not belong in
 `steward-agents` (that package is the LangGraph-contained execution runtime,
@@ -260,6 +265,19 @@ def goal[P: GoalParams](
     `budget` do not: a goal cannot be registered without one, so the
     determinism check in `tests/test_goals.py` always has a subject and a new
     goal cannot opt out of it by omission.
+
+    Registration exercises that subject rather than merely storing it: a
+    mismatched sample, a planner that plans nothing, or a planner that plans
+    outside its own allowlist used to boot fine and fail on a customer's
+    request instead. Planners are required to be deterministic and pure
+    (ARCHITECTURE.md §4), so running one once, here, against its own sample is
+    safe and turns a definition bug into an import-time failure -- loud,
+    before the goal is reachable, rather than a 500 on whichever request
+    happens to hit it first. `GoalRegistration.plan` is the one path that
+    already does this checking (`InvalidGoalPayload`, `EmptyRunPlan`,
+    `DisallowedTaskType`); registration just calls it before publishing the
+    entry, so nothing new needs learning it and a broken registration leaves
+    `REGISTRY` untouched.
     """
 
     def register(planner: Planner[P]) -> Planner[P]:
@@ -267,7 +285,7 @@ def goal[P: GoalParams](
             raise ValueError(f"goal already registered: {name}")
         if not allowed_task_types:
             raise ValueError(f"goal {name!r} registered with an empty task-type allowlist")
-        REGISTRY[name] = GoalRegistration(
+        registration = GoalRegistration(
             goal=name,
             params_model=params_model,
             planner=planner,
@@ -275,6 +293,8 @@ def goal[P: GoalParams](
             budget=budget,
             sample_payload=dict(sample_payload),
         )
+        registration.plan(registration.sample_payload)
+        REGISTRY[name] = registration
         return planner
 
     return register
