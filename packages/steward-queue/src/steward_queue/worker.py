@@ -2,7 +2,7 @@
 
 The worker is deliberately thin: claim, dispatch to the registry, record the
 outcome. It holds no policy of its own -- retries, backoff and dead-lettering
-belong to `queue.fail`, budgets to the run, and business behaviour to handlers
+belong to `tasks.fail`, budgets to the run, and business behaviour to handlers
 (GUARDRAILS.md §4: "retry/timeout/budget logic duplicated in an agent instead
 of the runtime"). There is no LLM here and there is not meant to be one: M0's
 worker executes registered handlers only.
@@ -17,7 +17,7 @@ Transaction shape, one task at a time:
    state and the audit row commit together, or none of them do (I7, I8).
 
 If the worker dies between 1 and 3 the task sits with an expired lease and
-`queue.requeue_stale` returns it to `pending` -- a crash costs a retry, never a
+`tasks.requeue_stale` returns it to `pending` -- a crash costs a retry, never a
 task (N1, H3).
 
 psycopg's synchronous connection is used from the async loop: the blocking
@@ -39,7 +39,7 @@ from datetime import timedelta
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskStatus
 from steward_telemetry import NoopTracer, Span, SpanOutcome, Tracer
 
-from steward_queue import queue
+from steward_queue import tasks
 from steward_queue.backoff import DEFAULT_BASE_DELAY, DEFAULT_FACTOR, DEFAULT_MAX_DELAY
 from steward_queue.db import QueueConnection, connect, set_statement_timeout
 from steward_queue.models import SYSTEM_ACTOR, Actor, ClaimedTask
@@ -85,7 +85,7 @@ class Worker:
         *,
         task_types: Sequence[str] | None = None,
         poll_interval: timedelta = DEFAULT_POLL_INTERVAL,
-        lease: timedelta = queue.DEFAULT_LEASE,
+        lease: timedelta = tasks.DEFAULT_LEASE,
         batch_size: int = 1,
         retry_base_delay: timedelta = DEFAULT_BASE_DELAY,
         retry_factor: float = DEFAULT_FACTOR,
@@ -129,7 +129,7 @@ class Worker:
 
     def _claim(self) -> list[ClaimedTask]:
         with connect(self._dsn) as conn:
-            claimed = queue.claim(
+            claimed = tasks.claim(
                 conn,
                 worker_id=self._worker_id,
                 limit=self._batch_size,
@@ -142,12 +142,12 @@ class Worker:
 
     def _reap(self) -> int:
         with connect(self._dsn) as conn:
-            recovered = queue.requeue_stale(conn, actor=self._actor)
+            recovered = tasks.requeue_stale(conn, actor=self._actor)
             conn.commit()
         return len(recovered)
 
     def _start(self, conn: QueueConnection, task: ClaimedTask) -> None:
-        queue.mark_running(
+        tasks.mark_running(
             conn,
             task.spec.task_id,
             lease=self._lease,
@@ -158,13 +158,13 @@ class Worker:
 
     def _succeed(self, conn: QueueConnection, result: TaskResult) -> None:
         set_statement_timeout(conn, self._lease)  # bookkeeping runs under the lease, not the task's budget
-        queue.complete(conn, result, claimed_by=self._worker_id, actor=self._actor)
+        tasks.complete(conn, result, claimed_by=self._worker_id, actor=self._actor)
         conn.commit()
 
     def _fail(self, conn: QueueConnection, task: ClaimedTask, error: ProblemDetails) -> None:
         conn.rollback()  # discard the failed attempt's partial writes before recording it
         set_statement_timeout(conn, self._lease)
-        queue.fail(
+        tasks.fail(
             conn,
             task.spec.task_id,
             error,
@@ -203,7 +203,7 @@ class Worker:
                 task_type=task.spec.task_type,
             ) as span:
                 return await self._execute_on(conn, task, span)
-        except queue.TaskNotClaimable:
+        except tasks.TaskNotClaimable:
             await asyncio.to_thread(conn.rollback)
             return False
         finally:
