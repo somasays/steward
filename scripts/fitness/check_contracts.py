@@ -523,7 +523,11 @@ def _evaluate(
     waived = broken & declared
     stale_declarations = sorted(declared - broken)
     if waived:
-        findings = [f for f in findings if f.path not in waived]
+        # Waive only the breaking findings on a declared label -- a
+        # simultaneous stale-snapshot finding on the same contract is a
+        # different problem (forgot to regenerate) that no declaration
+        # excuses.
+        findings = [f for f in findings if not (f.path in waived and "(breaking" in f.message)]
         breaking_files = [label for label in breaking_files if label not in waived]
     for label in stale_declarations:
         findings.append(Finding(label, 0, STALE_DECLARATION_MESSAGE))
@@ -948,6 +952,20 @@ def _selftest_declared_breaks(ok: bool) -> bool:
     ok = _check(ok, "a declaration left behind after its break is gone FAILs as stale",
                 detail.startswith("stale declaration:")
                 and any(STALE_DECLARATION_MESSAGE in f.message for f in findings), (findings, detail))
+
+    # 5. the waiver only excuses the declared break, not an unrelated
+    # forgotten-regeneration on the same contract riding along with it
+    without_status = json.loads(json.dumps(_BASE_SCHEMA))
+    del without_status["properties"]["status"]
+    regenerated_plus_note = json.loads(json.dumps(without_status))
+    regenerated_plus_note["properties"]["note"] = {"type": "string"}
+    mixed = [Artifact("contracts/schemas/widget.json", _diff_schema_breaking,
+                      _BASE_SCHEMA, without_status, regenerated_plus_note)]
+    findings, detail, _ = _evaluate(
+        mixed, baseline_available=True, declared=frozenset({"contracts/schemas/widget.json"}))
+    ok = _check(ok, "a waived break does not also excuse an unregenerated snapshot on the same contract",
+                detail.startswith(STALE_MESSAGE) and any(STALE_MESSAGE in f.message for f in findings)
+                and not any("(breaking" in f.message for f in findings), (findings, detail))
     return ok
 
 
