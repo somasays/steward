@@ -33,11 +33,40 @@ PROBLEM_CONTENT_TYPE = "application/problem+json"
 COUNT_RUNS = "SELECT count(*) FROM runs"
 COUNT_TASKS = "SELECT count(*) FROM tasks"
 
-EMPTY_PLAN_GOAL = "plans_nothing"
+EMPTY_PLAN_GOAL = "plans_conditionally"
+DISALLOWED_TYPE_GOAL = "plans_conditionally_outside_allowlist"
 
 EMPTY_PLAN_BUDGET = RunBudget(
     steps=1, tokens=1, cost_usd=Decimal("0.01"), wall_clock=timedelta(seconds=1)
 )
+
+
+class ConditionalPlanParams(GoalParams):
+    """Plans one task, unless told not to.
+
+    Registration (issue #39) now runs a planner once against its own
+    `sample_payload`, so a goal that plans zero tasks *unconditionally* can no
+    longer be registered at all -- exactly the point of that check. This
+    param lets the fixture below register a goal whose sample is honest
+    (`make_tasks=True` plans one task) while a *different* request payload
+    (`make_tasks=False`) still reaches `EmptyRunPlan` -- the defense-in-depth
+    case eager registration cannot rule out, since it only ever sees the
+    sample.
+    """
+
+    make_tasks: bool = True
+
+
+class ConditionalAllowlistParams(GoalParams):
+    """Plans `task_type`, which defaults to an allowed one.
+
+    Same shape as `ConditionalPlanParams`, for `DisallowedTaskType` rather
+    than `EmptyRunPlan`: the sample plans `"noop"` (allowed), so registration
+    passes; a request naming a different `task_type` plans outside the
+    allowlist, which eager registration cannot see coming.
+    """
+
+    task_type: str = "noop"
 
 
 @pytest.fixture(scope="session")
@@ -69,37 +98,73 @@ def db_client(dsn: str) -> Iterator[TestClient]:
 
 @pytest.fixture
 def db_client_no_raise(dsn: str) -> Iterator[TestClient]:
-    # `EmptyRunPlan` is a programming error, mapped the same way
-    # `DisallowedTaskType` is: nothing in problem_details.py catches it, so it
-    # reaches Starlette's default 500 handling. The default `TestClient`
-    # re-raises server exceptions instead of turning them into a response,
-    # which is right for debugging but wrong for a test asserting on the
-    # status code a real deployment would actually return.
+    # `EmptyRunPlan` and `DisallowedTaskType` are programming errors that
+    # problem_details.py's catch-all now converts to sanitized problem
+    # details (issue #39) rather than a bare 500 -- but they still raise
+    # through the ASGI stack on the way there (`ServerErrorMiddleware` always
+    # re-raises after building the response, so a caller can log or crash
+    # loudly). The default `TestClient` surfaces that as a re-raised
+    # exception instead of a response, which is right for debugging but wrong
+    # for a test asserting on the status code a real deployment would return.
     with TestClient(create_app(PostgresRunStore(dsn)), raise_server_exceptions=False) as test_client:
         yield test_client
 
 
 @pytest.fixture
-def plans_nothing_goal() -> Iterator[str]:
-    """Register a goal whose planner always returns zero tasks -- the exact
-    shape a conditional planner with a missed branch takes at runtime -- then
-    undo the registration so it cannot leak into another test.
+def plans_conditionally_goal() -> Iterator[str]:
+    """Register a goal whose sample payload plans one task -- so it passes
+    registration's eager check (issue #39) -- but whose planner returns zero
+    tasks for a *different* payload the client may still send. Undoes the
+    registration so it cannot leak into another test.
+
+    This is the case eager registration cannot rule out: it only ever
+    exercises the sample, so a planner that is conditionally broken on some
+    other input is exactly what the catch-all problem-details handler exists
+    to catch in depth.
     """
 
     @goal(
         EMPTY_PLAN_GOAL,
-        params_model=GoalParams,
+        params_model=ConditionalPlanParams,
         allowed_task_types=["noop"],
         budget=EMPTY_PLAN_BUDGET,
-        sample_payload={},
+        sample_payload={"make_tasks": True},
     )
-    def plan(params: GoalParams) -> tuple[PlannedTask, ...]:
-        return ()
+    def plan(params: ConditionalPlanParams) -> tuple[PlannedTask, ...]:
+        return (PlannedTask(task_type="noop", payload={}),) if params.make_tasks else ()
 
     try:
         yield EMPTY_PLAN_GOAL
     finally:
         unregister(EMPTY_PLAN_GOAL)
+
+
+@pytest.fixture
+def plans_conditionally_outside_allowlist_goal() -> Iterator[str]:
+    """Register a goal whose sample payload plans an allowed task -- so it
+    passes registration's eager check -- but whose planner plans a
+    caller-chosen task type for a *different* payload. Undoes the
+    registration so it cannot leak into another test.
+
+    The `DisallowedTaskType` counterpart to `plans_conditionally_goal`: same
+    defense-in-depth case, the other rejection eager registration cannot rule
+    out.
+    """
+
+    @goal(
+        DISALLOWED_TYPE_GOAL,
+        params_model=ConditionalAllowlistParams,
+        allowed_task_types=["noop"],
+        budget=EMPTY_PLAN_BUDGET,
+        sample_payload={"task_type": "noop"},
+    )
+    def plan(params: ConditionalAllowlistParams) -> tuple[PlannedTask, ...]:
+        return (PlannedTask(task_type=params.task_type, payload={}),)
+
+    try:
+        yield DISALLOWED_TYPE_GOAL
+    finally:
+        unregister(DISALLOWED_TYPE_GOAL)
 
 
 def _counts(conn: QueueConnection) -> tuple[int, int]:
@@ -162,17 +227,48 @@ def test_a_rejected_request_creates_no_run_and_no_task(db_client: TestClient, co
 
 
 def test_a_planner_that_plans_nothing_creates_no_run_and_no_task(
-    db_client_no_raise: TestClient, conn: QueueConnection, plans_nothing_goal: str
+    db_client_no_raise: TestClient, conn: QueueConnection, plans_conditionally_goal: str
 ) -> None:
     # Issue #37: a planner that expands to zero tasks used to be accepted and
-    # committed as a run nothing could ever move out of `pending`. It is now a
-    # 500 -- a planner planning nothing is a bug, not a bad request -- and,
-    # like every other rejection, it must leave nothing behind.
+    # committed as a run nothing could ever move out of `pending`. Issue #39
+    # makes it sanitized problem details rather than a bare 500 -- a planner
+    # planning nothing is a bug, not a bad request -- and, like every other
+    # rejection, it must leave nothing behind.
     before = _counts(conn)
 
-    resp = db_client_no_raise.post("/v1/runs", json={"goal": plans_nothing_goal})
+    resp = db_client_no_raise.post(
+        "/v1/runs", json={"goal": plans_conditionally_goal, "payload": {"make_tasks": False}}
+    )
 
     assert resp.status_code == 500
+    assert resp.headers["content-type"] == PROBLEM_CONTENT_TYPE
+    body = resp.json()
+    assert body["type"] == "urn:steward:internal-error"
+    assert "EmptyRunPlan" not in resp.text
+    assert plans_conditionally_goal not in resp.text
+    assert _counts(conn) == before
+
+
+def test_a_planner_that_plans_outside_its_allowlist_creates_no_run_and_no_task(
+    db_client_no_raise: TestClient, conn: QueueConnection, plans_conditionally_outside_allowlist_goal: str
+) -> None:
+    # The `DisallowedTaskType` counterpart to the `EmptyRunPlan` case above:
+    # a planner that names a task type outside its own registered allowlist
+    # is a programming error the same way, caught the same way, and must
+    # leave nothing behind the same way.
+    before = _counts(conn)
+
+    resp = db_client_no_raise.post(
+        "/v1/runs",
+        json={"goal": plans_conditionally_outside_allowlist_goal, "payload": {"task_type": "drop_table"}},
+    )
+
+    assert resp.status_code == 500
+    assert resp.headers["content-type"] == PROBLEM_CONTENT_TYPE
+    body = resp.json()
+    assert body["type"] == "urn:steward:internal-error"
+    assert "DisallowedTaskType" not in resp.text
+    assert "drop_table" not in resp.text
     assert _counts(conn) == before
 
 

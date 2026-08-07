@@ -214,7 +214,7 @@ def test_a_goal_name_cannot_be_registered_twice(isolated_registry: None) -> None
     # Two planners under one name is the bug the single registration site
     # exists to prevent: whichever imported last would silently win.
     def plan(params: Params) -> tuple[PlannedTask, ...]:
-        return ()
+        return (PlannedTask(task_type="profile_table", payload={}),)
 
     goal(
         "fixture_goal",
@@ -232,6 +232,66 @@ def test_a_goal_name_cannot_be_registered_twice(isolated_registry: None) -> None
             budget=BUDGET,
             sample_payload={"table": "public.users"},
         )(plan)
+
+
+def test_a_goal_with_a_sample_payload_that_fails_its_own_schema_cannot_register(
+    isolated_registry: None,
+) -> None:
+    # Issue #39: `sample_payload` used to be stored, never exercised, so a
+    # sample that does not even match the goal's own params model booted fine
+    # and only surfaced on a customer's request.
+    def plan(params: Params) -> tuple[PlannedTask, ...]:
+        return (PlannedTask(task_type="profile_table", payload={}),)
+
+    with pytest.raises(InvalidGoalPayload):
+        goal(
+            "fixture_goal",
+            params_model=Params,
+            allowed_task_types=["profile_table"],
+            budget=BUDGET,
+            sample_payload={"limit": "not-an-int"},  # missing "table", wrong type for "limit"
+        )(plan)
+
+    assert "fixture_goal" not in registered_goals()
+
+
+def test_a_goal_whose_sample_plans_nothing_cannot_register(isolated_registry: None) -> None:
+    # Issue #39: a planner that names zero tasks on its own sample used to
+    # register happily and only raise `EmptyRunPlan` on a real request.
+    def plans_nothing(params: Params) -> tuple[PlannedTask, ...]:
+        return ()
+
+    with pytest.raises(EmptyRunPlan):
+        goal(
+            "fixture_goal",
+            params_model=Params,
+            allowed_task_types=["profile_table"],
+            budget=BUDGET,
+            sample_payload={"table": "public.users"},
+        )(plans_nothing)
+
+    assert "fixture_goal" not in registered_goals()
+
+
+def test_a_goal_whose_sample_plans_outside_its_allowlist_cannot_register(
+    isolated_registry: None,
+) -> None:
+    # Issue #39: a planner reaching outside its own least-privilege list on
+    # its own sample used to register happily and only raise
+    # `DisallowedTaskType` on a real request.
+    def overreaching(params: Params) -> tuple[PlannedTask, ...]:
+        return (PlannedTask(task_type="drop_table", payload={}),)
+
+    with pytest.raises(DisallowedTaskType):
+        goal(
+            "fixture_goal",
+            params_model=Params,
+            allowed_task_types=["profile_table"],
+            budget=BUDGET,
+            sample_payload={"table": "public.users"},
+        )(overreaching)
+
+    assert "fixture_goal" not in registered_goals()
 
 
 def test_a_goal_cannot_be_registered_with_an_empty_allowlist(isolated_registry: None) -> None:
