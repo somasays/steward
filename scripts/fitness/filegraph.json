@@ -8,6 +8,8 @@
     "README.md": ["PROOFS.md"],
     "PROOFS.md": [],
     "scripts/fitness/*": ["GUARDRAILS.md", "Makefile", ".github/workflows/*", "PROOFS.md"],
+    "scripts/demo/*": ["DEMO.md", "Makefile", "PROOFS.md"],
+    "DEMO.md": ["README.md"],
     ".claude/agents/*": ["CLAUDE.md"],
     ".githooks/*": ["Makefile", "CLAUDE.md", "GUARDRAILS.md"],
     ".github/workflows/*": ["GUARDRAILS.md", "PROOFS.md"],

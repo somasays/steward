@@ -27,6 +27,17 @@ Data stewardship work — writing docs that go stale, hand-maintaining quality c
 | Observability & evals | Langfuse (traces, prompt mgmt, LLM-as-judge), OpenTelemetry, Prometheus |
 | Delivery | Docker, Helm, Kubernetes, GitHub Actions (CI + eval gates), ArgoCD (GitOps CD) |
 
+## Try it
+
+```
+uv sync --all-packages
+make demo              # the platform end to end on an ephemeral Postgres (no Docker, no API keys)
+make demo-guardrails   # plant guardrail violations, watch the gate reject them
+make fitness           # the full suite, as CI runs it
+```
+
+See [DEMO.md](./DEMO.md) for what each one shows.
+
 ## Documentation
 
 - **[ARCHITECTURE.md](./ARCHITECTURE.md)** — the system definition: functional requirements, quantified NFRs, technology decisions, invariants (I1–I14).

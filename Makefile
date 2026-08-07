@@ -1,9 +1,15 @@
 # Steward — developer entrypoints. See CLAUDE.md for the workflow, GUARDRAILS.md for what gates mean.
 
-.PHONY: fitness hooks lint type test evals
+.PHONY: fitness hooks lint type test evals demo demo-guardrails
 
 fitness:            ## Run the fitness suite: S/H/B tiers + hygiene (GUARDRAILS.md §1)
 	python3 scripts/fitness/run.py
+
+demo:               ## Run the platform end to end on an ephemeral Postgres (see DEMO.md)
+	uv run --with pgserver python scripts/demo/run_demo.py
+
+demo-guardrails:    ## Plant guardrail violations and watch the fitness gate reject them
+	@sh scripts/demo/guardrails_demo.sh
 
 hooks:              ## Install git hooks (run once after clone)
 	git config core.hooksPath .githooks
