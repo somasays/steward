@@ -18,7 +18,7 @@ Starts an ephemeral Postgres (`pgserver` ships the binaries), migrates it, start
 3. **Audit trail (I7)** — eight rows, each written in the same transaction as the mutation it records: `run.created`, `task.enqueued`, `task.claimed`, `task.started`, `run.status_changed` (→ running), `task.succeeded`, `run.usage_recorded`, `run.status_changed` (→ succeeded).
 4. **A second worker finds nothing** — the queue is drained; no double-claim.
 
-That whole path is also the M0 exit criterion (SPEC.md §12) as an executable check — `uv run pytest -q -m acceptance` asserts it, and `make fitness` runs it as H11.
+That whole path is also the M0 exit criterion (SPEC.md §12) as an executable check — `uv run pytest -q -m acceptance` asserts it, and `make fitness` runs it as H11. What it proves is trace *correlation*: one id, carried from the POST response through every span and audit row, with no credentials involved. Proving Langfuse received a resolvable trace is a separate check (H6) that lands with the M1 agent loop.
 
 ## make demo-guardrails
 
