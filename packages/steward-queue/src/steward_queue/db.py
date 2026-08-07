@@ -8,13 +8,68 @@ how I7 holds -- the audit row is written on the same connection, inside the
 same transaction, as the mutation it records.
 """
 
+from datetime import timedelta
+
 import psycopg
 from psycopg.rows import TupleRow
+
+from steward_queue import _sql
 
 type QueueConnection = psycopg.Connection[TupleRow]
 """A psycopg 3 connection in manual-commit mode, owned by the caller."""
 
+DSN_ENV = "STEWARD_DATABASE_URL"
+"""Environment variable every Steward process reads its Postgres DSN from.
 
-def connect(dsn: str) -> QueueConnection:
-    """Open a queue connection. Manual commit: the caller owns transactions."""
-    return psycopg.connect(dsn, autocommit=False)
+The name lives here, next to `connect`, so the API and the workers cannot drift
+onto two spellings of the same setting. Reading the environment is still the
+services' job (CLAUDE.md: business logic in packages, wiring in services) --
+this package only declares what the setting is called.
+"""
+
+MIN_STATEMENT_TIMEOUT_MS = 1
+"""The floor for a derived `statement_timeout`, in milliseconds.
+
+Postgres reads `statement_timeout = 0` as "no timeout", which is the exact
+opposite of what a zero wall-clock budget means. A budget of `timedelta(0)` is
+an already-exhausted budget: it must fail immediately, never run forever. Every
+non-positive budget therefore floors to 1 ms here, and the guard that turns
+that into a typed `budget_exceeded` failure is the worker's (I12).
+"""
+
+
+def statement_timeout_ms(budget: timedelta) -> int:
+    """A wall-clock budget as a Postgres `statement_timeout`, in milliseconds."""
+    return max(MIN_STATEMENT_TIMEOUT_MS, int(budget.total_seconds() * 1000))
+
+
+def connect(dsn: str, *, statement_timeout: timedelta | None = None) -> QueueConnection:
+    """Open a queue connection. Manual commit: the caller owns transactions.
+
+    `statement_timeout` makes a wall-clock budget enforceable rather than
+    merely hoped for. The worker's `asyncio.timeout` can only cancel at an
+    await point, and a psycopg call is a blocking C call running in a worker
+    thread -- a handler waiting on a lock or a pathological query would sit
+    there past its budget, holding the worker slot until its lease expired.
+    Setting the cap server-side means Postgres aborts the statement and the
+    blocked thread actually returns, so the budget guard has something to
+    interrupt (I12). Passed as a libpq connection option, so it applies to
+    every statement on the connection without a per-transaction `SET`.
+    """
+    if statement_timeout is None:
+        return psycopg.connect(dsn, autocommit=False)
+    options = f"-c statement_timeout={statement_timeout_ms(statement_timeout)}"
+    return psycopg.connect(dsn, autocommit=False, options=options)
+
+
+def set_statement_timeout(conn: QueueConnection, budget: timedelta) -> None:
+    """Re-point an open connection's statement timeout at a different bound.
+
+    A worker's connection lives under two different deadlines in turn: the
+    task's wall-clock budget while a handler is running, and the claim's lease
+    while the worker is doing its own bookkeeping. Leaving the handler's
+    (possibly very small) budget in place afterwards would let a tight budget
+    abort the statements that record the outcome -- turning a clean
+    `budget_exceeded` into a task nobody could write a result for.
+    """
+    conn.execute(_sql.SET_STATEMENT_TIMEOUT, {"milliseconds": str(statement_timeout_ms(budget))})

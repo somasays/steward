@@ -9,20 +9,35 @@ Private module on purpose: SQL text is an implementation detail of
 `steward_queue.queue`, not part of this package's public surface.
 """
 
+# The `ON CONFLICT` clause is the idempotency-key contract (SPEC.md §8): a
+# replayed POST converges on the run the first one created instead of starting a
+# second. The index predicate is restated because the index is partial -- runs
+# created without a key must not collide with each other on NULL.
 INSERT_RUN = """
-INSERT INTO runs (id, goal, status, budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
-                  trace_id)
-VALUES (%(id)s, %(goal)s, %(status)s, %(budget_steps)s, %(budget_tokens)s, %(budget_cost_usd)s,
-        %(budget_wall_clock)s, %(trace_id)s)
-RETURNING id, goal, status, budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
-          used_steps, used_tokens, used_cost_usd, used_wall_clock, trace_id, created_at, updated_at
+INSERT INTO runs (id, goal, payload, status, budget_steps, budget_tokens, budget_cost_usd,
+                  budget_wall_clock, trace_id, idempotency_key)
+VALUES (%(id)s, %(goal)s, %(payload)s, %(status)s, %(budget_steps)s, %(budget_tokens)s,
+        %(budget_cost_usd)s, %(budget_wall_clock)s, %(trace_id)s, %(idempotency_key)s)
+ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+RETURNING id, goal, payload, status, budget_steps, budget_tokens, budget_cost_usd,
+          budget_wall_clock, used_steps, used_tokens, used_cost_usd, used_wall_clock, trace_id,
+          idempotency_key, created_at, updated_at
 """
 
 SELECT_RUN = """
-SELECT id, goal, status, budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
-       used_steps, used_tokens, used_cost_usd, used_wall_clock, trace_id, created_at, updated_at
+SELECT id, goal, payload, status, budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
+       used_steps, used_tokens, used_cost_usd, used_wall_clock, trace_id, idempotency_key,
+       created_at, updated_at
 FROM runs
 WHERE id = %(id)s
+"""
+
+SELECT_RUN_BY_IDEMPOTENCY_KEY = """
+SELECT id, goal, payload, status, budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
+       used_steps, used_tokens, used_cost_usd, used_wall_clock, trace_id, idempotency_key,
+       created_at, updated_at
+FROM runs
+WHERE idempotency_key = %(idempotency_key)s
 """
 
 # `previous` CTEs throughout: `UPDATE ... RETURNING` yields post-update values,
@@ -38,6 +53,49 @@ SET status = %(status)s, updated_at = now()
 FROM previous AS p
 WHERE r.id = p.id
 RETURNING p.status
+"""
+
+# Run status follows task outcomes; nothing else moves it (except an operator
+# cancelling). Two statements, both single-shot so the read and the write cannot
+# be separated by a concurrent writer:
+#
+# START_RUN fires when a task first starts. `status = 'pending'` in the predicate
+# makes it a no-op for every task after the first, so no serialisation is needed
+# beyond the row lock the UPDATE itself takes.
+#
+# ROLLUP_RUN fires on every terminal task transition and is the run's terminal
+# state machine. `FOR UPDATE` on the run is what makes concurrent finishers
+# safe: two workers completing the last two tasks of a run both take this lock
+# *after* writing their own task row, so the second one to get it sees the
+# first's committed task state and performs the rollup exactly once. It fires
+# only when nothing is outstanding, and `failed` wins over `succeeded` because a
+# run that lost a task did not do what it was asked to.
+START_RUN = """
+UPDATE runs
+SET status = 'running', updated_at = now()
+WHERE id = %(id)s AND status = 'pending'
+RETURNING id
+"""
+
+ROLLUP_RUN = """
+WITH locked AS (
+    SELECT id, status FROM runs WHERE id = %(id)s FOR UPDATE
+), outcome AS (
+    SELECT count(*) AS total,
+           count(*) FILTER (WHERE state NOT IN ('succeeded', 'failed', 'dead')) AS outstanding,
+           count(*) FILTER (WHERE state IN ('failed', 'dead')) AS unsuccessful
+    FROM tasks
+    WHERE run_id = %(id)s
+)
+UPDATE runs AS r
+SET status = CASE WHEN o.unsuccessful > 0 THEN 'failed' ELSE 'succeeded' END,
+    updated_at = now()
+FROM locked AS l, outcome AS o
+WHERE r.id = l.id
+  AND l.status IN ('pending', 'running')
+  AND o.total > 0
+  AND o.outstanding = 0
+RETURNING l.status, r.status
 """
 
 ADD_RUN_USAGE = """
@@ -112,11 +170,11 @@ SET state = 'claimed',
     claimed_at = now(),
     lease_expires_at = now() + %(lease)s,
     updated_at = now()
-FROM claimable AS c
-WHERE t.id = c.id
+FROM claimable AS c, runs AS r
+WHERE t.id = c.id AND r.id = t.run_id
 RETURNING t.id, t.run_id, t.task_type, t.payload, t.attempts, t.max_attempts,
           t.budget_steps, t.budget_tokens, t.budget_cost_usd, t.budget_wall_clock,
-          t.claimed_by, t.lease_expires_at
+          t.claimed_by, t.lease_expires_at, r.trace_id
 """
 
 # The `claimed_by` predicate is a fencing token: a worker whose lease expired and
@@ -195,7 +253,7 @@ SET state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
 WHERE state IN ('claimed', 'running')
   AND lease_expires_at IS NOT NULL
   AND lease_expires_at < now()
-RETURNING id, state
+RETURNING id, run_id, state
 """
 
 UPSERT_CHECKPOINT = """
@@ -207,6 +265,15 @@ ON CONFLICT (task_id, step) DO UPDATE SET state = EXCLUDED.state, updated_at = n
 INSERT_AUDIT = """
 INSERT INTO audit_log (actor_kind, actor_id, action, entity_type, entity_id, before, after)
 VALUES (%(actor_kind)s, %(actor_id)s, %(action)s, %(entity_type)s, %(entity_id)s, %(before)s, %(after)s)
+"""
+
+# `set_config` rather than `SET`: the value is a bound derived at runtime, and
+# `SET` cannot take a bound parameter -- which would leave string assembly as
+# the only way to write it (I5/S3). `is_local = false` so the setting survives
+# the transaction it is issued in, which is what lets the worker widen the cap
+# back out after rolling a failed attempt back.
+SET_STATEMENT_TIMEOUT = """
+SELECT set_config('statement_timeout', %(milliseconds)s, false)
 """
 
 COUNT_AUDIT_FOR_ENTITY = """

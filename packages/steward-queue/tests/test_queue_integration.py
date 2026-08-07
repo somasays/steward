@@ -23,14 +23,17 @@ from steward_queue import (
     get_task,
     mark_running,
     requeue_stale,
+    rollup_run_status,
     set_run_status,
     write_checkpoint,
 )
 from steward_queue.db import QueueConnection
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
+from steward_telemetry import new_trace_id
 
 SELECT_AUDIT_ACTIONS = "SELECT action FROM audit_log ORDER BY id"
 COUNT_TASKS = "SELECT count(*) FROM tasks"
+COUNT_RUNS = "SELECT count(*) FROM runs"
 SELECT_TASK_LAST_ERROR = "SELECT last_error FROM tasks WHERE id = %s"
 SELECT_AUDIT_BEFORE = "SELECT before FROM audit_log WHERE action = %s AND entity_id = %s"
 SELECT_AUDIT_AFTER = "SELECT after FROM audit_log WHERE action = %s AND entity_id = %s"
@@ -89,6 +92,167 @@ class TestRuns:
     def test_status_change_on_missing_run_raises(self, conn: QueueConnection) -> None:
         with pytest.raises(LookupError):
             set_run_status(conn, uuid4(), RunStatus.RUNNING)
+
+    def test_a_run_always_has_a_trace_id(self, conn: QueueConnection, budget: RunBudget) -> None:
+        # I7: no caller has to remember to pass one, and none can opt out.
+        created = create_run(conn, goal="scan", budget=budget)
+        conn.commit()
+        assert created.trace_id == new_trace_id(seed=str(created.id))
+
+    def test_the_payload_is_stored_on_the_run(self, conn: QueueConnection, budget: RunBudget) -> None:
+        created = create_run(conn, goal="scan", budget=budget, payload={"source_id": "abc"})
+        conn.commit()
+        fetched = get_run(conn, created.id)
+        assert fetched is not None and fetched.payload == {"source_id": "abc"}
+
+    def test_replaying_an_idempotency_key_returns_the_first_run(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        first = create_run(conn, goal="scan", budget=budget, idempotency_key="retry-1")
+        conn.commit()
+        second = create_run(conn, goal="scan", budget=budget, idempotency_key="retry-1")
+        conn.commit()
+        assert second == first
+        assert scalar(conn, COUNT_RUNS) == 1
+        assert audit_actions(conn) == ["run.created"]  # nothing was created the second time
+
+    def test_different_idempotency_keys_create_different_runs(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        first = create_run(conn, goal="scan", budget=budget, idempotency_key="a")
+        second = create_run(conn, goal="scan", budget=budget, idempotency_key="b")
+        conn.commit()
+        assert first.id != second.id
+
+    def test_runs_without_a_key_never_collide(self, conn: QueueConnection, budget: RunBudget) -> None:
+        # The unique index is partial for exactly this reason: NULL keys must
+        # not be "the same key".
+        for _ in range(3):
+            create_run(conn, goal="scan", budget=budget)
+        conn.commit()
+        assert scalar(conn, COUNT_RUNS) == 3
+
+
+class TestRunStatusRollup:
+    """The run's status follows its tasks, decided in their transactions."""
+
+    def test_a_run_starts_running_when_its_first_task_does(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        spec = queued()
+        claim(conn, worker_id="w1")
+        mark_running(conn, spec.task_id)
+        conn.commit()
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.RUNNING
+
+    def test_a_second_task_starting_does_not_re_announce_running(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        first = queued(payload={"n": 1})
+        second = queued(payload={"n": 2})
+        claim(conn, worker_id="w1", limit=2)
+        mark_running(conn, first.task_id)
+        mark_running(conn, second.task_id)
+        conn.commit()
+        assert audit_actions(conn).count("run.status_changed") == 1
+
+    def test_a_run_stays_running_while_any_task_is_outstanding(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        first = queued(payload={"n": 1})
+        queued(payload={"n": 2})
+        claim(conn, worker_id="w1", limit=2)
+        mark_running(conn, first.task_id)
+        complete(conn, succeed(first))
+        conn.commit()
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.RUNNING
+
+    def test_a_run_succeeds_when_its_last_task_succeeds(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        specs = [queued(payload={"n": n}) for n in range(2)]
+        claim(conn, worker_id="w1", limit=2)
+        for spec in specs:
+            complete(conn, succeed(spec))
+        conn.commit()
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.SUCCEEDED
+
+    def test_one_lost_task_fails_the_whole_run(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        good = queued(payload={"n": 1})
+        bad = queued(payload={"n": 2}, max_attempts=1)
+        claim(conn, worker_id="w1", limit=2)
+        complete(conn, succeed(good))
+        fail(conn, bad.task_id, boom())
+        conn.commit()
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.FAILED
+
+    def test_a_scheduled_retry_leaves_the_run_in_flight(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        spec = queued(max_attempts=3)
+        claim(conn, worker_id="w1")
+        assert fail(conn, spec.task_id, boom(), base_delay=NO_BACKOFF) is TaskState.PENDING
+        conn.commit()
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is not RunStatus.FAILED
+
+    def test_a_terminal_run_is_not_moved_again(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # Re-running the rollup must be a no-op, so a replayed transition
+        # cannot rewrite the outcome of a finished run.
+        spec = queued()
+        claim(conn, worker_id="w1")
+        complete(conn, succeed(spec))
+        conn.commit()
+        assert rollup_run_status(conn, run_id) is None
+        conn.commit()
+        assert audit_actions(conn).count("run.status_changed") == 1
+
+    def test_a_cancelled_run_is_never_rolled_up(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # Cancellation is an operator decision; finishing the work it left
+        # behind must not quietly relabel the run as successful.
+        spec = queued()
+        claim(conn, worker_id="w1")
+        set_run_status(conn, run_id, RunStatus.CANCELLED)
+        complete(conn, succeed(spec))
+        conn.commit()
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.CANCELLED
+
+    def test_a_dead_lettered_lease_settles_its_run(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # The path with no worker left to do the rollup: the reaper must do it,
+        # or a run whose last task died with its worker sits `running` forever.
+        queued(max_attempts=1)
+        claim(conn, worker_id="crashed", lease=EXPIRED_LEASE)
+        conn.commit()
+        [(_, state)] = requeue_stale(conn)
+        conn.commit()
+        assert state is TaskState.DEAD
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.FAILED
+
+    def test_a_requeued_lease_leaves_the_run_alone(
+        self, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        queued(max_attempts=3)
+        claim(conn, worker_id="crashed", lease=EXPIRED_LEASE)
+        conn.commit()
+        [(_, state)] = requeue_stale(conn)
+        conn.commit()
+        assert state is TaskState.PENDING
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is not RunStatus.FAILED
 
 
 class TestEnqueue:
@@ -171,6 +335,7 @@ class TestLifecycle:
 
         run = get_run(conn, run_id)
         assert run is not None
+        assert run.status is RunStatus.SUCCEEDED
         assert run.usage.steps == 3
         assert run.usage.tokens == 42
         assert run.usage.cost_usd == Decimal("0.010000")
@@ -181,8 +346,10 @@ class TestLifecycle:
             "task.enqueued",
             "task.claimed",
             "task.started",
+            "run.status_changed",  # pending -> running, when the task started
             "task.succeeded",
             "run.usage_recorded",
+            "run.status_changed",  # running -> succeeded, when the last task settled
         ]
 
     def test_run_spend_is_audited_as_a_mutation_of_the_run(

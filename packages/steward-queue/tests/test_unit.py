@@ -9,9 +9,28 @@ from datetime import timedelta
 import pytest
 from steward_queue import NOOP_TASK_TYPE, REGISTRY, dedup_key_for, registered_types, retry_delay
 from steward_queue.backoff import DEFAULT_MAX_DELAY
+from steward_queue.db import MIN_STATEMENT_TIMEOUT_MS, statement_timeout_ms
 from steward_queue.handlers import noop
 from steward_queue.migrate import sqlalchemy_url
 from steward_queue.registry import UnknownTaskType, get_handler, task_handler
+
+
+class TestStatementTimeout:
+    """Translating a wall-clock budget into the server-side cap that makes it
+    enforceable (I12)."""
+
+    def test_a_budget_becomes_milliseconds(self) -> None:
+        assert statement_timeout_ms(timedelta(seconds=2.5)) == 2500
+
+    @pytest.mark.parametrize("budget", [timedelta(0), timedelta(seconds=-5), timedelta(microseconds=1)])
+    def test_a_spent_budget_never_becomes_postgres_no_timeout(self, budget: timedelta) -> None:
+        # Postgres reads 0 as "unlimited", which is the exact inverse of what a
+        # zero or negative wall-clock budget means: already exhausted, fail now.
+        assert statement_timeout_ms(budget) == MIN_STATEMENT_TIMEOUT_MS
+        assert statement_timeout_ms(budget) > 0
+
+    def test_sub_millisecond_precision_truncates_rather_than_disables(self) -> None:
+        assert statement_timeout_ms(timedelta(milliseconds=1.9)) == 1
 
 
 class TestBackoff:

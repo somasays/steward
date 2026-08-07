@@ -10,6 +10,14 @@ Two rules hold for every function here and are the reason the module exists:
   same connection, between the mutation and the caller's commit, so I7 holds
   by construction rather than by reviewer attention.
 
+Fencing is opt-in, and that is deliberate. `mark_running`, `complete` and
+`fail` take a `claimed_by` token; passing the worker id that holds the claim
+makes the transition apply only while that worker still holds it, and passing
+`None` disables the check. Workers always pass their id -- the unfenced form
+exists for administrative callers (a replay tool, a migration) that legitimately
+act on a task no worker holds, and choosing it is a caller's explicit decision
+rather than a default anyone can drift into.
+
 SQL lives in `_sql` as static constants (I5).
 """
 
@@ -23,6 +31,7 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec
+from steward_telemetry import new_trace_id
 
 from steward_queue import _sql
 from steward_queue.backoff import DEFAULT_BASE_DELAY, DEFAULT_FACTOR, DEFAULT_MAX_DELAY, retry_delay
@@ -114,12 +123,14 @@ def _run_record(row: Sequence[Any]) -> RunRecord:
     return RunRecord(
         id=row[0],
         goal=row[1],
-        status=RunStatus(row[2]),
-        budget=_budget_from(row[3], row[4], row[5], row[6]),
-        usage=_budget_from(row[7], row[8], row[9], row[10]),
-        trace_id=row[11],
-        created_at=row[12],
-        updated_at=row[13],
+        payload=row[2],
+        status=RunStatus(row[3]),
+        budget=_budget_from(row[4], row[5], row[6], row[7]),
+        usage=_budget_from(row[8], row[9], row[10], row[11]),
+        trace_id=row[12],
+        idempotency_key=row[13],
+        created_at=row[14],
+        updated_at=row[15],
     )
 
 
@@ -128,29 +139,50 @@ def create_run(
     *,
     goal: str,
     budget: RunBudget,
+    payload: Mapping[str, Any] | None = None,
     run_id: UUID | None = None,
     trace_id: str | None = None,
+    idempotency_key: str | None = None,
     status: RunStatus = RunStatus.PENDING,
     actor: Actor = SYSTEM_ACTOR,
 ) -> RunRecord:
-    """Create a run. `budget` is required, has no default, and is stored on the
-    row: a run without hard caps cannot exist (I12)."""
+    """Create a run, or return the one an earlier call with the same
+    `idempotency_key` created.
+
+    `budget` is required, has no default, and is stored on the row: a run
+    without hard caps cannot exist (I12). `trace_id` defaults to one derived
+    from the run id, so an untraced run is likewise unrepresentable (I7) --
+    deriving rather than randomising means a retried creation transaction lands
+    on the same trace instead of scattering the run across two.
+
+    With an `idempotency_key`, a replay returns the existing record unchanged
+    and writes no audit row: nothing was created, so nothing is recorded. The
+    caller can tell the two apart by comparing `run_id` to the returned id.
+    """
+    identifier = run_id or uuid4()
     params: dict[str, Any] = {
-        "id": run_id or uuid4(),
+        "id": identifier,
         "goal": goal,
+        "payload": Jsonb(dict(payload or {})),
         "status": status.value,
-        "trace_id": trace_id,
+        "trace_id": trace_id if trace_id is not None else new_trace_id(seed=str(identifier)),
+        "idempotency_key": idempotency_key,
         **_budget_params(budget),
     }
     row = conn.execute(_sql.INSERT_RUN, params).fetchone()
-    record = _run_record(_require_row(row, "INSERT INTO runs returned no row"))
+    if row is None:
+        existing = conn.execute(
+            _sql.SELECT_RUN_BY_IDEMPOTENCY_KEY, {"idempotency_key": idempotency_key}
+        ).fetchone()
+        return _run_record(_require_row(existing, "idempotency conflict without an existing row"))
+    record = _run_record(row)
     _audit(
         conn,
         actor=actor,
         action="run.created",
         entity_type=RUN_ENTITY,
         entity_id=str(record.id),
-        after={"status": record.status.value, "goal": record.goal},
+        after={"status": record.status.value, "goal": record.goal, "trace_id": record.trace_id},
     )
     return record
 
@@ -179,6 +211,65 @@ def set_run_status(
         before={"status": row[0]},
         after={"status": status.value},
     )
+
+
+def _record_run_status(
+    conn: QueueConnection,
+    run_id: UUID,
+    before: str,
+    after: str,
+    *,
+    actor: Actor,
+) -> None:
+    _audit(
+        conn,
+        actor=actor,
+        action="run.status_changed",
+        entity_type=RUN_ENTITY,
+        entity_id=str(run_id),
+        before={"status": before},
+        after={"status": after},
+    )
+
+
+def start_run(conn: QueueConnection, run_id: UUID, *, actor: Actor = SYSTEM_ACTOR) -> bool:
+    """Move a `pending` run to `running`. Returns whether it moved.
+
+    Called when a task of the run starts, so "running" means what an operator
+    expects it to mean -- work is in flight -- rather than being a state the
+    orchestrator sets hopefully at creation time. Idempotent by predicate: the
+    second and later tasks of a run find it already running and do nothing.
+    """
+    row = conn.execute(_sql.START_RUN, {"id": run_id}).fetchone()
+    if row is None:
+        return False
+    _record_run_status(conn, run_id, RunStatus.PENDING.value, RunStatus.RUNNING.value, actor=actor)
+    return True
+
+
+def rollup_run_status(
+    conn: QueueConnection, run_id: UUID, *, actor: Actor = SYSTEM_ACTOR
+) -> RunStatus | None:
+    """Settle a run's status once none of its tasks are outstanding.
+
+    Returns the status the run landed in, or None if it is still in flight or
+    was already terminal.
+
+    This lives here, called from the terminal task transitions, rather than in
+    a sweeper: the run reaching its terminal state *is* part of the task
+    reaching its terminal state, and running both in one transaction means
+    there is no window in which every task is finished but the run still reads
+    `running` -- no interval for a client to poll into, and no reconciliation
+    job whose failure would strand runs (I7, I8). The cost is one locking
+    statement per terminal task; the alternative is an eventually-consistent
+    run status, which is the wrong tradeoff for the resource the API publishes.
+    """
+    row = conn.execute(_sql.ROLLUP_RUN, {"id": run_id}).fetchone()
+    if row is None:
+        return None
+    landed = RunStatus(row[1])
+    _record_run_status(conn, run_id, row[0], landed.value, actor=actor)
+    return landed
 
 
 def enqueue(
@@ -272,7 +363,15 @@ def claim(
             budget=_budget_from(row[6], row[7], row[8], row[9]),
             max_attempts=row[5],
         )
-        claimed.append(ClaimedTask(spec=spec, attempts=row[4], claimed_by=row[10], lease_expires_at=row[11]))
+        claimed.append(
+            ClaimedTask(
+                spec=spec,
+                attempts=row[4],
+                claimed_by=row[10],
+                lease_expires_at=row[11],
+                trace_id=row[12],
+            )
+        )
         _audit(
             conn,
             actor=actor,
@@ -299,6 +398,9 @@ def mark_running(
 ) -> None:
     """Move a claimed task to `running` and extend its lease.
 
+    The run it belongs to moves `pending -> running` in the same transaction,
+    so a run is observably in flight from the moment its first task is.
+
     `claimed_by` is a fencing token (see `complete`): pass the worker id that
     claimed the task so a stalled worker cannot move a task a reaper has since
     handed to someone else.
@@ -317,6 +419,7 @@ def mark_running(
         before={"state": TaskState.CLAIMED.value},
         after={"state": TaskState.RUNNING.value},
     )
+    start_run(conn, row[1], actor=actor)
 
 
 def _usage_fields(budget: RunBudget) -> dict[str, Any]:
@@ -336,11 +439,11 @@ def complete(
     claimed_by: str | None = None,
     actor: Actor = SYSTEM_ACTOR,
 ) -> None:
-    """Record a successful execution and roll its usage up onto the run.
+    """Record a successful execution and roll its usage and outcome up onto the run.
 
     Called on the same connection the handler wrote through, so the handler's
-    effects, the terminal state, the run's cost/token totals and both audit
-    rows are one commit (I7, I12).
+    effects, the terminal state, the run's cost/token totals, the run's own
+    terminal status and every audit row are one commit (I7, I12).
 
     `claimed_by` is a fencing token. Pass the id of the worker that claimed the
     task and the transition applies only while that worker still holds it; a
@@ -369,6 +472,7 @@ def complete(
         after={"state": TaskState.SUCCEEDED.value},
     )
     _record_usage(conn, run_id, result, actor=actor)
+    rollup_run_status(conn, run_id, actor=actor)
 
 
 def _record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, actor: Actor) -> None:
@@ -418,7 +522,9 @@ def fail(
     A retryable failure with attempts left returns the task to `pending` at
     `now() + retry_delay(attempts)`. The attempt that spends `max_attempts`
     goes to `dead`; a non-retryable failure goes straight to `failed`. Returns
-    the state the task landed in.
+    the state the task landed in. A terminal landing settles the run's status
+    in the same transaction; a scheduled retry does not, because the run is
+    still in flight.
 
     `claimed_by` is the same fencing token `complete` takes; the row is read
     `FOR UPDATE` first, so checking the holder here is as strong as checking it
@@ -436,7 +542,7 @@ def fail(
     error_json = Jsonb(error.model_dump(mode="json"))
     if retryable and attempts < max_attempts:
         delay = retry_delay(attempts, base=base_delay, factor=factor, cap=max_delay)
-        conn.execute(_sql.RETRY_TASK, {"id": task_id, "delay": delay, "error": error_json})
+        outcome = conn.execute(_sql.RETRY_TASK, {"id": task_id, "delay": delay, "error": error_json})
         landed, action = TaskState.PENDING, "task.retry_scheduled"
         after: dict[str, Any] = {
             "state": landed.value,
@@ -446,8 +552,11 @@ def fail(
     else:
         landed = TaskState.DEAD if retryable else TaskState.FAILED
         action = "task.dead" if retryable else "task.failed"
-        conn.execute(_sql.TERMINATE_TASK, {"id": task_id, "state": landed.value, "error": error_json})
+        outcome = conn.execute(
+            _sql.TERMINATE_TASK, {"id": task_id, "state": landed.value, "error": error_json}
+        )
         after = {"state": landed.value, "attempts": attempts}
+    run_id: UUID = _require_row(outcome.fetchone(), "task transition returned no row")[0]
     _audit(
         conn,
         actor=actor,
@@ -457,6 +566,8 @@ def fail(
         before={"state": state.value, "attempts": attempts},
         after=after | {"error": error.title},
     )
+    if landed is not TaskState.PENDING:
+        rollup_run_status(conn, run_id, actor=actor)
     return landed
 
 
@@ -470,12 +581,21 @@ def requeue_stale(
     A worker that dies after claiming leaves a `claimed`/`running` row nobody
     is executing. Here it returns to `pending` (or to `dead` if its attempts
     are spent), so a crash costs a retry, never a task.
+
+    Dead-lettering here is a terminal transition like any other, so the runs it
+    finishes off are settled in the same transaction -- otherwise a run whose
+    last task died with its worker would sit `running` forever, which is the
+    one failure mode a status rollup exists to prevent. The affected runs are
+    locked in id order so two reapers running concurrently cannot deadlock.
     """
     rows = conn.execute(_sql.REQUEUE_STALE).fetchall()
     recovered: list[tuple[UUID, TaskState]] = []
+    finished: set[UUID] = set()
     for row in rows:
-        task_id, state = row[0], TaskState(row[1])
+        task_id, run_id, state = row[0], row[1], TaskState(row[2])
         recovered.append((task_id, state))
+        if state is TaskState.DEAD:
+            finished.add(run_id)
         _audit(
             conn,
             actor=actor,
@@ -484,6 +604,8 @@ def requeue_stale(
             entity_id=str(task_id),
             after={"state": state.value},
         )
+    for run_id in sorted(finished):
+        rollup_run_status(conn, run_id, actor=actor)
     return recovered
 
 

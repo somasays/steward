@@ -14,14 +14,19 @@ The three moving parts:
 * `registry` -- task type -> handler, with the contract handlers sign
   (idempotence, sample payload, state probe). The H1 harness iterates it, so
   new handlers are leashed on registration.
-* `worker` -- a minimal asyncio loop that claims and dispatches. No LLM.
+* `worker` -- a minimal asyncio loop that claims and dispatches, opening a task
+  span on the run's trace around every execution (I7). No LLM.
 
-Schema lives in `migrations` (one baseline revision); `migrate.upgrade_to_head`
-applies it.
+A run's status follows its tasks: `pending` until one starts, `running` while
+any is in flight, and `succeeded`/`failed` the moment the last one settles --
+decided in the same transaction as the task transition that caused it, so
+there is no window where a finished run still reads as running.
+
+Schema lives in `migrations`; `migrate.upgrade_to_head` applies it.
 """
 
 from steward_queue.backoff import retry_delay
-from steward_queue.db import QueueConnection, connect
+from steward_queue.db import DSN_ENV, QueueConnection, connect
 from steward_queue.handlers import NOOP_TASK_TYPE
 from steward_queue.migrate import downgrade_to_base, upgrade_to_head
 from steward_queue.models import (
@@ -47,7 +52,9 @@ from steward_queue.queue import (
     get_task,
     mark_running,
     requeue_stale,
+    rollup_run_status,
     set_run_status,
+    start_run,
     write_checkpoint,
 )
 from steward_queue.registry import (
@@ -66,6 +73,7 @@ from steward_queue.worker import Worker
 
 __all__ = [
     "DEFAULT_LEASE",
+    "DSN_ENV",
     "NOOP_TASK_TYPE",
     "REGISTRY",
     "SYSTEM_ACTOR",
@@ -100,7 +108,9 @@ __all__ = [
     "registered_types",
     "requeue_stale",
     "retry_delay",
+    "rollup_run_status",
     "set_run_status",
+    "start_run",
     "task_handler",
     "upgrade_to_head",
     "write_checkpoint",
