@@ -50,6 +50,7 @@ SLEEPS = "test.sleeps"
 BLOCKS_IN_THE_DRIVER = "test.blocks_in_the_driver"
 BLOCKS_THE_INTERPRETER = "test.blocks_the_interpreter"
 SPENDS_THE_CAP_TWICE = "test.spends_the_cap_twice"
+SWALLOWS_A_DATABASE_ERROR = "test.swallows_a_database_error"
 UNREGISTERED = "test.unregistered"
 REPORTS_ITS_LEASE = "test.reports_its_lease"
 
@@ -63,6 +64,8 @@ SELECT_TASK_LAST_ERROR = "SELECT last_error FROM tasks WHERE id = %s"
 SELECT_CHECKPOINTS = "SELECT step, state FROM checkpoints WHERE task_id = %s ORDER BY step"
 SELECT_AUDIT_ACTIONS = "SELECT action FROM audit_log WHERE entity_id = %s ORDER BY id"
 SELECT_PG_SLEEP = "SELECT pg_sleep(%(seconds)s)"
+SELECT_DIVIDE_BY_ZERO = "SELECT 1 / 0"
+EXPIRE_LEASE = "UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = %s"
 SELECT_BACKEND_STATE = "SELECT state FROM pg_stat_activity WHERE pid = %(pid)s"
 SELECT_LEASE_HEADROOM_SECONDS = """
 SELECT EXTRACT(EPOCH FROM (lease_expires_at - now())) FROM tasks WHERE id = %(id)s
@@ -184,6 +187,27 @@ async def spends_the_cap_twice(ctx: TaskContext) -> TaskResult:
         finally:
             other.close()
     ctx.connection.execute(SELECT_PG_SLEEP, {"seconds": seconds})
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(SWALLOWS_A_DATABASE_ERROR, sample_payload={"swallow": False})
+async def swallows_a_database_error(ctx: TaskContext) -> TaskResult:
+    """Aborts its transaction, hides the error, and reports success anyway.
+
+    The realistic way the recording write fails *after* the executor has taken
+    the handoff: Postgres refuses every further statement on an aborted
+    transaction, so the `complete` the thread is about to run raises
+    `InFailedSqlTransaction` -- not `TaskNotClaimable`, so it is not the
+    already-answered lost-claim case. Nothing is mocked; a handler that
+    suppresses a driver error and returns `SUCCEEDED` is a shape production
+    code reaches on its own.
+
+    Payload-driven, so the sample payload swallows nothing and stays an
+    instant, idempotent no-op under H1.
+    """
+    if ctx.spec.payload.get("swallow"):
+        with contextlib.suppress(psycopg.Error):
+            ctx.connection.execute(SELECT_DIVIDE_BY_ZERO)
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
 
 
@@ -514,6 +538,33 @@ class TestExecutionFailures:
 
         assert state_of(conn, spec.task_id) is TaskState.RUNNING
 
+    async def test_an_executor_that_cannot_persist_leaves_the_task_to_lease_recovery(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """Where "recorded exactly once" stops (#53, SPEC §13 D7).
+
+        The handoff is taken *before* the write, so a write that then fails is
+        an attempt nobody records: the loop has lost the handoff and must not
+        write a terminal state the thread that beat it to it may still be
+        committing. What is left is N1's own mechanism -- the attempt keeps its
+        lease, and `requeue_stale` hands it back when that lease expires.
+        """
+        spec = queued(task_type=SWALLOWS_A_DATABASE_ERROR, payload={"swallow": True}, max_attempts=3)
+
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+
+        # Not failed, not succeeded, and not dead: unrecorded, and still owned.
+        assert state_of(conn, spec.task_id) is TaskState.RUNNING
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None and row[0] is None  # the loop wrote nothing at all
+
+        conn.execute(EXPIRE_LEASE, (spec.task_id,))  # the lease this attempt was left to
+        conn.commit()
+        assert requeue_stale(conn) == [(spec.task_id, TaskState.PENDING)]
+        conn.commit()
+        assert state_of(conn, spec.task_id) is TaskState.PENDING
+
 
 class TestConcurrency:
     async def test_two_workers_never_execute_a_task_twice(
@@ -676,7 +727,14 @@ class TestRunRollup:
 
 @pytest.mark.parametrize(
     "task_type",
-    [EXPLODES, REPORTS_FAILURE, BLOCKS_IN_THE_DRIVER, BLOCKS_THE_INTERPRETER, SPENDS_THE_CAP_TWICE],
+    [
+        EXPLODES,
+        REPORTS_FAILURE,
+        BLOCKS_IN_THE_DRIVER,
+        BLOCKS_THE_INTERPRETER,
+        SPENDS_THE_CAP_TWICE,
+        SWALLOWS_A_DATABASE_ERROR,
+    ],
 )
 def test_scaffolding_handlers_are_registered(task_type: str) -> None:
     assert task_type in REGISTRY

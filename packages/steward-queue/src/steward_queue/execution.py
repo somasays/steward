@@ -44,10 +44,11 @@ therefore `DEADLINE_GRACE` plus one terminate round trip plus one bookkeeping
 transaction, *independent of what the handler is doing*, because nothing on
 that path waits on the handler thread.
 
-`_Handoff` is what makes "exactly one of them records" true rather than likely,
-and what makes an abandoned thread harmless: having lost the handoff it never
-touches the task row, and its session is gone by then anyway, so its writes are
-discarded and the attempt the worker recorded stands.
+`_Handoff` is what makes "*at most* one of them records" true rather than
+likely, and what makes an abandoned thread harmless: having lost the handoff it
+never touches the task row, and its session is gone by then anyway, so its
+writes are discarded and the attempt the worker recorded stands. At most, not
+exactly -- see below and SPEC.md §13 D7.
 
 What the thread never does is raise at the loop
 -----------------------------------------------
@@ -62,8 +63,13 @@ because `SystemExit`, `KeyboardInterrupt` and cancellation are the process
 ending rather than a task failing.
 
 An outcome the thread could not write reaches the loop as `recorded=False`, and
-the handoff decides whether the loop may write it instead -- so "exactly one
-context records this attempt" survives the failure of the one that usually does.
+the handoff decides whether the loop may write it instead. That covers a thread
+that fell over before taking the handoff. It deliberately does not cover a
+thread that took the handoff and *then* failed to write: the loop cannot know
+that thread is not still inside a commit, so it writes nothing, and the attempt
+keeps its lease until `requeue_stale` returns it (N1). Zero contexts record that
+attempt -- which is why the property here is "at most one", never "exactly one"
+(#53, SPEC.md §13 D7).
 """
 
 import asyncio
