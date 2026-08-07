@@ -374,14 +374,22 @@ bound to whichever run answers it — the one just created, or the one
 single-flight found already in flight — so a later replay of the same key
 converges on that run even after it finishes, instead of the key going
 unbound while a scan is in flight and a later replay starting a second one
-(issue #44). A key already bound to a run of a *different* source is a `409`
-on this endpoint the same as it is on `POST /v1/runs`, including when the
-request that names the wrong source is itself answered by single-flight. A
-run remembers one key: if single-flight answers a request with a run that
-already carries a *different* key (a second, independent retry racing its own
-key against a run someone else's request started), that run is returned as
-normal but the new key is not recorded on it, so a later replay under the new
-key alone will not find it and starts its own run.
+(issue #44). A key already bound to a run of a *different* goal or source is a
+`409` on this endpoint the same as it is on `POST /v1/runs`, including when
+the request that names the wrong source is itself answered by single-flight.
+A run remembers one key, so binding can itself fail: if single-flight answers
+a request with a run that already carries a *different* key (a second,
+independent retry racing its own key against a run someone else's request
+started), the new key cannot be attached and the endpoint says so with a
+`409` rather than a `202` it could not keep a promise about (issue #47) —
+distinguished from the cross-source `409` by `type`
+(`urn:steward:idempotency-key-unbindable` vs
+`urn:steward:idempotency-key-reused`). Nothing is written for a key that
+fails to bind: it is rejected, not recorded, so a later request carrying it
+once nothing is in flight is indistinguishable from an unkeyed request and is
+free to start a new scan — the one case here where a key does not guarantee
+convergence, stated as a fact of this schema (one key per run) rather than
+left for a client to discover by retrying.
 `GET /v1/assets` pages by opaque cursor over `(schema, name, id)` — a total
 order, so a scan committing between two pages cannot make a client skip an asset.
 
@@ -389,7 +397,7 @@ order, so a scan committing between two pages cannot make a client skip an asset
 
 The published run contract is a **projection**, not the row: `Run` (id, goal, payload, status, trace id, budget, usage, timestamps) is built from the `runs` record by the API service, so storage can change without that being an API change (I3, N9). Every run carries a Langfuse trace id from creation, generated locally and stored on the row whether or not tracing credentials are configured — so a run is always correlatable and no deployment depends on an observability account to function (I7).
 
-Conventions: cursor pagination everywhere; RFC 9457 problem-details errors; idempotency keys on all POSTs that create runs — replayed with the same body they return the original run, replayed with a different one they are a `409`, because returning the original would tell a client its edited request was queued when nothing will ever run it; SSE (not WebSockets) for streaming — it's proxy-friendly and resumable via `Last-Event-ID`.
+Conventions: cursor pagination everywhere; RFC 9457 problem-details errors; idempotency keys on all POSTs that create runs — replayed with the same body they return the original run, replayed with a different one they are a `409`, because returning the original would tell a client its edited request was queued when nothing will ever run it; on an endpoint where single-flight can also answer the request (`POST /v1/sources/{id}/scan`, above), a same-body key can additionally fail to *bind* rather than mismatch, which is its own `409` rather than either of the first two outcomes; SSE (not WebSockets) for streaming — it's proxy-friendly and resumable via `Last-Event-ID`.
 
 **Rejections are eval data:** every human rejection in the review queue (with reason) is exported to a Langfuse dataset, closing the loop between production feedback and offline evals.
 
