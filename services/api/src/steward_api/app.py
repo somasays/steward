@@ -18,6 +18,13 @@ def create_app(run_store: RunStore | None = None) -> FastAPI:
     Every deployment passes a `PostgresRunStore` instead -- see
     `steward_api.__main__`, which is the composition root and the only place
     that reads the environment.
+
+    There is deliberately no module-level `app` to point an ASGI server at.
+    One would default to the in-memory store, and a deployment started the
+    idiomatic way (`uvicorn steward_api.app:app`) would then accept runs,
+    return 202 with a trace id and a budget, and execute none of them --
+    forever, silently. `__main__` refuses to start without a DSN precisely to
+    prevent that, and an importable app would have been the way around it.
     """
 
     app = FastAPI(title="Steward API", version="0.1.0")
@@ -25,6 +32,3 @@ def create_app(run_store: RunStore | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(build_runs_router(run_store if run_store is not None else InMemoryRunStore()))
     return app
-
-
-app = create_app()

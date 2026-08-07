@@ -263,7 +263,13 @@ def rollup_run_status(
     job whose failure would strand runs (I7, I8). The cost is one locking
     statement per terminal task; the alternative is an eventually-consistent
     run status, which is the wrong tradeoff for the resource the API publishes.
+
+    The lock is taken in its own statement, before the one that counts tasks,
+    and that ordering is the whole correctness argument -- see `_sql.LOCK_RUN`.
+    Callers must therefore have already written their own task's terminal state
+    in this transaction, or they are voting with a row nobody else can see.
     """
+    conn.execute(_sql.LOCK_RUN, {"id": run_id})
     row = conn.execute(_sql.ROLLUP_RUN, {"id": run_id}).fetchone()
     if row is None:
         return None

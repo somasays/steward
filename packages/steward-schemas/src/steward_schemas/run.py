@@ -3,14 +3,14 @@
 
 These are two different things and the distinction is load-bearing. A run's
 authoritative state is its `runs` row, projected by `steward_queue.RunRecord` --
-budget, usage, trace id, timestamps, the lot. `RunResponse` is what the API
-*publishes* of that state: a projection built from the record, versioned and
-compatibility-checked (S6) independently of how the row happens to be stored.
+budget, usage, trace id, timestamps, the lot. `Run` is what the API *publishes*
+of that state: a projection built from the record (`steward_api.store`), versioned
+and compatibility-checked (S6) independently of how the row happens to be stored.
 Letting one model be both would tie the published contract to the schema and
 make every storage change a breaking API change (I3, N9).
 
-`RunCreate` is the external command; `RunResponse` is the external view. Nothing
-here knows about tasks or transactions.
+`RunCreate` is the external command; `Run` is the external view. Nothing here
+knows about tasks or transactions.
 """
 
 from datetime import datetime
@@ -56,23 +56,26 @@ class RunCreate(SchemaModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class RunResponse(SchemaModel):
+class Run(SchemaModel):
     """The API's projection of a run (SPEC.md §8: "status, task tree, cost,
     trace link").
 
-    `trace_id` is not optional: a run always has one, generated when the run
-    row is written and independent of whether any tracing backend is
-    configured (I7). `budget` and `usage` ship together so a caller can see how
-    close a run is to its caps without a second request (I12); the task tree
-    lands with the orchestrator in M1.
+    `trace_id` is always populated by the server -- `runs.trace_id` is `NOT
+    NULL` and generated whether or not a tracing backend is configured (I7) --
+    and `budget`/`usage` likewise, so a caller can see how close a run is to
+    its caps without a second request (I12). They are nullable *in the
+    contract* because this model was published without them and S6 classifies
+    a newly-required property as a breaking change; tightening them belongs
+    with the contract-versioning mechanism, not with a field addition. The task
+    tree lands with the orchestrator in M1.
     """
 
     id: UUID
     goal: str
     payload: dict[str, Any]
     status: RunStatus
-    trace_id: str
-    budget: RunBudget
-    usage: RunBudget
+    trace_id: str | None = None
+    budget: RunBudget | None = None
+    usage: RunBudget | None = None
     created_at: datetime
     updated_at: datetime

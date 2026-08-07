@@ -4,6 +4,7 @@ Every assertion here is about observable state -- rows, states, audit trail --
 not about how the queue got there.
 """
 
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -253,6 +254,66 @@ class TestRunStatusRollup:
         assert state is TaskState.PENDING
         run = get_run(conn, run_id)
         assert run is not None and run.status is not RunStatus.FAILED
+
+    @pytest.mark.parametrize("first_succeeds", [True, False])
+    def test_two_workers_settling_the_last_two_tasks_still_finish_the_run(
+        self,
+        conn: QueueConnection,
+        open_conn: Callable[[], QueueConnection],
+        run_id: UUID,
+        queued: Callable[..., TaskSpec],
+        first_succeeds: bool,
+    ) -> None:
+        """The race that has no recovery path if it is lost.
+
+        Two workers finish the last two tasks of a run at the same moment. Each
+        writes its own task's terminal state and then asks "is anything still
+        outstanding?" -- and each can only see the other's answer once the other
+        has committed. Whoever gets the run lock second must therefore evaluate
+        that question *after* the wait, not against the snapshot it started
+        with, or both decline and the run is stranded non-terminal with no
+        sweeper to notice (`rollup_run_status` deliberately has no fallback).
+
+        Both orderings are covered because they take different code paths:
+        `complete` touches the run row before the rollup (usage), `fail` does
+        not, so the failing/failing pair is the one with nothing else to
+        serialise it.
+        """
+        first = queued(payload={"n": 1}, max_attempts=1)
+        second = queued(payload={"n": 2}, max_attempts=1)
+
+        worker_a = open_conn()
+        worker_b = open_conn()
+        claim(worker_a, worker_id="a", limit=2)
+        worker_a.commit()
+
+        # A settles its task and holds the run lock, uncommitted.
+        if first_succeeds:
+            complete(worker_a, succeed(first))
+        else:
+            fail(worker_a, first.task_id, boom())
+
+        # B settles the other one concurrently; its rollup blocks on A's lock.
+        settled = threading.Event()
+
+        def settle_second() -> None:
+            fail(worker_b, second.task_id, boom())
+            worker_b.commit()
+            settled.set()
+
+        thread = threading.Thread(target=settle_second)
+        thread.start()
+        try:
+            assert not settled.wait(timeout=0.5)  # blocked, as designed
+            worker_a.commit()
+            assert settled.wait(timeout=20), "second worker never got the run lock"
+        finally:
+            thread.join(timeout=20)
+
+        run = get_run(conn, run_id)
+        assert run is not None
+        assert run.status is RunStatus.FAILED  # one task died, so the run did
+        assert audit_actions(conn).count("run.status_changed") == 1
 
 
 class TestEnqueue:

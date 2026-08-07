@@ -23,7 +23,17 @@ from langfuse import Langfuse
 
 from steward_telemetry.tracer import Span, SpanOutcome
 
-RUN_SPAN_NAME = "run"
+RUN_SPAN_NAME = "run.create"
+"""Named for what the span actually covers.
+
+The run-level span is opened by whoever creates the run and closes when the
+creating transaction does -- it establishes the trace and records the run's
+identity on it, and it is milliseconds long even for a run that goes on for
+ten minutes. Calling it `run` would put a span in the trace that looks like it
+measures the run and does not. The task spans a worker opens later sit on the
+same trace id, as siblings of this one.
+"""
+
 TASK_SPAN_NAME = "task"
 
 _LEVELS: Mapping[SpanOutcome, Literal["DEFAULT", "ERROR"]] = {

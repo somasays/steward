@@ -15,14 +15,18 @@ from steward_telemetry import (
     PUBLIC_KEY_ENV,
     SECRET_KEY_ENV,
     TRACE_ID_HEX_LENGTH,
-    LangfuseTracer,
     NoopTracer,
     SpanOutcome,
     Tracer,
     new_trace_id,
     tracer_from_env,
 )
-from steward_telemetry._langfuse import RUN_SPAN_NAME, TASK_SPAN_NAME, _LangfuseSpan
+from steward_telemetry._langfuse import (
+    RUN_SPAN_NAME,
+    TASK_SPAN_NAME,
+    LangfuseTracer,
+    _LangfuseSpan,
+)
 
 TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -125,8 +129,9 @@ class TestLangfuseTracer:
             with tracer.task_span(trace_id=new_trace_id(), run_id=RUN_ID, task_id=TASK_ID, task_type="noop"):
                 raise ValueError("bad payload")
 
-    def test_span_names_are_the_two_platform_levels(self) -> None:
-        assert (RUN_SPAN_NAME, TASK_SPAN_NAME) == ("run", "task")
+    def test_span_names_say_what_they_cover(self) -> None:
+        # The run-level span covers creating the run, not running it.
+        assert (RUN_SPAN_NAME, TASK_SPAN_NAME) == ("run.create", "task")
 
 
 class TestWiring:

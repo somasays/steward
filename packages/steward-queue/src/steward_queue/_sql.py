@@ -56,20 +56,24 @@ RETURNING p.status
 """
 
 # Run status follows task outcomes; nothing else moves it (except an operator
-# cancelling). Two statements, both single-shot so the read and the write cannot
-# be separated by a concurrent writer:
+# cancelling).
 #
 # START_RUN fires when a task first starts. `status = 'pending'` in the predicate
 # makes it a no-op for every task after the first, so no serialisation is needed
 # beyond the row lock the UPDATE itself takes.
 #
-# ROLLUP_RUN fires on every terminal task transition and is the run's terminal
-# state machine. `FOR UPDATE` on the run is what makes concurrent finishers
-# safe: two workers completing the last two tasks of a run both take this lock
-# *after* writing their own task row, so the second one to get it sees the
-# first's committed task state and performs the rollup exactly once. It fires
-# only when nothing is outstanding, and `failed` wins over `succeeded` because a
-# run that lost a task did not do what it was asked to.
+# LOCK_RUN + ROLLUP_RUN are the run's terminal state machine, and they are two
+# statements for a reason that is easy to get wrong. Under READ COMMITTED a
+# statement evaluates against the snapshot it started with; when `FOR UPDATE`
+# inside a statement blocks on a concurrent writer, only the *locked* row is
+# re-read once the lock is granted (EvalPlanQual) -- an aggregate over `tasks`
+# in the same statement keeps the stale snapshot. Two workers settling the last
+# two tasks of a run would then both count the other's task as outstanding and
+# both decline, leaving the run non-terminal forever with nothing to recover it.
+# Taking the lock in its own statement means ROLLUP_RUN begins after the wait
+# and therefore reads a snapshot that includes the other worker's committed
+# task. It fires only when nothing is outstanding, and `failed` wins over
+# `succeeded` because a run that lost a task did not do what it was asked to.
 START_RUN = """
 UPDATE runs
 SET status = 'running', updated_at = now()
@@ -77,25 +81,29 @@ WHERE id = %(id)s AND status = 'pending'
 RETURNING id
 """
 
+LOCK_RUN = """
+SELECT id FROM runs WHERE id = %(id)s FOR UPDATE
+"""
+
 ROLLUP_RUN = """
-WITH locked AS (
-    SELECT id, status FROM runs WHERE id = %(id)s FOR UPDATE
-), outcome AS (
+WITH outcome AS (
     SELECT count(*) AS total,
            count(*) FILTER (WHERE state NOT IN ('succeeded', 'failed', 'dead')) AS outstanding,
            count(*) FILTER (WHERE state IN ('failed', 'dead')) AS unsuccessful
     FROM tasks
     WHERE run_id = %(id)s
+), previous AS (
+    SELECT id, status FROM runs WHERE id = %(id)s
 )
 UPDATE runs AS r
 SET status = CASE WHEN o.unsuccessful > 0 THEN 'failed' ELSE 'succeeded' END,
     updated_at = now()
-FROM locked AS l, outcome AS o
-WHERE r.id = l.id
-  AND l.status IN ('pending', 'running')
+FROM previous AS p, outcome AS o
+WHERE r.id = p.id
+  AND p.status IN ('pending', 'running')
   AND o.total > 0
   AND o.outstanding = 0
-RETURNING l.status, r.status
+RETURNING p.status, r.status
 """
 
 ADD_RUN_USAGE = """

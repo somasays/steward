@@ -37,7 +37,7 @@ from steward_queue import (
     enqueue,
     get_run,
 )
-from steward_schemas import RunBudget, RunCreate, RunResponse, RunStatus, TaskSpec
+from steward_schemas import Run, RunBudget, RunCreate, RunStatus, TaskSpec
 from steward_telemetry import NoopTracer, SpanOutcome, Tracer, new_trace_id
 
 DEFAULT_RUN_BUDGET = RunBudget(
@@ -61,28 +61,51 @@ REPLAYED_DETAIL = "idempotency key replayed an existing run"
 RUN_LOCATION_PREFIX = "/v1/runs/"
 
 
+class IdempotencyKeyReused(Exception):
+    """An idempotency key was replayed with a body that is not the same request.
+
+    A domain error, not an HTTP one: the store decides that the two requests
+    differ, the route decides that is a 409 (I4 -- storage does not know about
+    status codes). Returning the original run instead would be the dangerous
+    answer, because a client that retried with an edited goal would read 202
+    and believe the edited goal was queued when nothing will ever run it.
+    """
+
+    def __init__(self, idempotency_key: str, existing: Run) -> None:
+        super().__init__(f"idempotency key {idempotency_key!r} was used for a different request")
+        self.idempotency_key = idempotency_key
+        self.existing = existing
+
+
 class RunStore(Protocol):
     """Typed seam between the runs API and wherever runs actually live."""
 
-    async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> RunResponse:
+    async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
         """Create a run for `spec`. Replaying the same `idempotency_key`
-        (when not None) returns the run created the first time, unchanged."""
+        (when not None) with the same body returns the run created the first
+        time, unchanged; replaying it with a different body raises
+        `IdempotencyKeyReused`."""
         ...
 
-    async def get_run(self, run_id: UUID) -> RunResponse | None:
+    async def get_run(self, run_id: UUID) -> Run | None:
         """The run with `run_id`, or None if it does not exist."""
         ...
 
 
-def to_response(record: RunRecord) -> RunResponse:
+def _same_request(run: Run, spec: RunCreate) -> bool:
+    """Whether `spec` asks for what `run` was created to do."""
+    return run.goal == spec.goal and run.payload == spec.payload
+
+
+def to_response(record: RunRecord) -> Run:
     """Project a `runs` row onto the published contract.
 
     An explicit projection, not a shared model: `RunRecord` is persistence
-    state that follows the schema, `RunResponse` is a versioned promise to
-    clients (I3). Keeping them apart is what lets a column be added, renamed or
+    state that follows the schema, `Run` is a versioned promise to clients
+    (I3). Keeping them apart is what lets a column be added, renamed or
     denormalised without that being an API change.
     """
-    return RunResponse(
+    return Run(
         id=record.id,
         goal=record.goal,
         payload=record.payload,
@@ -118,15 +141,15 @@ class PostgresRunStore:
         self._budget = budget
         self._max_attempts = max_attempts
 
-    async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> RunResponse:
+    async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
         return await asyncio.to_thread(self._create_run, spec, idempotency_key)
 
-    async def get_run(self, run_id: UUID) -> RunResponse | None:
+    async def get_run(self, run_id: UUID) -> Run | None:
         return await asyncio.to_thread(self._get_run, run_id)
 
     # --- synchronous halves, always called through asyncio.to_thread ---
 
-    def _create_run(self, spec: RunCreate, idempotency_key: str | None) -> RunResponse:
+    def _create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
         """The run row and its task, committed together (I8).
 
         The span wraps the whole attempt, including the transaction, so a
@@ -134,7 +157,8 @@ class PostgresRunStore:
         all. On an idempotency replay the transaction is a no-op -- `create_run`
         returns the original row and `enqueue` deduplicates on the payload the
         original was enqueued with -- and the span says so instead of pretending
-        work happened.
+        work happened. `record.id != run_id` is how a replay is detected: the
+        id this call generated is on the row only if this call created it.
         """
         run_id = uuid4()
         trace_id = new_trace_id(seed=str(run_id))
@@ -151,9 +175,12 @@ class PostgresRunStore:
                 )
                 enqueue(conn, self._first_task(record))
                 conn.commit()
+            run = to_response(record)
             if record.id != run_id:
+                if idempotency_key is not None and not _same_request(run, spec):
+                    raise IdempotencyKeyReused(idempotency_key, run)
                 span.record(SpanOutcome.OK, REPLAYED_DETAIL)
-        return to_response(record)
+        return run
 
     def _first_task(self, record: RunRecord) -> TaskSpec:
         """The task the run's goal expands to.
@@ -171,7 +198,7 @@ class PostgresRunStore:
             max_attempts=self._max_attempts,
         )
 
-    def _get_run(self, run_id: UUID) -> RunResponse | None:
+    def _get_run(self, run_id: UUID) -> Run | None:
         with connect(self._dsn) as conn:
             record = get_run(conn, run_id)
             conn.rollback()  # a read-only transaction still has to be ended
@@ -187,21 +214,24 @@ class InMemoryRunStore:
     """
 
     def __init__(self, *, budget: RunBudget = DEFAULT_RUN_BUDGET) -> None:
-        self._runs: dict[UUID, RunResponse] = {}
+        self._runs: dict[UUID, Run] = {}
         self._by_idempotency_key: dict[str, UUID] = {}
         self._budget = budget
         self._lock = asyncio.Lock()
 
-    async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> RunResponse:
+    async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
         async with self._lock:
             if idempotency_key is not None:
                 existing_id = self._by_idempotency_key.get(idempotency_key)
                 if existing_id is not None:
-                    return self._runs[existing_id]
+                    existing = self._runs[existing_id]
+                    if not _same_request(existing, spec):
+                        raise IdempotencyKeyReused(idempotency_key, existing)
+                    return existing
 
             now = datetime.now(UTC)
             run_id = uuid4()
-            run = RunResponse(
+            run = Run(
                 id=run_id,
                 goal=spec.goal,
                 payload=spec.payload,
@@ -217,6 +247,6 @@ class InMemoryRunStore:
                 self._by_idempotency_key[idempotency_key] = run.id
             return run
 
-    async def get_run(self, run_id: UUID) -> RunResponse | None:
+    async def get_run(self, run_id: UUID) -> Run | None:
         async with self._lock:
             return self._runs.get(run_id)

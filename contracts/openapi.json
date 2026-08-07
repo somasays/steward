@@ -50,6 +50,80 @@
         "title": "ProblemDetails",
         "type": "object"
       },
+      "Run": {
+        "additionalProperties": false,
+        "description": "The API's projection of a run (SPEC.md \u00a78: \"status, task tree, cost,\ntrace link\").\n\n`trace_id` is always populated by the server -- `runs.trace_id` is `NOT\nNULL` and generated whether or not a tracing backend is configured (I7) --\nand `budget`/`usage` likewise, so a caller can see how close a run is to\nits caps without a second request (I12). They are nullable *in the\ncontract* because this model was published without them and S6 classifies\na newly-required property as a breaking change; tightening them belongs\nwith the contract-versioning mechanism, not with a field addition. The task\ntree lands with the orchestrator in M1.",
+        "properties": {
+          "budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunBudget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "goal": {
+            "title": "Goal",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStatus"
+          },
+          "trace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trace Id"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunBudget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "goal",
+          "payload",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "Run",
+        "type": "object"
+      },
       "RunBudget": {
         "additionalProperties": false,
         "description": "Hard caps on one bounded agent run or task.\n\nAlso reused by `TaskResult.usage` to report what was actually consumed\n(ARCHITECTURE.md I12; SPEC.md \u00a73.2) \u2014 same shape, no separate type needed\nfor \"amount spent\" vs. \"amount allowed\".",
@@ -102,62 +176,6 @@
           "goal"
         ],
         "title": "RunCreate",
-        "type": "object"
-      },
-      "RunResponse": {
-        "additionalProperties": false,
-        "description": "The API's projection of a run (SPEC.md \u00a78: \"status, task tree, cost,\ntrace link\").\n\n`trace_id` is not optional: a run always has one, generated when the run\nrow is written and independent of whether any tracing backend is\nconfigured (I7). `budget` and `usage` ship together so a caller can see how\nclose a run is to its caps without a second request (I12); the task tree\nlands with the orchestrator in M1.",
-        "properties": {
-          "budget": {
-            "$ref": "#/components/schemas/RunBudget"
-          },
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
-            "type": "string"
-          },
-          "goal": {
-            "title": "Goal",
-            "type": "string"
-          },
-          "id": {
-            "format": "uuid",
-            "title": "Id",
-            "type": "string"
-          },
-          "payload": {
-            "additionalProperties": true,
-            "title": "Payload",
-            "type": "object"
-          },
-          "status": {
-            "$ref": "#/components/schemas/RunStatus"
-          },
-          "trace_id": {
-            "title": "Trace Id",
-            "type": "string"
-          },
-          "updated_at": {
-            "format": "date-time",
-            "title": "Updated At",
-            "type": "string"
-          },
-          "usage": {
-            "$ref": "#/components/schemas/RunBudget"
-          }
-        },
-        "required": [
-          "id",
-          "goal",
-          "payload",
-          "status",
-          "trace_id",
-          "budget",
-          "usage",
-          "created_at",
-          "updated_at"
-        ],
-        "title": "RunResponse",
         "type": "object"
       },
       "RunStatus": {
@@ -241,11 +259,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RunResponse"
+                  "$ref": "#/components/schemas/Run"
                 }
               }
             },
             "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Idempotency key reused with a different request"
           },
           "422": {
             "content": {
@@ -284,7 +312,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RunResponse"
+                  "$ref": "#/components/schemas/Run"
                 }
               }
             },

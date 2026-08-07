@@ -23,6 +23,8 @@ import re
 import tempfile
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 from uuid import UUID
@@ -31,10 +33,10 @@ import pgserver
 import pytest
 from fastapi.testclient import TestClient
 from steward_api.app import create_app
-from steward_api.store import PostgresRunStore
+from steward_api.store import REPLAYED_DETAIL, PostgresRunStore
 from steward_queue import NOOP_TASK_TYPE, TaskState, Worker, connect, get_task, upgrade_to_head
 from steward_queue.db import QueueConnection
-from steward_telemetry import NoopTracer
+from steward_telemetry import Span, SpanOutcome
 
 pytestmark = pytest.mark.acceptance
 
@@ -82,10 +84,47 @@ def dsn() -> Iterator[str]:
             server.cleanup()
 
 
+@dataclass
+class RecordedSpan:
+    """A span the store opened, and how it said the work ended."""
+
+    trace_id: str
+    run_id: UUID
+    goal: str
+    outcome: SpanOutcome | None = None
+    detail: str | None = None
+
+    def record(self, outcome: SpanOutcome, detail: str | None = None) -> None:
+        self.outcome, self.detail = outcome, detail
+
+
+class RecordingTracer:
+    """A `Tracer` that keeps its spans, so the scenario can assert on them."""
+
+    def __init__(self) -> None:
+        self.spans: list[RecordedSpan] = []
+
+    @contextmanager
+    def run_span(self, *, trace_id: str, run_id: UUID, goal: str) -> Iterator[Span]:
+        span = RecordedSpan(trace_id=trace_id, run_id=run_id, goal=goal)
+        self.spans.append(span)
+        yield span
+
+    @contextmanager
+    def task_span(self, *, trace_id: str, run_id: UUID, task_id: UUID, task_type: str) -> Iterator[Span]:
+        raise NotImplementedError("the API creates runs; tasks are executed by workers")
+        yield  # pragma: no cover -- unreachable, kept so the signature is a generator
+
+
 @pytest.fixture
-def client(dsn: str) -> Iterator[TestClient]:
+def tracer() -> RecordingTracer:
+    return RecordingTracer()
+
+
+@pytest.fixture
+def client(dsn: str, tracer: RecordingTracer) -> Iterator[TestClient]:
     """The real app, wired to the queue-backed store."""
-    store = PostgresRunStore(dsn, tracer=NoopTracer())
+    store = PostgresRunStore(dsn, tracer=tracer)
     with TestClient(create_app(store)) as test_client:
         yield test_client
 
@@ -119,7 +158,7 @@ def drain_until_terminal(client: TestClient, worker: Worker, run_id: str) -> dic
 
 
 def test_a_noop_run_flows_api_to_queue_to_worker_to_done(
-    client: TestClient, conn: QueueConnection, dsn: str
+    client: TestClient, conn: QueueConnection, dsn: str, tracer: RecordingTracer
 ) -> None:
     accepted = client.post("/v1/runs", json={"goal": "noop", "payload": {"echo": "m0"}})
     assert accepted.status_code == 202
@@ -127,6 +166,12 @@ def test_a_noop_run_flows_api_to_queue_to_worker_to_done(
     run_id = created["id"]
     assert created["status"] == "pending"
     assert TRACE_ID_RE.match(created["trace_id"])
+
+    # I7: creating the run opened the trace, on the id the row now carries.
+    [span] = tracer.spans
+    assert span.trace_id == created["trace_id"]
+    assert span.run_id == UUID(run_id)
+    assert span.goal == "noop"
 
     # I8: the 202 means the run row and its task committed together. A client
     # that got this response is guaranteed there is work queued for it.
@@ -154,7 +199,7 @@ def test_a_noop_run_flows_api_to_queue_to_worker_to_done(
 
 
 def test_a_replayed_idempotency_key_does_not_start_a_second_run(
-    client: TestClient, conn: QueueConnection
+    client: TestClient, conn: QueueConnection, tracer: RecordingTracer
 ) -> None:
     headers = {"Idempotency-Key": "acceptance-replay"}
     first = client.post("/v1/runs", json={"goal": "noop"}, headers=headers).json()
@@ -164,6 +209,19 @@ def test_a_replayed_idempotency_key_does_not_start_a_second_run(
     tasks = conn.execute(SELECT_RUN_TASKS, {"run_id": UUID(first["id"])}).fetchall()
     conn.rollback()
     assert len(tasks) == 1
+    # The replay is traced as a replay rather than as a second creation.
+    assert [span.detail for span in tracer.spans] == [None, REPLAYED_DETAIL]
+
+
+def test_reusing_a_key_for_a_different_request_is_a_409(client: TestClient, conn: QueueConnection) -> None:
+    headers = {"Idempotency-Key": "acceptance-conflict"}
+    first = client.post("/v1/runs", json={"goal": "noop"}, headers=headers)
+    second = client.post("/v1/runs", json={"goal": "noop", "payload": {"echo": "x"}}, headers=headers)
+
+    assert second.status_code == 409
+    tasks = conn.execute(SELECT_RUN_TASKS, {"run_id": UUID(first.json()["id"])}).fetchall()
+    conn.rollback()
+    assert len(tasks) == 1  # the conflicting request queued nothing
 
 
 def test_a_run_the_api_never_created_is_a_404(client: TestClient) -> None:

@@ -1,7 +1,49 @@
 {
   "$defs": {
+    "RunBudget": {
+      "additionalProperties": false,
+      "description": "Hard caps on one bounded agent run or task.\n\nAlso reused by `TaskResult.usage` to report what was actually consumed\n(ARCHITECTURE.md I12; SPEC.md \u00a73.2) \u2014 same shape, no separate type needed\nfor \"amount spent\" vs. \"amount allowed\".",
+      "properties": {
+        "cost_usd": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Cost Usd"
+        },
+        "steps": {
+          "minimum": 0,
+          "title": "Steps",
+          "type": "integer"
+        },
+        "tokens": {
+          "minimum": 0,
+          "title": "Tokens",
+          "type": "integer"
+        },
+        "wall_clock": {
+          "format": "duration",
+          "title": "Wall Clock",
+          "type": "string"
+        }
+      },
+      "required": [
+        "steps",
+        "tokens",
+        "cost_usd",
+        "wall_clock"
+      ],
+      "title": "RunBudget",
+      "type": "object"
+    },
     "RunStatus": {
-      "description": "Lifecycle of a `Run` (SPEC.md \u00a77). The M0 in-memory store only ever\nproduces `PENDING`; the remaining states are driven by the orchestrator\nonce a run is actually executed (issue #5 onward).",
+      "description": "Lifecycle of a run (SPEC.md \u00a77).\n\nA run is `PENDING` until a worker starts its first task, `RUNNING` while\nany task is in flight, and terminal once every task is terminal: `FAILED`\nif any task failed or dead-lettered, `SUCCEEDED` otherwise. `CANCELLED` is\noperator-driven and is never entered by the rollup.\n\nThe queue's `tasks.state` machine is a different, finer thing (claimed,\nleases, attempts); these five are the run-level states the API publishes.",
       "enum": [
         "pending",
         "running",
@@ -14,8 +56,19 @@
     }
   },
   "additionalProperties": false,
-  "description": "An agent run record (SPEC.md \u00a77: \"runs -- agent run records (goal,\nstatus, cost, token totals, langfuse trace id)\").",
+  "description": "The API's projection of a run (SPEC.md \u00a78: \"status, task tree, cost,\ntrace link\").\n\n`trace_id` is always populated by the server -- `runs.trace_id` is `NOT\nNULL` and generated whether or not a tracing backend is configured (I7) --\nand `budget`/`usage` likewise, so a caller can see how close a run is to\nits caps without a second request (I12). They are nullable *in the\ncontract* because this model was published without them and S6 classifies\na newly-required property as a breaking change; tightening them belongs\nwith the contract-versioning mechanism, not with a field addition. The task\ntree lands with the orchestrator in M1.",
   "properties": {
+    "budget": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RunBudget"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "created_at": {
       "format": "date-time",
       "title": "Created At",
@@ -38,10 +91,33 @@
     "status": {
       "$ref": "#/$defs/RunStatus"
     },
+    "trace_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Trace Id"
+    },
     "updated_at": {
       "format": "date-time",
       "title": "Updated At",
       "type": "string"
+    },
+    "usage": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RunBudget"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

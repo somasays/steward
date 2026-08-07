@@ -18,10 +18,13 @@ design is two-layer:
 `tracer_from_env` picks between the two: with credentials, spans export; with
 none, `NoopTracer`. The trace id is generated and stored either way, which is
 what lets the system be operated -- demoed, tested, deployed air-gapped --
-with no observability credentials at all.
+with no observability credentials at all. It is also the *only* way to obtain
+the Langfuse-backed tracer: `LangfuseTracer` is deliberately not exported,
+because its constructor takes a `Langfuse` client and exporting it would put a
+vendor type back in this package's reachable surface (I9) -- the thing the
+private module exists to prevent.
 """
 
-from steward_telemetry._langfuse import LangfuseTracer
 from steward_telemetry.env import HOST_ENV, PUBLIC_KEY_ENV, SECRET_KEY_ENV, tracer_from_env
 from steward_telemetry.tracer import (
     TRACE_ID_HEX_LENGTH,
@@ -38,7 +41,6 @@ __all__ = [
     "PUBLIC_KEY_ENV",
     "SECRET_KEY_ENV",
     "TRACE_ID_HEX_LENGTH",
-    "LangfuseTracer",
     "NoopSpan",
     "NoopTracer",
     "Span",

@@ -86,7 +86,7 @@ class RunRecord(QueueModel):
     admitted under, and what it has consumed so far. `trace_id` is not optional
     because the column is not nullable: a run that cannot be traced back to a
     trace does not exist (I7). What the API publishes of this is
-    `steward_schemas.RunResponse` -- a projection, so how the row is stored and
+    `steward_schemas.Run` -- a projection, so how the row is stored and
     what the contract promises can evolve separately (I3).
     """
 
