@@ -1,0 +1,57 @@
+{
+  "$defs": {
+    "RunStatus": {
+      "description": "Lifecycle of a `Run` (SPEC.md \u00a77). The M0 in-memory store only ever\nproduces `PENDING`; the remaining states are driven by the orchestrator\nonce a run is actually executed (issue #5 onward).",
+      "enum": [
+        "pending",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ],
+      "title": "RunStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "An agent run record (SPEC.md \u00a77: \"runs -- agent run records (goal,\nstatus, cost, token totals, langfuse trace id)\").",
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "goal": {
+      "title": "Goal",
+      "type": "string"
+    },
+    "id": {
+      "format": "uuid",
+      "title": "Id",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "status": {
+      "$ref": "#/$defs/RunStatus"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "goal",
+    "payload",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "Run",
+  "type": "object"
+}

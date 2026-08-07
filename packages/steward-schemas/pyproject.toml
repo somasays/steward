@@ -7,6 +7,9 @@ dependencies = [
     "pydantic>=2.7",
 ]
 
+[project.scripts]
+steward-schemas-export-schemas = "steward_schemas.export_schemas:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

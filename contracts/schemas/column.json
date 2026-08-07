@@ -1,0 +1,60 @@
+{
+  "additionalProperties": false,
+  "description": "A column of an `Asset`. `data_type` is the source engine's own type\nname (e.g. \"varchar\", \"numeric(10,2)\") \u2014 engines disagree on type\nsystems, so this is deliberately a string rather than a closed enum.",
+  "properties": {
+    "asset_id": {
+      "format": "uuid",
+      "title": "Asset Id",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "data_type": {
+      "title": "Data Type",
+      "type": "string"
+    },
+    "id": {
+      "format": "uuid",
+      "title": "Id",
+      "type": "string"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "nullable": {
+      "title": "Nullable",
+      "type": "boolean"
+    },
+    "ordinal": {
+      "title": "Ordinal",
+      "type": "integer"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "workspace_id": {
+      "format": "uuid",
+      "title": "Workspace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "workspace_id",
+    "asset_id",
+    "name",
+    "data_type",
+    "ordinal",
+    "nullable",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "Column",
+  "type": "object"
+}
