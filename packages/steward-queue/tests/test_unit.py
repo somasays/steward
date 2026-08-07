@@ -4,6 +4,9 @@ Backoff policy, the dedup natural key, the registry contract's bookkeeping,
 and the Alembic URL binding.
 """
 
+import threading
+import time
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -13,6 +16,19 @@ from steward_queue.db import MIN_STATEMENT_TIMEOUT_MS, statement_timeout_ms
 from steward_queue.handlers import noop
 from steward_queue.migrate import sqlalchemy_url
 from steward_queue.registry import UnknownTaskType, get_handler, task_handler
+from steward_queue.worker import _Handoff
+
+THREADS = 8
+
+
+def wait_for(condition: Callable[[], bool], *, within: float = 5.0) -> bool:
+    """Poll `condition` until it holds. Returns whether it did."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.005)
+    return False
 
 
 class TestStatementTimeout:
@@ -113,3 +129,48 @@ class TestSqlalchemyUrl:
     def test_non_postgres_dsn_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="not a PostgreSQL DSN"):
             sqlalchemy_url("mysql://u@h/db")
+
+
+class TestHandoff:
+    """Exactly one context records an attempt (worker.py, SPEC.md D7).
+
+    The handler thread and the event loop both reach the point of writing a
+    terminal state for the same attempt. Two of them writing would count the
+    attempt twice, or record an outcome for a task another worker has since
+    taken over -- so the property is not "rarely both", it is "never both".
+    """
+
+    def test_only_the_first_caller_takes_it(self) -> None:
+        handoff = _Handoff()
+        assert handoff.take() is True
+        assert handoff.take() is False
+
+    def test_only_one_of_many_threads_takes_it(self) -> None:
+        handoff = _Handoff()
+        start = threading.Barrier(THREADS)
+        winners: list[bool] = []
+        lock = threading.Lock()
+
+        def contend() -> None:
+            start.wait()
+            taken = handoff.take()
+            with lock:
+                winners.append(taken)
+
+        threads = [threading.Thread(target=contend) for _ in range(THREADS)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert winners.count(True) == 1
+
+    def test_a_backend_that_was_never_published_is_none(self) -> None:
+        # The loop asks before the thread has opened its connection: there is
+        # nothing to end, and that is not an error.
+        assert _Handoff().backend_pid() is None
+
+    def test_a_published_backend_is_readable_from_another_thread(self) -> None:
+        handoff = _Handoff()
+        threading.Thread(target=lambda: handoff.publish(4242)).start()
+        assert wait_for(lambda: handoff.backend_pid() == 4242)

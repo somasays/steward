@@ -18,12 +18,14 @@ application-level enforcement I5 rules out. The role is the guarantee; the test
 that proves it (`tests/test_read_only.py`) asserts the privilege error, which
 only a genuinely read-only role can produce.
 
-Timeouts are the connection's own, for the same reason `steward_queue.db.connect`
-sets one: the worker's `asyncio.timeout` can only cancel at an await point, and
-a psycopg call is a blocking C call in a worker thread. A source that accepts a
-connection and then never answers would otherwise burn the whole task budget
-with nothing to interrupt. Both bounds derive from the task's wall-clock budget,
-so a scan cannot outlive the cap the run was admitted under (I12).
+Timeouts are the connection's own, and here they matter more than anywhere else
+in the system. The worker bounds a scan's *task* whatever the handler is doing
+-- at the deadline it stops waiting and fails the task (SPEC.md §13, D7) -- but
+the one thing it cannot reach is a thread blocked on a socket to a database
+Steward does not own. `connect_timeout` and `statement_timeout`, both derived
+from the task's wall-clock budget, are what bound that thread; without them a
+source that accepts a connection and never answers would leave a thread waiting
+long after the task it belonged to was recorded as `budget_exceeded` (I12).
 
 SQL is static module constants (I5); `%(name)s` placeholders are bound by
 psycopg, and nothing here is assembled from strings.

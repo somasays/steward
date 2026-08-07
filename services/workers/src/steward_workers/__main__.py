@@ -38,12 +38,16 @@ def default_worker_id() -> str:
 
 
 async def run(worker: Worker) -> None:
-    """Poll until the process is asked to stop, then finish the task in hand.
+    """Poll until the process is asked to stop, then stop.
 
-    SIGTERM sets the stop event rather than killing the loop: `run_forever`
-    returns after the current execution records its outcome, so a rolling
-    deploy costs no re-executed work. A worker killed harder than that is the
-    case leases exist for (N1) -- the task is reaped and retried.
+    SIGTERM sets the stop event rather than killing the loop, and `run_forever`
+    returns within a poll interval whatever a handler happens to be doing --
+    the handler runs on a thread of its own, so the signal is seen at once and
+    the loop is not waiting on it (SPEC.md §13, D7). An attempt still in flight
+    is left to its lease: a reaper requeues it and an idempotent handler runs it
+    again (I8), which is the same trade N1 already makes for a worker that dies
+    outright. Bounding a rolling deploy at a poll interval is worth one
+    re-executed attempt; bounding it at a task's wall-clock budget was not.
     """
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
