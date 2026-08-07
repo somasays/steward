@@ -78,13 +78,20 @@ def _check_g4() -> CheckResult:
     return CheckResult("G4", "secret scan", "FAIL", [], "gitleaks detect\n    " + "\n    ".join(tail))
 
 
+SCRIPT_SKIP_EXIT = 2
+
+
 def _script_or_pending(check_id: str, name: str, script: str) -> CheckResult:
-    """Checks specced in GUARDRAILS.md that land via their own issue."""
+    """Checks specced in GUARDRAILS.md that land via their own issue.
+
+    Exit codes: 0 PASS, 1 FAIL, 2 SKIP. Without the SKIP code a check that
+    couldn't run (no toolchain, no baseline) exits 0 and reads as PASS in
+    this table — green for work it didn't do (GUARDRAILS.md §3)."""
     path = Path(__file__).parent / script
     if not path.exists():
         return CheckResult(check_id, name, "SKIP", [], f"{script} not implemented yet (tracked as an issue)")
     proc = subprocess.run([sys.executable, str(path)], cwd=repo_root(), capture_output=True, text=True)
-    status = "PASS" if proc.returncode == 0 else "FAIL"
+    status = {0: "PASS", SCRIPT_SKIP_EXIT: "SKIP"}.get(proc.returncode, "FAIL")
     detail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else script
     return CheckResult(check_id, name, status, [], detail)
 
