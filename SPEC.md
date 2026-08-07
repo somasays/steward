@@ -133,6 +133,7 @@ packages/
   steward-agents/      # Agent runtime: owned contracts (tools, budgets, results); LangGraph contained here
   steward-retrieval/   # Hybrid search client: Qdrant + ES + fusion + rerank
   steward-llm/         # Thin LiteLLM client wrapper: typed completions, structured output helpers
+  steward-telemetry/   # Tracing seam: owned Tracer contract, Langfuse contained behind it
   steward-sdk/         # Public Python client for the REST API (generated types + hand-written ergonomics)
 services/
   api/                 # FastAPI app
@@ -283,13 +284,13 @@ classifications  — column sensitivity labels (label, confidence, evidence, rev
 quality_rules    — declarative expectations (type, params, compiled SQL, state: proposed|active|muted)
 check_runs       — rule execution results (pass/fail, observed values, duration)
 incidents        — opened from failures/drift (severity, status, triage JSONB, links to check_runs)
-runs             — agent run records (goal, status, cost, token totals, langfuse trace id)
+runs             — agent run records (goal, payload, status, budget + usage, langfuse trace id, idempotency key)
 tasks            — the queue (run_id, type, payload JSONB, state, attempts, claimed_by, …)
 checkpoints      — agent state snapshots (task_id, step, state JSONB)
 audit_log        — every state-changing action (actor: human|agent|policy, before/after)
 ```
 
-Notable choices: profiles and documents are **append-only versioned** (stewardship history is a feature — "what did this table look like in March?"); the task queue lives in Postgres rather than a broker (see [D2](#13-key-design-decisions)); `audit_log` is written from the same transactions as the mutations they record.
+Notable choices: profiles and documents are **append-only versioned** (stewardship history is a feature — "what did this table look like in March?"); the task queue lives in Postgres rather than a broker (see [D2](#13-key-design-decisions)); `audit_log` is written from the same transactions as the mutations they record; `runs.trace_id` is `NOT NULL` and `runs.idempotency_key` is uniquely indexed, so an untraceable run and a duplicated `POST /v1/runs` are both unrepresentable rather than merely discouraged.
 
 ---
 
@@ -328,7 +329,9 @@ GET    /v1/runs/{id}                     # status, task tree, cost, trace link
 POST   /v1/runs/{id}:cancel
 ```
 
-`POST /v1/runs` is the M0 API skeleton's entry point (issue #4): a generic `{goal, payload}` body, no orchestrator wiring yet (a run is created straight into `pending`). Goal-specific endpoints (`POST /v1/sources/{id}/scan`, above) land in M1 and are expected to become the primary way runs get created; whether `POST /v1/runs` stays as a generic escape hatch or narrows to goal-specific endpoints only is an open question for that milestone.
+`POST /v1/runs` is M0's entry point: a generic `{goal, payload}` body returning 202. The run row and its first task are written in one transaction (I8), so a 202 is a guarantee that work is queued, not a promise to queue it later; a worker then executes the task and the run's status follows its tasks (`pending → running → succeeded|failed`) in the transaction that settles the last one. M0 expands every goal to a single `noop` task — the deterministic planner that turns a goal into a task DAG (§3.1) lands in M1 and replaces that expansion, not the endpoint. Goal-specific endpoints (`POST /v1/sources/{id}/scan`, above) land in M1 and are expected to become the primary way runs get created; whether `POST /v1/runs` stays as a generic escape hatch or narrows to goal-specific endpoints only is an open question for that milestone.
+
+The published run contract is a **projection**, not the row: `RunResponse` (id, goal, payload, status, trace id, budget, usage, timestamps) is built from the `runs` record, so storage can change without that being an API change (I3, N9). Every run carries a Langfuse trace id from creation, generated locally and stored on the row whether or not tracing credentials are configured — so a run is always correlatable and no deployment depends on an observability account to function (I7).
 
 Conventions: cursor pagination everywhere; RFC 9457 problem-details errors; idempotency keys on all POSTs that create runs; SSE (not WebSockets) for streaming — it's proxy-friendly and resumable via `Last-Event-ID`.
 
@@ -363,7 +366,7 @@ The eval framework is a first-class subsystem, not an afterthought: **no prompt,
 
 Three layers, distinct jobs:
 
-1. **Langfuse — semantic tracing.** Every run is a trace; every task, generation, and tool call is a span with model, tokens, cost, latency, and validated I/O. Prompt versions are managed in Langfuse, so any output links to the exact prompt version that produced it. Answering "why did the Classifier call this column PHI?" is a trace lookup, not archaeology.
+1. **Langfuse — semantic tracing.** Every run is a trace; every task, generation, and tool call is a span with model, tokens, cost, latency, and validated I/O. Prompt versions are managed in Langfuse, so any output links to the exact prompt version that produced it. Answering "why did the Classifier call this column PHI?" is a trace lookup, not archaeology. Langfuse is reached only through `steward-telemetry`'s owned `Tracer` contract (the same containment pattern as LangGraph and LiteLLM), and the trace id is generated locally: with no credentials configured the system runs unchanged and only span export is missing.
 2. **OpenTelemetry + Prometheus/Grafana — service health.** RED metrics for the API, queue depth/age per task type, worker saturation, per-alias LLM latency/error/fallback rates, cost per workspace per day. SLOs: API P99 < 500 ms (non-agent endpoints); scan completes < 30 min for a 500-table source; `ask` P50 < 10 s.
 3. **ElasticSearch — structured logs.** JSON logs correlated by `run_id`/`task_id`/`trace_id`, searchable next to the audit trail.
 
