@@ -39,12 +39,12 @@ These run real components — Postgres, the queue, the runtime with a stub LLM �
 | H3 | No lost/ghost tasks | I8, N1 | crash injection around enqueue/claim/complete → task set matches state-machine expectations exactly | active |
 | H4 | Budget termination | I12, N6 | agent given an impossible goal with 1-step/1-cent budget → terminates `budget_exceeded`, never hangs, cost ≤ cap | wall-clock active (worker); step/token/cost with the M1 agent loop |
 | H5 | Audit completeness | I7, N8 | every repository mutation produces an audit row in the same transaction (asserted over the repository registry) | M1 |
-| H6 | Trace completeness | I7, N8 | a finished run's Langfuse trace contains the full expected span tree; every generation span carries a prompt version | M0/M1 |
+| H6 | Trace completeness | I7, N8 | a finished run's Langfuse trace contains the full expected span tree; every generation span carries a prompt version | partial: trace_id is NOT NULL and asserted end to end by H11; span-tree assertions land with the M1 agent loop |
 | H7 | Masking canary | I6, N7 | canary secrets planted in fixture data; assert they never appear in any captured prompt or trace payload | M1 |
 | H8 | Index rebuild convergence | I1, N9 | wipe Qdrant + ES, run rebuild job → search results identical to pre-wipe golden results | M2 |
 | H9 | Citation resolution | N2, FR8 | every citation in every golden answer resolves to a live asset/document id | M3 |
 | H10 | Governance gating | I13, FR9 | governance actions land in `pending_review` unless a policy explicitly auto-approves; the policy id is on the audit row | M1 |
-| H11 | Milestone acceptance | FR1–FR10 | executable exit criterion of each shipped milestone (SPEC §12); once shipped, runs forever | rolling |
+| H11 | Milestone acceptance | FR1–FR10 | executable exit criterion of each shipped milestone (SPEC §12); once shipped, runs forever | active (M0: API → queue → worker → succeeded) |
 
 ### Tier B — benchmarks & evals (affected-path PRs + nightly)
 
@@ -142,7 +142,7 @@ Not everything reduces to a check. The `architecture-guardian` subagent and huma
 
 ## 5. Enforcement status
 
-Active now: S1, S3–S7 (S1/S3 tool-backed: import-linter + ruff; S4–S7 stdlib), H1, H3, H4 (wall-clock half), G1–G3, G4 (gitleaks CLI, full history, same command on push and PR), G5. S2 skips until there is a runtime to bound. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced invariants in the meantime — I6 (until masking lands, M1) and the tracing half of I7 (until #5) — are the `architecture-guardian`'s explicit responsibility.
+Active now: S1, S3–S7 (S1/S3 tool-backed: import-linter + ruff; S4–S7 stdlib), H1, H3, H4 (wall-clock; step/token/cost with the M1 agent loop), H11 (M0 exit criterion), G1–G5. S2 skips until there is a runtime to bound. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced in the meantime: I6 (until masking lands, M1) and the span-tree half of I7/H6 (until the M1 agent loop) — the `architecture-guardian`'s explicit responsibility.
 
 ## 6. Amendment process
 
