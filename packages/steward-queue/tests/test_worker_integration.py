@@ -50,6 +50,7 @@ EXPIRED_LEASE = timedelta(seconds=-1)
 NO_USAGE = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(0))
 
 EXPLODES = "test.explodes_on_demand"
+OVERSPENDS = "test.overspends_its_budget"
 REPORTS_FAILURE = "test.reports_failure"
 SLEEPS = "test.sleeps"
 BLOCKS_IN_THE_DRIVER = "test.blocks_in_the_driver"
@@ -253,6 +254,28 @@ async def cannot_reach_its_source(ctx: TaskContext) -> TaskResult:
     if ctx.spec.payload.get("unreachable"):
         raise TimeoutError("connection to customer-db timed out")
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(OVERSPENDS, sample_payload={"steps": 1})
+async def overspends_its_budget(ctx: TaskContext) -> TaskResult:
+    """Succeeds while reporting whatever usage the payload names.
+
+    Steps, tokens and cost are counted inside a handler and reported here;
+    nothing outside can observe them, so a handler is free to report more than
+    it was given. Payload-driven, so the sample payload (one step) is inside
+    every fixture budget and idempotent under H1, while a budget test can ask
+    for an overrun.
+    """
+    return TaskResult(
+        task_id=ctx.spec.task_id,
+        status=TaskStatus.SUCCEEDED,
+        usage=RunBudget(
+            steps=int(ctx.spec.payload["steps"]),
+            tokens=0,
+            cost_usd=Decimal("0"),
+            wall_clock=timedelta(0),
+        ),
+    )
 
 
 @task_handler(REPORTS_FAILURE, sample_payload={})
@@ -988,6 +1011,7 @@ class TestRunRollup:
     "task_type",
     [
         EXPLODES,
+        OVERSPENDS,
         REPORTS_FAILURE,
         BLOCKS_IN_THE_DRIVER,
         BLOCKS_THE_INTERPRETER,
@@ -999,6 +1023,46 @@ class TestRunRollup:
 )
 def test_scaffolding_handlers_are_registered(task_type: str) -> None:
     assert task_type in REGISTRY
+
+
+class TestReportedUsageIsCapped:
+    """I12's other three dimensions, at the seam where they become visible (#48).
+
+    Wall-clock is bounded by machinery the handler cannot influence. Steps,
+    tokens and cost are counted *inside* the handler and reported on its
+    result, so the only place they can be enforced is where that report is
+    read. Without this check, run-level reservation would bound what tasks are
+    allowed to spend while `runs.used_*` -- the sum of what they say they spent
+    -- stayed free to exceed the run's budget one task at a time.
+    """
+
+    async def test_a_result_reporting_more_than_its_budget_is_a_budget_failure(
+        self, dsn: str, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        spec = queued(task_type=OVERSPENDS, payload={"steps": 99}, max_attempts=1)
+
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+
+        assert state_of(conn, spec.task_id) is TaskState.DEAD
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        assert row is not None
+        assert row[0]["title"] == BUDGET_EXCEEDED
+        assert "steps" in row[0]["detail"]  # which cap, not just that one blew
+        run = get_run(conn, run_id)
+        assert run is not None and run.usage.steps == 0  # nothing overspent was rolled up
+
+    async def test_a_result_within_its_budget_is_rolled_up_unchanged(
+        self, dsn: str, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # The check must bind the overrun and nothing else: the same handler
+        # reporting a figure inside its cap succeeds and its usage counts.
+        queued(task_type=OVERSPENDS, payload={"steps": 2}, max_attempts=1)
+
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+
+        run = get_run(conn, run_id)
+        assert run is not None and run.usage.steps == 2
+        assert run.usage.over(run.budget) == ()
 
 
 class TestWallClockIsOneCap:
