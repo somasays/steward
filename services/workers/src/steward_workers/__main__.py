@@ -16,6 +16,7 @@ import socket
 import uuid
 
 import steward_catalog  # noqa: F401 -- imported for its side effect: registers `scan_source`
+from steward_llm import gateway_config_from_env
 from steward_queue import DSN_ENV, Worker, registered_types
 from steward_telemetry import tracer_from_env
 
@@ -64,12 +65,26 @@ def main() -> None:
     whose handlers this process should execute must be imported before that --
     hence the side-effecting import above, and the log line that makes the
     resulting claim list visible rather than something to infer from silence.
+
+    The gateway config is validated here, before any task can be claimed: if a
+    production alias resolves anywhere but an approved self-hosted endpoint the
+    exception propagates and the process does not start (I15). No config named
+    means no gateway at all, which is how M0/M1 run credential-free -- not a
+    degraded mode, since nothing in this process can call a model without one.
     """
     dsn = os.environ.get(DSN_ENV, "").strip()
     if not dsn:
         raise SystemExit(f"{DSN_ENV} is not set")
+    gateway = gateway_config_from_env()
+    log = logging.getLogger(__name__)
+    log.info(
+        "gateway: %s",
+        f"{len(gateway.bindings)} models from {gateway.source} ({gateway.mode.value})"
+        if gateway
+        else "none configured; this worker cannot call a model",
+    )
     worker_id = os.environ.get(WORKER_ID_ENV, "").strip() or default_worker_id()
-    logging.getLogger(__name__).info("worker %s claims %s", worker_id, ", ".join(registered_types()))
+    log.info("worker %s claims %s", worker_id, ", ".join(registered_types()))
     asyncio.run(run(Worker(dsn, worker_id, tracer=tracer_from_env())))
 
 

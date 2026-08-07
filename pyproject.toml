@@ -9,6 +9,7 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-asyncio>=0.24",
     "import-linter>=2.0",
+    "types-PyYAML>=6.0",
     # Tier H harnesses run against a real Postgres, not a fake: pgserver ships the
     # server binaries in its wheel and starts an ephemeral instance per session, so
     # the queue's SKIP LOCKED and transaction semantics are exercised for real

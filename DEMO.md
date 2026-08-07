@@ -41,7 +41,7 @@ The same command runs in the pre-commit hook and in CI.
 
 ## Where to read next
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — requirements, NFRs, invariants I1–I14, technology decisions with what was rejected
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — requirements, NFRs, invariants I1–I15, technology decisions with what was rejected
 - [GUARDRAILS.md](./GUARDRAILS.md) — every fitness function, and the matrix showing each invariant and NFR has one
 - [PROOFS.md](./PROOFS.md) — each claim with the command that reproduces it
 - [SPEC.md](./SPEC.md) §13 — the load-bearing design decisions (LangGraph contained rather than adopted or rebuilt; Postgres as queue; hybrid retrieval)
