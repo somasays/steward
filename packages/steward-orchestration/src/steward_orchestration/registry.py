@@ -136,7 +136,18 @@ class RunPlan:
     tasks: tuple[PlannedTask, ...]
 
     def task_specs(self, run_id: UUID) -> tuple[TaskSpec, ...]:
-        """The plan as queue-ready specs for `run_id`, under the goal's budget."""
+        """The plan as queue-ready specs for `run_id`, under the goal's budget.
+
+        Every task carries the whole run budget, which is the placeholder the
+        queue's per-task caps already imply and *not* the end state: with a
+        fan-out plan it means N tasks may each spend the run's cap, so a run
+        could exceed the budget the API reports for it. Nothing in M1 fans out
+        yet (`noop` plans one task), and the fix is run-level enforcement --
+        the accumulated `runs.used_*` totals compared against `runs.budget_*`
+        by the runtime -- which lands with the agent loop that H4's
+        step/token/cost half measures (I12, N6). The first goal that fans out
+        (#20) must not ship before it.
+        """
         return tuple(
             TaskSpec(
                 task_id=uuid4(),
@@ -184,7 +195,10 @@ class GoalRegistration[P: GoalParams]:
 
 
 REGISTRY: dict[str, GoalRegistration[Any]] = {}
-"""Registered goals by name.
+"""Registered goals by name. Module-private by intent: not re-exported from the
+package, so `goal()` is the only supported way in and the "one registration
+site" property cannot be sidestepped with a dict assignment. Read it through
+`registered_goals()` and `get_goal()`.
 
 The value type is erased because the registry is heterogeneous by nature --
 each entry pairs its own params model with a planner that takes exactly that

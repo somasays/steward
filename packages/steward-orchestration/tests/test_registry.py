@@ -15,7 +15,6 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 from steward_orchestration import (
-    REGISTRY,
     DisallowedTaskType,
     GoalParams,
     GoalRegistration,
@@ -28,6 +27,7 @@ from steward_orchestration import (
     plan_run,
     registered_goals,
 )
+from steward_orchestration.registry import REGISTRY
 from steward_schemas import RunBudget
 
 BUDGET = RunBudget(steps=4, tokens=100, cost_usd=Decimal("0.5"), wall_clock=timedelta(minutes=1))
@@ -61,7 +61,11 @@ def _registration(
 
 @pytest.fixture
 def isolated_registry() -> Iterator[None]:
-    """Undo anything a test registers globally, so goal names cannot leak."""
+    """Undo anything a test registers globally, so goal names cannot leak.
+
+    Reaches for the module attribute rather than a package export: the registry
+    dict is deliberately not part of the public surface.
+    """
     snapshot = dict(REGISTRY)
     try:
         yield
@@ -133,6 +137,8 @@ def test_a_planner_cannot_plan_outside_its_allowlist() -> None:
 
 
 def test_an_allowed_expansion_becomes_queue_specs_under_the_goals_budget() -> None:
+    # Per-task caps are the goal's caps today; see `task_specs` on why that is a
+    # placeholder until run-level budget enforcement lands with the agent loop.
     run_id = uuid4()
 
     specs = _registration().plan({"table": "t", "limit": 3}).task_specs(run_id)

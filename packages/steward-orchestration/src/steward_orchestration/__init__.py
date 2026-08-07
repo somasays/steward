@@ -23,7 +23,6 @@ the import alone, with no setup call a caller could forget.
 from steward_orchestration.goals import NOOP_BUDGET, NOOP_GOAL, NOOP_TASK_TYPE, NoopParams
 from steward_orchestration.registry import (
     DEFAULT_MAX_ATTEMPTS,
-    REGISTRY,
     DisallowedTaskType,
     GoalParams,
     GoalRegistration,
@@ -43,7 +42,6 @@ __all__ = [
     "NOOP_BUDGET",
     "NOOP_GOAL",
     "NOOP_TASK_TYPE",
-    "REGISTRY",
     "DisallowedTaskType",
     "GoalParams",
     "GoalRegistration",

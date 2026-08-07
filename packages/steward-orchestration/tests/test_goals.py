@@ -8,14 +8,15 @@ the two packages agree on task-type *names*, and this is where that agreement
 is verified instead of assumed.
 """
 
-from steward_orchestration import NOOP_GOAL, NOOP_TASK_TYPE, REGISTRY, NoopParams, plan_run
+from steward_orchestration import NOOP_GOAL, NOOP_TASK_TYPE, NoopParams, get_goal, plan_run, registered_goals
 from steward_queue import registered_types
 
 
 def test_every_goal_plans_only_executable_task_types() -> None:
     executable = set(registered_types())
 
-    for name, registration in REGISTRY.items():
+    for name in registered_goals():
+        registration = get_goal(name)
         assert registration.allowed_task_types <= executable, (
             f"goal {name!r} may plan task types no handler can execute: "
             f"{sorted(registration.allowed_task_types - executable)}"
@@ -25,8 +26,8 @@ def test_every_goal_plans_only_executable_task_types() -> None:
 def test_every_goal_is_registered_with_hard_caps() -> None:
     # I12: a goal without a budget cannot be registered, so this asserts the
     # caps are meaningful rather than zeroed placeholders.
-    for name, registration in REGISTRY.items():
-        budget = registration.budget
+    for name in registered_goals():
+        budget = get_goal(name).budget
         assert budget.steps > 0, name
         assert budget.wall_clock.total_seconds() > 0, name
 
