@@ -40,7 +40,7 @@ Quantified; each is protected by at least one fitness function in `GUARDRAILS.md
 
 ## 3. Technology decisions
 
-Full rationale for the load-bearing ones in `SPEC.md` §13 (D1–D8).
+Full rationale for the load-bearing ones in `SPEC.md` §13 (D1–D9).
 
 | Technology | Role | Why (one line) | Rejected |
 |---|---|---|---|

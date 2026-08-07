@@ -1,6 +1,6 @@
 # Steward — Technical Specification
 
-**Version:** 0.2 · **Status:** Draft for implementation · **Last updated:** 2026-08-06
+**Version:** 0.2 · **Status:** Draft for implementation · **Last updated:** 2026-08-08
 
 Companion documents: `ARCHITECTURE.md` (requirements, invariants, tech decisions — the authority), `GUARDRAILS.md` (fitness functions enforcing them). This spec details the component designs.
 
@@ -170,15 +170,27 @@ discover_schema ──► profile_table (×N, fan-out per table)
                                 └─► propose_quality_rules
 ```
 
-**That DAG is the target shape, not what `scan_source` plans today.** As shipped
-(issue #20) it plans **exactly one** task — the metadata scan — and the reason is
-a budget one: `RunPlan.task_specs` gives every planned task the *run's* budget,
-so an N-way fan-out lets a single run spend N times the cap the API published for
-it (I12). With one task the per-task cap the queue enforces *is* the run cap, so
-the advertised budget is the real bound. The fan-out above lands once run-level
-budget reservation does — accumulated `runs.used_*` checked against
-`runs.budget_*` by the runtime, which arrives with the agent loop H4's
-step/token/cost half measures (issue #37). No goal may fan out before then.
+**That DAG is the target shape, and fan-out is now permitted** (issue #48).
+Until it landed, every planned task carried the *run's* budget, so an N-way
+fan-out let a single run spend N times the cap the API published for it (I12) —
+which is why `scan_source` shipped as exactly one task (#20, #37). A plan now
+**divides** its run's budget instead: each `PlannedTask` declares its own
+`RunBudget`, and `GoalRegistration.plan` refuses the whole expansion —
+`RunBudgetExceeded`, before a run row or a task row exists — if those declared
+caps sum to more than the goal's budget in any dimension. What the API
+advertises for a run is therefore what its tasks may spend between them, not
+per branch. `scan_source` stays single-task by choice (one round trip already
+enumerates a schema, and convergence diffs the whole catalog at once), not by
+necessity; profiling (#49) is the fan-out this unblocked.
+
+The mechanism is *not* the one this section previously promised (accumulated
+`runs.used_*` compared against `runs.budget_*` by the runtime, arriving with the
+agent loop). Reservation at planning time is stricter and lands earlier: it
+refuses the plan rather than killing a task mid-run, needs no agent loop to
+exist, and leaves nothing enqueued to clean up. `runs.used_*` is still the
+accounting — the sum of what the run's succeeded tasks reported — and it stays
+inside `runs.budget_*` because the reservation bounded the caps and the runtime
+fails any task whose reported usage exceeds its own cap. See [D9](#13-key-design-decisions).
 
 - Tasks are rows in Postgres. Workers claim them with `SELECT ... FOR UPDATE SKIP LOCKED`, giving exactly-once *claiming* with at-least-once *execution* — so **every task handler must be idempotent** (all writes are upserts keyed on natural keys; indexing uses deterministic document IDs).
 - Task state machine: `pending → claimed → running → (succeeded | failed | dead)`. Failures retry with exponential backoff up to `max_attempts`; `dead` tasks page via alerting and can be replayed.
@@ -202,7 +214,7 @@ Budget guards, tool validation, and result typing run in *our* node wrappers aro
 Properties the runtime guarantees:
 
 - **Typed tools.** Every tool is a Python function with Pydantic input/output models; schemas are generated, arguments validated before execution, and validation errors are returned to the model as structured feedback (one retry) rather than crashing the run.
-- **Budgets are hard.** Per-task caps on steps, tokens, dollars (via LiteLLM cost tracking), and wall-clock. Exceeding a budget fails the task with a `budget_exceeded` error — visible in traces and metrics — never a silent truncation. Wall-clock is enforced by the worker rather than by the handler honouring it: the handler runs on its own thread and the loop holds the deadline, so the cap binds a handler that awaits, one blocked in the driver, and one blocked in Python alike ([D7](#13-key-design-decisions)).
+- **Budgets are hard, and they nest.** Per-task caps on steps, tokens, dollars (via LiteLLM cost tracking), and wall-clock, and those caps are *drawn from the run's* — a plan whose tasks reserve more than the run's budget is refused before anything is enqueued ([D9](#13-key-design-decisions)). Exceeding a budget fails the task with a `budget_exceeded` error — visible in traces and metrics — never a silent truncation. Wall-clock is enforced by the worker rather than by the handler honouring it: the handler runs on its own thread and the loop holds the deadline, so the cap binds a handler that awaits, one blocked in the driver, and one blocked in Python alike ([D7](#13-key-design-decisions)). Steps, tokens and cost are counted inside the handler and reported on its result, so they are enforced where they become visible: a succeeded result whose usage exceeds its task's cap is turned into a `budget_exceeded` failure and its usage is never rolled up. In-loop enforcement — stopping an agent at the step that *would* cross the cap — lands with the M1 agent loop; the check on the reported total is the outer fence and holds whatever the loop does.
 - **Checkpointing.** Agent state (message history + scratchpad) is persisted after every step. A worker dying mid-run (deploy, OOM, spot eviction) costs at most one step of progress.
 - **Structured results.** A task's terminal output must validate against the task type's result schema (the model is forced through a `submit_result` tool). Downstream tasks consume typed results, never prose.
 - **Least-privilege toolsets.** Each agent type gets an explicit allowlist of tools. The Classifier cannot run SQL; the Profiler cannot write catalog docs.
@@ -508,3 +520,18 @@ Enforcement is a runtime refusal rather than documentation, because the failure 
 *What it costs.* The hosted fallback chain is gone, and it was real resilience: when a model was unavailable, traffic moved to another provider. Redundancy has to replace diversity — each alias is served by two approved endpoints, so an outage is routed around inside the deployment, and an approved endpoint set with no redundancy is now an availability defect rather than a config preference. Model quality is bounded by what the deployment can serve, which is why B9 changes meaning: it used to prove that swapping providers works, and now proves the OSS binding is the *only* binding and still clears the eval gates. And an operator who genuinely needs a hosted model must amend (GUARDRAILS §7), not edit a values file — deliberately more expensive than the mistake it prevents.
 
 Rejected: ***hosted default with a self-hosted option*** — the status quo, and the reason this issue exists: the safe configuration was the one you had to remember, and nothing failed when you forgot. ***Documentation plus review*** — the diff that breaches this does not look like a breach; it is one plausible URL in a YAML file. ***A lint over the committed config alone*** — it would pass while a cluster mounts a different config, so the check has to live where the config is loaded; S9 runs the same code over the committed file as a fast gate, but the boot-time refusal is the actual enforcement. ***An egress NetworkPolicy alone*** — necessary (it lands with the M6 chart) and not sufficient: it cannot distinguish an approved endpoint from a proxy to a hosted one, and it fails closed at the wrong altitude, as a timeout during a run rather than a refusal at startup.
+
+**D9 — A run's budget is divided among its tasks at planning time, not handed to each of them.**
+Every planned task used to carry the *run's* whole budget, so a plan of N tasks could spend N times the cap the API published for that run — the reason `scan_source` shipped as exactly one task (#20, #37) and the reason profiling could not fan out at all (#48, #49). A plan now states how it divides the pot: each `PlannedTask` declares its own `RunBudget`, `GoalRegistration.plan` sums those declarations dimension-wise, and an expansion reserving more than the goal's budget in *any* dimension raises `RunBudgetExceeded`. That happens before a run id, a run row or a task row exists, so a plan nobody can afford leaves nothing behind — the same property #19 gave an unknown goal and #37 gave an empty plan, reached the same way. A goal whose own `sample_payload` cannot be afforded fails at import, because registration already runs the sample through `plan()`.
+
+*Why declaration rather than division.* An **equal split** needs no planner to say anything, and breaks immediately: `steps=1` over three tasks is zero steps each, and every task fails instantly against a cap of nothing. It is also wrong in principle for the DAG this exists to enable — `discover_schema` and `profile_table` do not cost the same, and a scheme that pretends they do forces the run budget up to N times the most expensive branch. **Sequential reservation with a remainder** (fund tasks in order until the pot is empty) was rejected for making the outcome depend on plan order and for turning "this plan is too expensive" into "the last few branches got less", which is a truncation wearing a reservation's clothes. Declaration puts the number where the knowledge is, at the one registration site per goal, and makes the check order-independent arithmetic.
+
+*Why refusal rather than truncation.* Shrinking the tasks that do not fit, or dropping them, produces a run that does less than the client asked for while the API reports 202. I12 requires exceeding a budget to be a typed, visible failure; a quietly shortened plan is neither. Refusing is also the cheaper failure — nothing is enqueued, so there is nothing to cancel, reclaim or explain.
+
+*The four dimensions, and what "enforced" means for each.* Steps, tokens and cost are reserved at planning time and checked again at runtime: a task whose reported usage exceeds its own cap is recorded as `budget_exceeded` and its usage is never rolled up, so `runs.used_*` cannot be walked past `runs.budget_*` one task at a time. That runtime check is the *outer* fence; stopping an agent at the step that would cross its cap is in-loop enforcement and lands with the M1 agent loop, which is what H4's step/token/cost half measures. Wall-clock is reserved the same way and enforced by the worker's deadline (D7), unchanged.
+
+*What summed wall-clock means, precisely.* Reserved wall-clock is **aggregate task time**, not a run's elapsed duration. Two tasks running at once on two workers cost two tasks' worth of budget while the clock on the wall advances once, so the reservation is exactly right for serial execution and an over-estimate for parallel — deliberately, because the alternative (reserve the *maximum* task wall-clock rather than the sum) leaves `runs.used_wall_clock`, which is a sum, legitimately exceeding `runs.budget_wall_clock`: the advertised number stops bounding the recorded one, which is this defect in a different costume. The cost is that a wide fan-out has to advertise a wall-clock budget it will not use up in real time. Accepted, and it is the conservative direction. Measured wall-clock usage is a separate matter and still deferred: both registered handlers report zero, because H1 compares a handler's result byte for byte across two executions and a real duration differs between them by construction (`_scan_usage`). So `used_wall_clock` is not yet a measurement of anything; the enforcement that matters is the runtime's deadline, which does not depend on it.
+
+*Where the bound stops.* Reservation counts each task **once**, so the run's budget bounds one pass of the plan. A task that fails and retries executes again under its own cap, and that spend is neither reserved nor recorded — the failure path carries no usage to record, so `runs.used_*` counts succeeded tasks only and is a lower bound on real consumption (bounded above by `max_attempts` × the reservation). Multiplying the reservation by `max_attempts` was rejected: it would triple every advertised budget to defend a claim the accounting cannot see, and retry spend exceeding the advertised cap is a property single-task runs already had rather than something fan-out introduces. Closing it properly means carrying usage on the failure path, which is a change to `tasks.fail`'s contract and belongs with the agent loop that will make the numbers non-trivial. One smaller conservatism in the same direction: two planned tasks with identical type and payload reserve twice but dedupe to one row at enqueue, so such a plan reserves more than it can spend.
+
+Rejected also: ***run-level enforcement at execution time*** — comparing accumulated `runs.used_*` against `runs.budget_*` as each task finishes, which is what SPEC §3.1 originally promised. It arrives too late to be a refusal (the tasks are enqueued and some have already run), it turns "this plan is unaffordable" into "the last tasks of this run fail for reasons the first ones caused", and it needs a lock on the run row on every terminal transition. It is also strictly weaker: reservation makes the overrun unrepresentable, so there is nothing left for the run-level check to catch except a handler lying about its usage — which is exactly what the per-task check above covers, one task earlier and with a failure that names the task that caused it.
