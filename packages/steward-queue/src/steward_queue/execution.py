@@ -58,9 +58,18 @@ one task's failure and is reported as an `_Executed`, never as an exception on
 the future. The loop reads that future from inside its poll loop, so an
 exception on it is a worker killed by one task: #45, reached in practice by a
 handler connection that could not be opened once #42 doubled the connections a
-task holds. Only a `BaseException` that is not an `Exception` still travels,
-because `SystemExit`, `KeyboardInterrupt` and cancellation are the process
-ending rather than a task failing.
+task holds. Exactly two things still travel -- `SystemExit` and
+`KeyboardInterrupt`, which are the process ending rather than a task failing.
+
+Cancellation is not one of them. The handler gets an event loop of its own
+(`asyncio.run` below), so a `CancelledError` escaping it -- an inner `wait_for`
+or `TaskGroup` a handler leaked, which is a routine bug once handlers await the
+gateway -- says nothing about the worker's loop or the process; treating it as
+fatal let one buggy handler kill the worker (#55). It is task-scoped, and it is
+classified like any other raise. The trade in the other direction is real and
+recorded in SPEC.md §13 D7: `MemoryError` and an fd-exhausted `OSError` *are*
+`Exception`s, so a degraded worker files them as its task's failure and keeps
+claiming.
 
 An outcome the thread could not write reaches the loop as `recorded=False`, and
 the handoff decides whether the loop may write it instead. That covers a thread
@@ -215,15 +224,39 @@ def _consume(finished: asyncio.Future[_Executed]) -> None:
         finished.exception()
 
 
+class _WallClockExpired(Exception):
+    """The cap's own timeout, told apart from every other `TimeoutError`.
+
+    Since 3.11 `socket.timeout`, `asyncio.TimeoutError` and the `OSError`
+    subclass are one class, so a customer database's `connect_timeout` firing
+    five seconds into a half-hour budget arrives at `_classify` as the same type
+    an overrun does. Raised only by `_bounded`, and only when the cap it set is
+    the thing that fired, so the type is evidence rather than a guess (#57).
+
+    An `Exception`, deliberately: `_run_handler` answers for `Exception`, and a
+    sentinel outside that is #55 with a different name.
+    """
+
+
 async def _bounded(coro: Awaitable[TaskResult], budget: timedelta) -> TaskResult:
     """Run a handler under its wall-clock cap, on the thread's own event loop.
 
     This is the cheap half of enforcement and it only reaches handlers that
     await. The expensive half -- a handler that never yields -- is the loop's
     deadline, which does not depend on the handler cooperating at all.
+
+    A `TimeoutError` leaving here is re-raised as itself unless `asyncio.timeout`
+    reports that it expired -- the handler's own timeouts are the handler's, and
+    only the cap's is the cap's.
     """
-    async with asyncio.timeout(budget.total_seconds()):
-        return await coro
+    cap = asyncio.timeout(budget.total_seconds())
+    try:
+        async with cap:
+            return await coro
+    except TimeoutError as exc:
+        if not cap.expired():
+            raise
+        raise _WallClockExpired(f"wall-clock cap of {budget} reached") from exc
 
 
 def spawn(
@@ -288,18 +321,21 @@ def _execute_in_thread(
     worker and leaving its task `running` for a budget-length lease.
 
     The exception becomes this task's typed failure instead, unrecorded, for
-    the loop to settle. A `BaseException` that is not an `Exception` still
-    travels: the process is ending, and dressing that up as a failed task would
-    hide a shutdown as a data point.
+    the loop to settle. `SystemExit` and `KeyboardInterrupt` still travel: the
+    process is ending, and dressing that up as a failed task would hide a
+    shutdown as a data point. They are named, rather than reached by asking
+    whether the exception is an `Exception`, because that question has a third
+    answer -- `asyncio.CancelledError` -- which is task-scoped here and killed
+    the worker while it was grouped with the other two (#55).
     """
     try:
         future.set_result(_run_handler(dsn, task, registration, handoff, record))
-    except Exception as exc:
+    except (SystemExit, KeyboardInterrupt) as exc:
+        future.set_exception(exc)
+    except BaseException as exc:
         detail = f"{type(exc).__name__}: {exc}"
         failure = _Executed(error=_problem(EXECUTION_FAILED, detail), lost_claim=False, recorded=False)
         future.set_result(failure)
-    except BaseException as exc:
-        future.set_exception(exc)
 
 
 def _run_handler(
@@ -317,7 +353,10 @@ def _run_handler(
 
     `asyncio.run` gives the handler an event loop of its own. Handlers stay
     `async def` (M1+ awaits the LLM gateway from them) and a handler that
-    blocks now blocks only this thread.
+    blocks now blocks only this thread. That loop is also why a `CancelledError`
+    out of `asyncio.run` is caught here with everything else: it was raised on a
+    loop nobody outside this frame can reach, so it is one handler's bug and not
+    a signal about the worker (#55).
     """
     budget = task.spec.budget.wall_clock
     conn = connect(dsn, statement_timeout=budget)
@@ -327,7 +366,7 @@ def _run_handler(
         started = time.monotonic()
         try:
             result = asyncio.run(_bounded(registration.fn(ctx), budget))
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             outcome: TaskResult | ProblemDetails = _classify(
                 exc, task.spec.budget, time.monotonic() - started
             )
@@ -348,15 +387,24 @@ def _run_handler(
         conn.close()
 
 
-def _classify(exc: Exception, budget: RunBudget, elapsed: float) -> ProblemDetails:
+def _classify(exc: BaseException, budget: RunBudget, elapsed: float) -> ProblemDetails:
     """Name the failure a handler ended on -- overrun, or genuine fault.
 
-    Anything raised at or past the cap is the cap: a driver-blocked handler
-    surfaces its overrun as the connection's `QueryCanceled`, and reporting
-    that as "handler raised" would hide the one failure mode I12 exists to
-    make visible. Below the cap the exception is the handler's own.
+    Two shapes are the cap, and each is recognised by what it can offer.
+    `_WallClockExpired` is the in-band one: `_bounded` raises it only when the
+    timeout *it* set fired, so the type is proof. A driver-blocked handler has
+    no such signal -- its overrun arrives as the connection's `QueryCanceled`,
+    which is what a cancelled statement always looks like -- so it is recognised
+    by the clock, and reporting it as "handler raised" would hide the one
+    failure mode I12 exists to make visible.
+
+    What is deliberately *not* here is `isinstance(exc, TimeoutError)`. Since
+    3.11 that is also `socket.timeout`, so it filed an unreachable customer
+    database as `budget_exceeded` against a cap nothing had approached: an
+    operator sent to the budget instead of the host, and an H4 assertion a
+    non-budget failure could satisfy (#57).
     """
-    if isinstance(exc, TimeoutError) or elapsed >= budget.wall_clock.total_seconds():
+    if isinstance(exc, _WallClockExpired) or elapsed >= budget.wall_clock.total_seconds():
         return _budget_exceeded(budget)
     return _problem(HANDLER_FAILED, f"{type(exc).__name__}: {exc}")
 
