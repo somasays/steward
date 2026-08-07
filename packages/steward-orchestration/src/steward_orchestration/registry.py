@@ -17,9 +17,18 @@ worker executes. Everything that turns one into the other is declared here, at
 4. **Allowed task types.** The planner's least-privilege list. Planning a type
    outside it raises `DisallowedTaskType` -- checked on every expansion, not
    reviewed by convention (SPEC.md §3.2's least-privilege rule, applied one
-   level up).
+   level up). A planner that expands to no tasks at all raises `EmptyRunPlan`
+   instead: nothing would ever move the run out of `pending`, since only task
+   completion drives the rollup, so a plan of zero tasks is a planner bug, not
+   a valid expansion.
 5. **Budget.** The caps a run of this goal is admitted under. Required, with no
    default: a goal whose runs have no hard limits is unrepresentable (I12).
+6. **Sample payload.** A payload valid against the goal's own schema, required
+   the same way `steward_queue.task_handler`'s `sample_payload` is. It is the
+   fixed point ARCHITECTURE §4's "planners are deterministic and pure" is
+   checked against: `tests/test_goals.py` runs every registered planner twice
+   on its sample payload and asserts equal output, so a planner that calls
+   `uuid4()` or reads the clock fails the moment it registers, not by review.
 
 Where this lives is a decision, not an accident. Planners do not belong in
 `steward-agents` (that package is the LangGraph-contained execution runtime,
@@ -121,6 +130,24 @@ class DisallowedTaskType(RuntimeError):
         self.allowed = allowed
 
 
+class EmptyRunPlan(RuntimeError):
+    """A planner returned no tasks at all.
+
+    A programming error, not a client error, for the same reason
+    `DisallowedTaskType` is one: the request was valid and the goal exists,
+    the planner just failed to name any work. Filtering it quietly would be
+    worse than raising -- a run with no tasks has nothing a worker can claim,
+    and only a task completing ever triggers the rollup that moves a run out
+    of `pending`, so it would sit there forever. Raised (like
+    `DisallowedTaskType`) before the run is created, so no such run is ever
+    persisted.
+    """
+
+    def __init__(self, goal: str) -> None:
+        super().__init__(f"goal {goal!r} planned zero tasks")
+        self.goal = goal
+
+
 @dataclass(frozen=True, slots=True)
 class RunPlan:
     """A validated, expanded, allowlist-checked plan for one run.
@@ -170,6 +197,7 @@ class GoalRegistration[P: GoalParams]:
     planner: Planner[P]
     allowed_task_types: frozenset[str]
     budget: RunBudget
+    sample_payload: Mapping[str, Any]
 
     def validate(self, payload: Mapping[str, Any]) -> P:
         """`payload` as this goal's typed params, or `InvalidGoalPayload`."""
@@ -179,15 +207,18 @@ class GoalRegistration[P: GoalParams]:
             raise InvalidGoalPayload(self.goal, exc) from exc
 
     def plan(self, payload: Mapping[str, Any]) -> RunPlan:
-        """Validate `payload`, expand it, and check the expansion's privilege.
+        """Validate `payload`, expand it, and check the expansion's shape.
 
-        The allowlist is enforced here rather than at the enqueue call because
-        this is the only path from a planner's output to a `TaskSpec` -- a
-        planner has no other way to reach the queue, so "cannot enqueue outside
-        its allowlist" is a property of the code, not of reviewer attention.
+        A planner that names zero tasks raises `EmptyRunPlan`; one that names
+        a task type outside its allowlist raises `DisallowedTaskType`. Both
+        checks happen here, the only path from a planner's output to a
+        `TaskSpec`, so neither failure mode is a property of reviewer
+        attention -- it cannot reach the queue by any route.
         """
         params = self.validate(payload)
         tasks = tuple(self.planner(params))
+        if not tasks:
+            raise EmptyRunPlan(self.goal)
         for task in tasks:
             if task.task_type not in self.allowed_task_types:
                 raise DisallowedTaskType(self.goal, task.task_type, self.allowed_task_types)
@@ -214,6 +245,7 @@ def goal[P: GoalParams](
     params_model: type[P],
     allowed_task_types: Sequence[str],
     budget: RunBudget,
+    sample_payload: Mapping[str, Any],
 ) -> Callable[[Planner[P]], Planner[P]]:
     """Register `name`'s planner. See this module's registration contract.
 
@@ -223,6 +255,11 @@ def goal[P: GoalParams](
     somewhere else. `params_model` binds the planner's parameter type, so a
     planner that does not take exactly this goal's params fails `mypy --strict`
     at the registration site rather than at runtime on a client's request.
+
+    `sample_payload` has no default, the same way `allowed_task_types` and
+    `budget` do not: a goal cannot be registered without one, so the
+    determinism check in `tests/test_goals.py` always has a subject and a new
+    goal cannot opt out of it by omission.
     """
 
     def register(planner: Planner[P]) -> Planner[P]:
@@ -236,6 +273,7 @@ def goal[P: GoalParams](
             planner=planner,
             allowed_task_types=frozenset(allowed_task_types),
             budget=budget,
+            sample_payload=dict(sample_payload),
         )
         return planner
 
@@ -259,9 +297,10 @@ def plan_run(name: str, payload: Mapping[str, Any]) -> RunPlan:
     """The plan for `name` and `payload` -- the admission decision, whole.
 
     Raises `UnknownGoal` or `InvalidGoalPayload` for a request that must not
-    become a run, and `DisallowedTaskType` for a planner that exceeded its
-    privilege. Callers create the run only after this returns, which is what
-    makes "no run row for a rejected request" structural rather than an
+    become a run, `DisallowedTaskType` for a planner that exceeded its
+    privilege, and `EmptyRunPlan` for a planner that named no work at all
+    (issue #37). Callers create the run only after this returns, which is
+    what makes "no run row for a rejected request" structural rather than an
     ordering a route handler has to remember (issue #19).
     """
     return get_goal(name).plan(payload)
