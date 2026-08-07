@@ -13,7 +13,8 @@ The moving parts, one module per aggregate behind this façade:
 * `runs` -- creation with an idempotency key, status, and spend against the
   run's budget.
 * `checkpoints` -- agent state persisted between steps.
-* `audit` -- the audit row each of those writes on its own connection (I7).
+* `audit` -- the audit row each of those writes on the mutation's own
+  connection, inside the mutation's transaction (I7).
 * `registry` -- task type -> handler, with the contract handlers sign
   (idempotence, sample payload, state probe). The H1 harness iterates it, so
   new handlers are leashed on registration.
