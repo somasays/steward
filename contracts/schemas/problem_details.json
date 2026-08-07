@@ -1,0 +1,51 @@
+{
+  "additionalProperties": true,
+  "description": "A machine-readable error, per RFC 9457 (obsoletes RFC 7807).\n\nDeviates from the package's usual `extra=\"forbid\"` (see `_base.SchemaModel`)\nby design: RFC 9457 defines problem types as extensible with additional\nmembers beyond `type`/`title`/`status`/`detail`/`instance`, and Steward's\nAPI surface uses that \u2014 e.g. a `budget_exceeded` problem carries the\n`RunBudget` that was exceeded as an extension member. Still frozen:\nan error value is a fact about what happened, not something to mutate.",
+  "properties": {
+    "detail": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Detail"
+    },
+    "instance": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Instance"
+    },
+    "status": {
+      "maximum": 599,
+      "minimum": 100,
+      "title": "Status",
+      "type": "integer"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "type": {
+      "default": "about:blank",
+      "title": "Type",
+      "type": "string"
+    }
+  },
+  "required": [
+    "title",
+    "status"
+  ],
+  "title": "ProblemDetails",
+  "type": "object"
+}

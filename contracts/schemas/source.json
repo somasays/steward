@@ -1,0 +1,72 @@
+{
+  "$defs": {
+    "SourceEngine": {
+      "description": "Database engines Steward can connect to (SPEC.md \u00a72 system diagram).",
+      "enum": [
+        "postgres",
+        "mysql",
+        "snowflake"
+      ],
+      "title": "SourceEngine",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A connection registration. Never carries a raw DSN or credential\n(I5, N7, I4's neighbor \"no credentials in git\") \u2014 only a reference into\nthe secret store the deployment configures.",
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "dsn_secret_ref": {
+      "title": "Dsn Secret Ref",
+      "type": "string"
+    },
+    "engine": {
+      "$ref": "#/$defs/SourceEngine"
+    },
+    "id": {
+      "format": "uuid",
+      "title": "Id",
+      "type": "string"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "scan_schedule": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Scan Schedule"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "workspace_id": {
+      "format": "uuid",
+      "title": "Workspace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "workspace_id",
+    "name",
+    "engine",
+    "dsn_secret_ref",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "Source",
+  "type": "object"
+}

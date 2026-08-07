@@ -1,0 +1,20 @@
+{
+  "additionalProperties": false,
+  "description": "`POST /v1/runs` request body: the goal to execute and its parameters.\n\n`goal` names a well-known goal (e.g. \"scan_source\", SPEC.md \u00a73.1);\nvalidated by the orchestrator, not this generic API-facing contract --\nmirrors `TaskSpec.payload` (`steward_schemas.task`) for the same reason:\nper-goal parameter shapes land with the goals themselves.",
+  "properties": {
+    "goal": {
+      "title": "Goal",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    }
+  },
+  "required": [
+    "goal"
+  ],
+  "title": "RunCreate",
+  "type": "object"
+}

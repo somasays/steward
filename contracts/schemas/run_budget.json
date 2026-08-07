@@ -1,0 +1,42 @@
+{
+  "additionalProperties": false,
+  "description": "Hard caps on one bounded agent run or task.\n\nAlso reused by `TaskResult.usage` to report what was actually consumed\n(ARCHITECTURE.md I12; SPEC.md \u00a73.2) \u2014 same shape, no separate type needed\nfor \"amount spent\" vs. \"amount allowed\".",
+  "properties": {
+    "cost_usd": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        }
+      ],
+      "title": "Cost Usd"
+    },
+    "steps": {
+      "minimum": 0,
+      "title": "Steps",
+      "type": "integer"
+    },
+    "tokens": {
+      "minimum": 0,
+      "title": "Tokens",
+      "type": "integer"
+    },
+    "wall_clock": {
+      "format": "duration",
+      "title": "Wall Clock",
+      "type": "string"
+    }
+  },
+  "required": [
+    "steps",
+    "tokens",
+    "cost_usd",
+    "wall_clock"
+  ],
+  "title": "RunBudget",
+  "type": "object"
+}

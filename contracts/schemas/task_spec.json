@@ -1,0 +1,86 @@
+{
+  "$defs": {
+    "RunBudget": {
+      "additionalProperties": false,
+      "description": "Hard caps on one bounded agent run or task.\n\nAlso reused by `TaskResult.usage` to report what was actually consumed\n(ARCHITECTURE.md I12; SPEC.md \u00a73.2) \u2014 same shape, no separate type needed\nfor \"amount spent\" vs. \"amount allowed\".",
+      "properties": {
+        "cost_usd": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Cost Usd"
+        },
+        "steps": {
+          "minimum": 0,
+          "title": "Steps",
+          "type": "integer"
+        },
+        "tokens": {
+          "minimum": 0,
+          "title": "Tokens",
+          "type": "integer"
+        },
+        "wall_clock": {
+          "format": "duration",
+          "title": "Wall Clock",
+          "type": "string"
+        }
+      },
+      "required": [
+        "steps",
+        "tokens",
+        "cost_usd",
+        "wall_clock"
+      ],
+      "title": "RunBudget",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "What the orchestrator hands a worker to execute one bounded agent\nloop (SPEC.md \u00a73.2). `payload` is intentionally opaque JSON: task types\nare open-ended (defined by each agent's task registry, M1+), and this\ncontract is the generic queue seam they all share \u2014 the task-type-specific\nshape is validated by the handler, not here.",
+  "properties": {
+    "budget": {
+      "$ref": "#/$defs/RunBudget"
+    },
+    "max_attempts": {
+      "title": "Max Attempts",
+      "type": "integer"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "run_id": {
+      "format": "uuid",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "task_id": {
+      "format": "uuid",
+      "title": "Task Id",
+      "type": "string"
+    },
+    "task_type": {
+      "title": "Task Type",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_id",
+    "run_id",
+    "task_type",
+    "payload",
+    "budget",
+    "max_attempts"
+  ],
+  "title": "TaskSpec",
+  "type": "object"
+}

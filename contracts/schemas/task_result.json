@@ -1,0 +1,153 @@
+{
+  "$defs": {
+    "ProblemDetails": {
+      "additionalProperties": true,
+      "description": "A machine-readable error, per RFC 9457 (obsoletes RFC 7807).\n\nDeviates from the package's usual `extra=\"forbid\"` (see `_base.SchemaModel`)\nby design: RFC 9457 defines problem types as extensible with additional\nmembers beyond `type`/`title`/`status`/`detail`/`instance`, and Steward's\nAPI surface uses that \u2014 e.g. a `budget_exceeded` problem carries the\n`RunBudget` that was exceeded as an extension member. Still frozen:\nan error value is a fact about what happened, not something to mutate.",
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "instance": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Instance"
+        },
+        "status": {
+          "maximum": 599,
+          "minimum": 100,
+          "title": "Status",
+          "type": "integer"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "type": {
+          "default": "about:blank",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "status"
+      ],
+      "title": "ProblemDetails",
+      "type": "object"
+    },
+    "RunBudget": {
+      "additionalProperties": false,
+      "description": "Hard caps on one bounded agent run or task.\n\nAlso reused by `TaskResult.usage` to report what was actually consumed\n(ARCHITECTURE.md I12; SPEC.md \u00a73.2) \u2014 same shape, no separate type needed\nfor \"amount spent\" vs. \"amount allowed\".",
+      "properties": {
+        "cost_usd": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Cost Usd"
+        },
+        "steps": {
+          "minimum": 0,
+          "title": "Steps",
+          "type": "integer"
+        },
+        "tokens": {
+          "minimum": 0,
+          "title": "Tokens",
+          "type": "integer"
+        },
+        "wall_clock": {
+          "format": "duration",
+          "title": "Wall Clock",
+          "type": "string"
+        }
+      },
+      "required": [
+        "steps",
+        "tokens",
+        "cost_usd",
+        "wall_clock"
+      ],
+      "title": "RunBudget",
+      "type": "object"
+    },
+    "TaskStatus": {
+      "description": "Terminal states of a task execution (SPEC.md \u00a73.1 state machine:\n\"pending -> claimed -> running -> (succeeded | failed | dead)\"). Only the\nterminal outcomes of one execution attempt are represented here; queue\nbookkeeping (`pending`/`claimed`/`running`, `attempts`, `claimed_by`) is\nthe task queue's concern, not this result contract's.",
+      "enum": [
+        "succeeded",
+        "failed",
+        "dead"
+      ],
+      "title": "TaskStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The typed, terminal output of one task execution (SPEC.md \u00a73.2:\n\"a task's terminal output must validate against the task type's result\nschema\"). `output` is generic JSON at this layer for the same reason as\n`TaskSpec.payload` \u2014 per-task-type result schemas (TableProfile, AssetDoc,\n...) land with their agents in M1+.",
+  "properties": {
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProblemDetails"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "output": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Output"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskStatus"
+    },
+    "task_id": {
+      "format": "uuid",
+      "title": "Task Id",
+      "type": "string"
+    },
+    "usage": {
+      "$ref": "#/$defs/RunBudget"
+    }
+  },
+  "required": [
+    "task_id",
+    "status",
+    "usage"
+  ],
+  "title": "TaskResult",
+  "type": "object"
+}

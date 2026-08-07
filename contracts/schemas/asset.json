@@ -1,0 +1,73 @@
+{
+  "$defs": {
+    "AssetLifecycle": {
+      "description": "SPEC.md \u00a77: \"lifecycle: active|missing|deprecated\".",
+      "enum": [
+        "active",
+        "missing",
+        "deprecated"
+      ],
+      "title": "AssetLifecycle",
+      "type": "string"
+    },
+    "AssetType": {
+      "enum": [
+        "table",
+        "view"
+      ],
+      "title": "AssetType",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A table or view discovered by scanning a `Source`.",
+  "properties": {
+    "asset_type": {
+      "$ref": "#/$defs/AssetType"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "fqn": {
+      "title": "Fqn",
+      "type": "string"
+    },
+    "id": {
+      "format": "uuid",
+      "title": "Id",
+      "type": "string"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/AssetLifecycle"
+    },
+    "source_id": {
+      "format": "uuid",
+      "title": "Source Id",
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "workspace_id": {
+      "format": "uuid",
+      "title": "Workspace Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "workspace_id",
+    "source_id",
+    "fqn",
+    "asset_type",
+    "lifecycle",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "Asset",
+  "type": "object"
+}
