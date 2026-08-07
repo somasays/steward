@@ -20,7 +20,7 @@ lint:               ## G1
 	uv run ruff check . && uv run ruff format --check .
 
 type:               ## G2
-	uv run mypy --strict packages
+	uv run mypy --strict packages services
 
 test:               ## G3
 	uv run pytest -q -m "not acceptance" --cov=packages --cov-branch --cov-fail-under=85

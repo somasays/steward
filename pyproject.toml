@@ -129,9 +129,14 @@ mypy_path = [
     "packages/steward-retrieval/src",
     "packages/steward-sdk/src",
     "packages/steward-telemetry/src",
+    "services/api/src",
+    "services/workers/src",
 ]
-# Per-package tests share the basename test_smoke.py across sibling packages;
-# they're exercised by pytest (H3), not by strict typing.
+# Per-member tests share basenames across siblings (e.g. test_smoke.py in packages,
+# conftest.py in packages and services); they're exercised by pytest (H3), not strict
+# typing. mypy_path lists each member's src/ explicitly (packages and services alike)
+# so sibling modules with identical relative paths resolve to distinct dotted names
+# instead of colliding under implicit namespace packages (issue #17).
 exclude = "(^|/)tests/"
 
 [tool.pytest.ini_options]

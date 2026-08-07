@@ -77,7 +77,7 @@ Datasets live in Langfuse; runnable identically on a laptop and CI (`steward eva
 | ID | Check | Mechanism |
 |----|-------|-----------|
 | G1 | Lint & format | ruff check + format --check |
-| G2 | Strict types | mypy --strict on `packages/` (this is also what turns typed-contract conventions (I3, I6-by-construction) into compile-time enforcement) |
+| G2 | Strict types | mypy --strict on `packages/` and `services/` in one invocation — each member's `src/` is listed in `mypy_path` (with `explicit_package_bases`) so sibling modules with identical relative paths resolve to distinct dotted names instead of colliding (this is also what turns typed-contract conventions (I3, I6-by-construction) into compile-time enforcement) |
 | G3 | Tests & coverage | pytest, branch coverage ≥ 85% on `packages/` |
 | G4 | Secret scan | gitleaks — full history in the CI `gitleaks` job (hard gate); staged diff (`gitleaks protect --staged`) as a pre-commit pass-through when gitleaks is installed locally, otherwise the hook prints an install hint and continues. `make fitness` runs a repo-wide `gitleaks detect` when the binary is available, and reports `SKIP` (never a false `PASS`) when it isn't |
 | G5 | Commit discipline | commit-msg hook: Conventional Commits; feat/fix/refactor/perf must reference an issue (custom: issue-ref rule is project policy) |
@@ -142,7 +142,7 @@ Not everything reduces to a check. The `architecture-guardian` subagent and huma
 
 ## 5. Enforcement status
 
-Active now: S1, S3–S7 (S1/S3 tool-backed: import-linter + ruff; S4–S7 stdlib), H1, H3, H4 (wall-clock; step/token/cost with the M1 agent loop), H11 (M0 exit criterion), G1–G5. S2 skips until there is a runtime to bound. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced in the meantime: I6 (until masking lands, M1) and the span-tree half of I7/H6 (until the M1 agent loop) — the `architecture-guardian`'s explicit responsibility.
+Active now: S1, S3–S7 (S1/S3 tool-backed: import-linter + ruff; S4–S7 stdlib), H1, H3, H4 (wall-clock; step/token/cost with the M1 agent loop), H11 (M0 exit criterion), G1–G5 (G2 covers `packages/` and `services/` in one `--strict` invocation, issue #17). S2 skips until there is a runtime to bound. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced in the meantime: I6 (until masking lands, M1) and the span-tree half of I7/H6 (until the M1 agent loop) — the `architecture-guardian`'s explicit responsibility.
 
 ## 6. Amendment process
 
