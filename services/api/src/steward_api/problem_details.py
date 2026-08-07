@@ -52,6 +52,21 @@ def not_found(detail: str, *, instance: str | None = None) -> ProblemDetailsErro
     )
 
 
+def bad_request(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `400 Bad Request` problem, e.g. a pagination cursor this API never
+    issued. 400 rather than 422: the cursor is not a field whose *value* is out
+    of range, it is a token the client should only ever be echoing back."""
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:bad-request",
+            title="Malformed request",
+            status=status.HTTP_400_BAD_REQUEST,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
 def conflict(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
     """A `409 Conflict` problem, e.g. an idempotency key reused for a
     different request body."""

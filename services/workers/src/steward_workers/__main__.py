@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import signal
 import socket
 import uuid
 
-from steward_queue import DSN_ENV, Worker
+import steward_catalog  # noqa: F401 -- imported for its side effect: registers `scan_source`
+from steward_queue import DSN_ENV, Worker, registered_types
 from steward_telemetry import tracer_from_env
 
 WORKER_ID_ENV = "STEWARD_WORKER_ID"
@@ -52,10 +54,18 @@ async def run(worker: Worker) -> None:
 
 
 def main() -> None:
+    """Start a worker for every handler this process has.
+
+    `Worker` snapshots the registry when it is constructed, so the packages
+    whose handlers this process should execute must be imported before that --
+    hence the side-effecting import above, and the log line that makes the
+    resulting claim list visible rather than something to infer from silence.
+    """
     dsn = os.environ.get(DSN_ENV, "").strip()
     if not dsn:
         raise SystemExit(f"{DSN_ENV} is not set")
     worker_id = os.environ.get(WORKER_ID_ENV, "").strip() or default_worker_id()
+    logging.getLogger(__name__).info("worker %s claims %s", worker_id, ", ".join(registered_types()))
     asyncio.run(run(Worker(dsn, worker_id, tracer=tracer_from_env())))
 
 

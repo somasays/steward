@@ -14,6 +14,7 @@ from steward_queue import DSN_ENV
 from steward_telemetry import tracer_from_env
 
 from steward_api.app import create_app
+from steward_api.catalog import PostgresCatalogStore
 from steward_api.store import PostgresRunStore
 
 DEFAULT_HOST = "0.0.0.0"  # noqa: S104 -- containers bind all interfaces; exposure is the NetworkPolicy's job
@@ -31,8 +32,9 @@ def main() -> None:
     dsn = os.environ.get(DSN_ENV, "").strip()
     if not dsn:
         raise SystemExit(f"{DSN_ENV} is not set")
-    store = PostgresRunStore(dsn, tracer=tracer_from_env())
-    uvicorn.run(create_app(store), host=DEFAULT_HOST, port=DEFAULT_PORT)
+    tracer = tracer_from_env()
+    app = create_app(PostgresRunStore(dsn, tracer=tracer), PostgresCatalogStore(dsn, tracer=tracer))
+    uvicorn.run(app, host=DEFAULT_HOST, port=DEFAULT_PORT)
 
 
 if __name__ == "__main__":
