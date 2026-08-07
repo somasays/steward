@@ -283,7 +283,7 @@
                 }
               }
             },
-            "description": "Validation error"
+            "description": "Malformed body, unknown goal, or a payload the goal's schema rejects"
           }
         },
         "summary": "Create Run",

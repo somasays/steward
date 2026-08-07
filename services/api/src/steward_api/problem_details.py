@@ -10,10 +10,13 @@ build a JSON error body by hand.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic_core import ErrorDetails
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from steward_schemas import ProblemDetails
 
@@ -51,6 +54,47 @@ def conflict(detail: str, *, instance: str | None = None) -> ProblemDetailsError
             status=status.HTTP_409_CONFLICT,
             detail=detail,
             instance=instance,
+        )
+    )
+
+
+def unknown_goal(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `422` problem for a `goal` no planner is registered for (issue #19).
+
+    422 rather than 404: the request reached the right resource, its body just
+    does not describe anything the system can run -- the same class of failure
+    as a field of the wrong type, which FastAPI already answers 422.
+    """
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:unknown-goal",
+            title="Unknown goal",
+            status=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
+def invalid_goal_payload(
+    detail: str, errors: Sequence[ErrorDetails], *, instance: str | None = None
+) -> ProblemDetailsError:
+    """A `422` problem for a payload that does not match its goal's schema.
+
+    `errors` is the same RFC 9457 extension member the generic request
+    validation handler below uses, carrying pydantic's per-field detail: a
+    client gets told which parameter is wrong, not just that one is.
+    """
+    return ProblemDetailsError(
+        ProblemDetails.model_validate(
+            {
+                "type": "urn:steward:invalid-goal-payload",
+                "title": "Goal payload failed validation",
+                "status": status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "detail": detail,
+                "instance": instance,
+                "errors": jsonable_encoder(errors),
+            }
         )
     )
 

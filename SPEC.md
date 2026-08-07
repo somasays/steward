@@ -130,6 +130,7 @@ The repo is a `uv` workspace with independently importable packages — the same
 packages/
   steward-schemas/     # Pydantic models: API contracts, tool I/O, events (zero heavy deps)
   steward-queue/       # Postgres task queue: migrations, transactional enqueue, SKIP LOCKED claiming, worker loop
+  steward-orchestration/ # Goal registry + deterministic planners: name, input schema, planner, allowed task types, budget
   steward-agents/      # Agent runtime: owned contracts (tools, budgets, results); LangGraph contained here
   steward-retrieval/   # Hybrid search client: Qdrant + ES + fusion + rerank
   steward-llm/         # Thin LiteLLM client wrapper: typed completions, structured output helpers
@@ -152,8 +153,8 @@ The runtime has two layers with different ownership rules (see [D1](#13-key-desi
 
 ### 3.1 Execution model: planner / worker
 
-- A **run** is created from a goal (e.g. `scan_source(source_id)`, `answer(question)`).
-- The **planner** (deterministic code for well-known goals; LLM-planned only for `ask` runs) expands the goal into a **task DAG**. Example for `scan_source`:
+- A **run** is created from a goal (e.g. `scan_source(source_id)`, `answer(question)`). Goals are registered, one site each, in `steward-orchestration`: name, typed input schema, planner, allowed task types, budget policy. The API validates the request against that registration before a run row exists — an unknown goal or a payload the schema rejects is problem-details, not a run (issue #19).
+- The **planner** (deterministic code for well-known goals; LLM-planned only for `ask` runs) expands the goal into a **task DAG**, and may only name task types its registration allows. Example for `scan_source`:
 
 ```
 discover_schema ──► profile_table (×N, fan-out per table)

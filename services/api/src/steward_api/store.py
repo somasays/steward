@@ -15,6 +15,11 @@ Two implementations, and the difference is not "fake vs real" but *scope*:
   layers can be tested without a database. It is process-local and forgets
   everything on restart -- it is not a deployment option.
 
+Both admit a run the same way, through `steward_orchestration.plan_run`: the
+goal registry decides whether a request is a run at all, what it expands to,
+and what it may spend. Neither store knows what a goal means, and neither one
+holds a default budget any more (issue #19).
+
 The queue's functions are synchronous and caller-transactional on purpose:
 that is what makes I8 structural rather than a convention. Rather than make
 the queue async and lose it, the async boundary is bridged here with
@@ -29,32 +34,16 @@ from decimal import Decimal
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from steward_orchestration import RunPlan, plan_run
 from steward_queue import (
-    NOOP_TASK_TYPE,
     RunRecord,
     connect,
     create_run,
     enqueue,
     get_run,
 )
-from steward_schemas import Run, RunBudget, RunCreate, RunStatus, TaskSpec
+from steward_schemas import Run, RunBudget, RunCreate, RunStatus
 from steward_telemetry import NoopTracer, SpanOutcome, Tracer, new_trace_id
-
-DEFAULT_RUN_BUDGET = RunBudget(
-    steps=32,
-    tokens=200_000,
-    cost_usd=Decimal("2.000000"),
-    wall_clock=timedelta(minutes=15),
-)
-"""The caps a run created over the generic `POST /v1/runs` is admitted under.
-
-I12 says autonomy is bounded, which means *something* has to name the bound at
-the point a run is created. A conservative default here is that something: it
-is injectable per store, and per-goal budgets arrive with the goal-specific
-endpoints in M1 (SPEC.md §8), at which point this stops being the only answer.
-"""
-
-DEFAULT_MAX_ATTEMPTS = 3
 
 REPLAYED_DETAIL = "idempotency key replayed an existing run"
 
@@ -84,7 +73,11 @@ class RunStore(Protocol):
         """Create a run for `spec`. Replaying the same `idempotency_key`
         (when not None) with the same body returns the run created the first
         time, unchanged; replaying it with a different body raises
-        `IdempotencyKeyReused`."""
+        `IdempotencyKeyReused`.
+
+        Raises `steward_orchestration.UnknownGoal` or `InvalidGoalPayload`
+        without creating anything when `spec` does not name a registered goal
+        or does not match that goal's schema (issue #19)."""
         ...
 
     async def get_run(self, run_id: UUID) -> Run | None:
@@ -126,20 +119,9 @@ class PostgresRunStore:
     to this class alone once it is.
     """
 
-    def __init__(
-        self,
-        dsn: str,
-        *,
-        tracer: Tracer | None = None,
-        task_type: str = NOOP_TASK_TYPE,
-        budget: RunBudget = DEFAULT_RUN_BUDGET,
-        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    ) -> None:
+    def __init__(self, dsn: str, *, tracer: Tracer | None = None) -> None:
         self._dsn = dsn
         self._tracer: Tracer = tracer if tracer is not None else NoopTracer()
-        self._task_type = task_type
-        self._budget = budget
-        self._max_attempts = max_attempts
 
     async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
         return await asyncio.to_thread(self._create_run, spec, idempotency_key)
@@ -150,7 +132,14 @@ class PostgresRunStore:
     # --- synchronous halves, always called through asyncio.to_thread ---
 
     def _create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
-        """The run row and its task, committed together (I8).
+        """The run row and its planned tasks, committed together (I8).
+
+        Admission comes first and outside everything else: `plan_run` rejects
+        an unknown goal or a payload that does not match its goal's schema
+        before a run id, a trace id or a row exists, so a rejected request
+        leaves nothing behind -- not a run, not a task, not a trace (issue
+        #19). A trace for work the system refused to accept would be a trace
+        with no run to attach to.
 
         Two properties pull in opposite directions here. The span has to exist
         even when creation fails -- a failure is a trace with an error, not a
@@ -170,15 +159,18 @@ class PostgresRunStore:
         `record.id != run_id` is how a replay is detected: the id this call
         generated is on the row only if this call created it. A replay's
         transaction is a no-op -- `create_run` returns the original row and
-        `enqueue` deduplicates on the payload the original was enqueued with --
-        and the span says so instead of pretending work happened. A replay with
-        a different body raises inside that same span, so the conflict is an
-        error on the original run's trace rather than on an orphan.
+        nothing is enqueued onto it -- and the span says so instead of
+        pretending work happened. A replay with a different body raises inside
+        that same span, so the conflict is an error on the original run's trace
+        rather than on an orphan.
         """
+        plan = plan_run(spec.goal, spec.payload)
         run_id = uuid4()
         trace_id = new_trace_id(seed=str(run_id))
         try:
-            record = self._persist(spec, run_id=run_id, trace_id=trace_id, idempotency_key=idempotency_key)
+            record = self._persist(
+                spec, plan, run_id=run_id, trace_id=trace_id, idempotency_key=idempotency_key
+            )
         except Exception:
             # Nothing was persisted, so the identity this call generated is the
             # only one that ever named the work. Re-raising inside the span is
@@ -194,42 +186,43 @@ class PostgresRunStore:
         return run
 
     def _persist(
-        self, spec: RunCreate, *, run_id: UUID, trace_id: str, idempotency_key: str | None
+        self,
+        spec: RunCreate,
+        plan: RunPlan,
+        *,
+        run_id: UUID,
+        trace_id: str,
+        idempotency_key: str | None,
     ) -> RunRecord:
-        """The run row and its first task, committed together (I8).
+        """The run row and the tasks its goal expands to, committed together (I8).
 
         Separate from `_create_run` only so the run this call is about is known
         -- returned or raised -- before anything opens a span about it.
+
+        The run is admitted under the *goal's* budget (I12): the caps a run
+        gets are a property of what it was asked to do, not of this service.
+
+        Enqueueing is skipped when the row already existed, because `plan`
+        expands the body of *this* call: a replay carrying a different body
+        would otherwise attach its tasks to the original run before the
+        conflict that rejects it is even detected. The original's tasks were
+        committed with it, so there is nothing to re-create.
         """
         with connect(self._dsn) as conn:
             record = create_run(
                 conn,
                 goal=spec.goal,
                 payload=spec.payload,
-                budget=self._budget,
+                budget=plan.budget,
                 run_id=run_id,
                 trace_id=trace_id,
                 idempotency_key=idempotency_key,
             )
-            enqueue(conn, self._first_task(record))
+            if record.id == run_id:
+                for task in plan.task_specs(record.id):
+                    enqueue(conn, task)
             conn.commit()
         return record
-
-    def _first_task(self, record: RunRecord) -> TaskSpec:
-        """The task the run's goal expands to.
-
-        M0 has one task type and no planner, so the expansion is a constant.
-        The deterministic orchestrator that turns a goal into a DAG (SPEC.md
-        §3.1) replaces this function, not its callers.
-        """
-        return TaskSpec(
-            task_id=uuid4(),
-            run_id=record.id,
-            task_type=self._task_type,
-            payload=record.payload,
-            budget=record.budget,
-            max_attempts=self._max_attempts,
-        )
 
     def _get_run(self, run_id: UUID) -> Run | None:
         with connect(self._dsn) as conn:
@@ -244,15 +237,20 @@ class InMemoryRunStore:
     Not persistent, not shared across replicas, and no queue behind it: a run
     created here stays `pending` forever because nothing executes it. Satisfies
     `RunStore` structurally.
+
+    It admits runs through the same goal registry the real store does. That is
+    not a convenience: admission is the behavior the HTTP-layer tests are
+    about, and a double that accepted goals the system rejects would make those
+    tests prove the opposite of the truth.
     """
 
-    def __init__(self, *, budget: RunBudget = DEFAULT_RUN_BUDGET) -> None:
+    def __init__(self) -> None:
         self._runs: dict[UUID, Run] = {}
         self._by_idempotency_key: dict[str, UUID] = {}
-        self._budget = budget
         self._lock = asyncio.Lock()
 
     async def create_run(self, spec: RunCreate, idempotency_key: str | None) -> Run:
+        plan = plan_run(spec.goal, spec.payload)
         async with self._lock:
             if idempotency_key is not None:
                 existing_id = self._by_idempotency_key.get(idempotency_key)
@@ -270,7 +268,7 @@ class InMemoryRunStore:
                 payload=spec.payload,
                 status=RunStatus.PENDING,
                 trace_id=new_trace_id(seed=str(run_id)),
-                budget=self._budget,
+                budget=plan.budget,
                 usage=RunBudget(steps=0, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(0)),
                 created_at=now,
                 updated_at=now,

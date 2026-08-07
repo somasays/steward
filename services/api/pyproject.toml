@@ -5,6 +5,7 @@ description = "Steward API service (FastAPI gateway): runs API over the Postgres
 requires-python = ">=3.12"
 dependencies = [
     "steward-schemas",
+    "steward-orchestration",
     "steward-queue",
     "steward-telemetry",
     "fastapi>=0.115",
@@ -17,6 +18,7 @@ steward-api-export-openapi = "steward_api.export_openapi:main"
 
 [tool.uv.sources]
 steward-schemas = { workspace = true }
+steward-orchestration = { workspace = true }
 steward-queue = { workspace = true }
 steward-telemetry = { workspace = true }
 
