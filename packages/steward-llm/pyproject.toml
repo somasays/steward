@@ -5,6 +5,10 @@ description = "Thin gateway wrapper: typed completions via model aliases. Provid
 requires-python = ">=3.12"
 dependencies = [
     "steward-schemas",
+    # The gateway config is a LiteLLM proxy YAML file; the startup check (I15) parses
+    # it without importing litellm, so a misrouted config is refused before anything
+    # in this package touches a provider.
+    "pyyaml>=6.0",
 ]
 
 [tool.uv.sources]

@@ -11,6 +11,10 @@ dependencies = [
     # before the worker is built -- is what puts `scan_source` on the list of
     # task types this process claims.
     "steward-catalog",
+    # Not for calling models (that client lands with #50) but for refusing to start:
+    # the composition root validates the gateway config before the worker claims
+    # anything, so a production alias pointed off the allowlist never runs (I15).
+    "steward-llm",
 ]
 
 [project.scripts]
@@ -20,6 +24,7 @@ steward-worker = "steward_workers.__main__:main"
 steward-queue = { workspace = true }
 steward-telemetry = { workspace = true }
 steward-catalog = { workspace = true }
+steward-llm = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

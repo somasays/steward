@@ -1,0 +1,70 @@
+# LiteLLM proxy configuration for production (SPEC.md §6, ARCHITECTURE.md I15).
+#
+# Every alias binds to a self-hosted vLLM endpoint on the approved allowlist
+# (approved_endpoints.yaml). Hosted providers do not appear here and are not a
+# production fallback: resilience comes from redundancy *inside* the allowlist —
+# each alias has two endpoints, so LiteLLM routes around one that is down without
+# leaving the deployment. A deployment mounting its own config points
+# STEWARD_LITELLM_CONFIG at it; this file is the default and the one S9 checks.
+#
+# api_base is mandatory on every entry: an entry without one resolves to its
+# provider's hosted API, which is the quietest way to breach I15. The startup
+# check refuses a config where any entry omits it.
+
+model_list:
+  - model_name: steward-reasoning
+    litellm_params:
+      model: hosted_vllm/qwen3-32b-instruct
+      api_base: http://vllm-reasoning-a.steward-inference.svc.cluster.local:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+  - model_name: steward-reasoning
+    litellm_params:
+      model: hosted_vllm/qwen3-32b-instruct
+      api_base: http://vllm-reasoning-b.steward-inference.svc.cluster.local:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+
+  - model_name: steward-fast
+    litellm_params:
+      model: hosted_vllm/qwen3-8b-instruct
+      api_base: http://vllm-fast-a.steward-inference.svc.cluster.local:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+  - model_name: steward-fast
+    litellm_params:
+      model: hosted_vllm/qwen3-8b-instruct
+      api_base: http://vllm-fast-b.steward-inference.svc.cluster.local:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+
+  - model_name: steward-classify
+    litellm_params:
+      model: hosted_vllm/qwen3-7b-classify
+      api_base: http://vllm-classify-a.steward-inference.svc.cluster.local:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+  - model_name: steward-classify
+    litellm_params:
+      model: hosted_vllm/qwen3-7b-classify
+      api_base: http://vllm-classify-b.steward-inference.svc.cluster.local:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+
+  - model_name: steward-embed
+    litellm_params:
+      model: hosted_vllm/bge-m3
+      api_base: http://vllm-embed-a.steward-inference.svc.cluster.local:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+  - model_name: steward-embed
+    litellm_params:
+      model: hosted_vllm/bge-m3
+      api_base: http://vllm-embed-b.steward-inference.svc.cluster.local:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+
+router_settings:
+  routing_strategy: latency-based-routing
+  num_retries: 2
+  # Fallbacks stay inside the allowlist: an alias falls back to another alias whose
+  # endpoints are approved, never out of the deployment.
+  fallbacks:
+    - steward-classify: ["steward-fast"]
+
+litellm_settings:
+  drop_params: true
+  # Budgets and caching are gateway concerns (SPEC §6); the values land with #50.
+  cache: true
