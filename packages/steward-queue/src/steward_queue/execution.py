@@ -48,6 +48,22 @@ that path waits on the handler thread.
 and what makes an abandoned thread harmless: having lost the handoff it never
 touches the task row, and its session is gone by then anyway, so its writes are
 discarded and the attempt the worker recorded stands.
+
+What the thread never does is raise at the loop
+-----------------------------------------------
+Everything that can go wrong here -- the handler, the connection it needs
+before the handler can run at all, the statement that records the outcome -- is
+one task's failure and is reported as an `_Executed`, never as an exception on
+the future. The loop reads that future from inside its poll loop, so an
+exception on it is a worker killed by one task: #45, reached in practice by a
+handler connection that could not be opened once #42 doubled the connections a
+task holds. Only a `BaseException` that is not an `Exception` still travels,
+because `SystemExit`, `KeyboardInterrupt` and cancellation are the process
+ending rather than a task failing.
+
+An outcome the thread could not write reaches the loop as `recorded=False`, and
+the handoff decides whether the loop may write it instead -- so "exactly one
+context records this attempt" survives the failure of the one that usually does.
 """
 
 import asyncio
@@ -79,6 +95,15 @@ round trips to write a failure row.
 """
 
 HANDLER_FAILED = "handler raised"
+EXECUTION_FAILED = "execution failed"
+"""The title for a failure that was not the handler's: the machinery around it.
+
+Kept distinct from `HANDLER_FAILED` because the two send an operator to
+different places. "handler raised" is a bug in the task's own code; "execution
+failed" is the worker unable to run it at all -- typically the connection the
+handler needs, which is the shape #45 was reported as.
+"""
+
 BUDGET_EXCEEDED = "budget_exceeded"
 
 type RecordOutcome = Callable[[QueueConnection, ClaimedTask, TaskResult | ProblemDetails], None]
@@ -162,11 +187,14 @@ class _Executed:
 
     `error` is the typed failure it settled on (None on success) and is carried
     even when the thread did not get to record it, so the span still says how
-    the work ended.
+    the work ended. `recorded` says whether the terminal state reached the
+    database: false leaves the task unsettled, and the loop -- if the handoff
+    is still there to be taken -- writes the failure itself.
     """
 
     error: ProblemDetails | None
     lost_claim: bool
+    recorded: bool
 
 
 def _consume(finished: asyncio.Future[_Executed]) -> None:
@@ -244,9 +272,26 @@ def _execute_in_thread(
     record: RecordOutcome,
     future: concurrent.futures.Future[_Executed],
 ) -> None:
-    """Thread entry point. Never raises: the loop must not wait on a lost future."""
+    """Thread entry point. Never raises, and never fails the worker.
+
+    `_run_handler` already answers for the handler itself. What this catches is
+    everything around it: the connection opened before the handler is called,
+    the context built from it, the statement that records the outcome, the
+    close on the way out. Those raised straight through the future and out of
+    the poll loop until #45 -- one task's transient `OperationalError` ending a
+    worker and leaving its task `running` for a budget-length lease.
+
+    The exception becomes this task's typed failure instead, unrecorded, for
+    the loop to settle. A `BaseException` that is not an `Exception` still
+    travels: the process is ending, and dressing that up as a failed task would
+    hide a shutdown as a data point.
+    """
     try:
         future.set_result(_run_handler(dsn, task, registration, handoff, record))
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        failure = _Executed(error=_problem(EXECUTION_FAILED, detail), lost_claim=False, recorded=False)
+        future.set_result(failure)
     except BaseException as exc:
         future.set_exception(exc)
 
@@ -324,12 +369,17 @@ def _record_in_thread(
     all: the caller's `finally` rolls the handler's transaction back, so an
     abandoned execution leaves no trace of itself anywhere -- not in the
     catalog it was writing, and not on the task row.
+
+    Anything else `record` raises leaves this thread holding a handoff it
+    cannot use, and travels on: the loop cannot write the outcome either (the
+    handoff is gone, and this thread might still commit), so the attempt is
+    left to its lease and `requeue_stale` returns it (N1).
     """
     error = outcome if isinstance(outcome, ProblemDetails) else None
     if not handoff.take():
-        return _Executed(error=error, lost_claim=False)
+        return _Executed(error=error, lost_claim=False, recorded=False)
     try:
         record(conn, task, outcome)
     except tasks.TaskNotClaimable:
-        return _Executed(error=error, lost_claim=True)
-    return _Executed(error=error, lost_claim=False)
+        return _Executed(error=error, lost_claim=True, recorded=False)
+    return _Executed(error=error, lost_claim=False, recorded=True)

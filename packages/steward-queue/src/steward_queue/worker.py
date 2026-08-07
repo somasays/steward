@@ -299,12 +299,12 @@ class Worker:
         await wait(finished, deadline, stop)
 
         if finished.done():
-            return self._settle(finished.result(), span)
+            return await self._settle(conn, task, handoff, finished.result(), span)
         stopping = time.monotonic() - started < deadline.total_seconds()
         if not handoff.take():
             # The thread claimed the recording in the moment between the wait
             # returning and this line; its outcome is the authoritative one.
-            return self._settle(await finished, span)
+            return await self._settle(conn, task, handoff, await finished, span)
         await asyncio.to_thread(self._abandon, conn, handoff)
         if stopping:
             # `stop` fired before the cap: the budget is intact, so this is not
@@ -332,8 +332,23 @@ class Worker:
             record=self._record,
         )
 
-    def _settle(self, executed: _Executed, span: Span) -> bool:
-        """Mark the span for an execution the handler thread recorded itself.
+    async def _settle(
+        self,
+        conn: QueueConnection,
+        task: ClaimedTask,
+        handoff: _Handoff,
+        executed: _Executed,
+        span: Span,
+    ) -> bool:
+        """Close out an execution the handler thread has finished with.
+
+        Usually there is nothing to write: the thread recorded the outcome in
+        the same transaction as the handler's writes, and this only marks the
+        span. The exception is an execution that fell over before it could
+        record itself -- the connection it needed, or the write itself (#45).
+        The failure is this worker's to persist then, on its own connection,
+        and it asks the handoff first so a thread that did get there is never
+        double-counted.
 
         A lost claim is re-raised rather than reported: `execute` already knows
         how to answer one, and letting it travel as an exception is also what
@@ -341,10 +356,12 @@ class Worker:
         """
         if executed.lost_claim:
             raise tasks.TaskNotClaimable("the task was taken back mid-execution")
-        if executed.error is not None:
-            span.record(SpanOutcome.ERROR, executed.error.title)
-        else:
+        if executed.error is None:
             span.record(SpanOutcome.OK)
+            return True
+        if not executed.recorded and handoff.take():
+            await asyncio.to_thread(self._fail, conn, task, executed.error)
+        span.record(SpanOutcome.ERROR, executed.error.title)
         return True
 
     async def _record_failure(
