@@ -134,6 +134,11 @@ def main() -> int:
         _script_or_pending("S6", "contract compatibility", "check_contracts.py"),
         check_filegraph.run(),           # S7
         _script_or_pending("S8", "checker self-tests", "check_selftests.py"),
+        # S9 -- inference endpoint allowlist (I15). Not a lint: this runs the startup
+        # refusal itself over the committed LiteLLM config, so the check and the thing
+        # a process does at boot are the same code.
+        _tool_check("S9", "inference endpoints", ["uv", "run", "python", "-m", "steward_llm.validate"],
+                    not_installed),
         # Tier H — behavioral harnesses
         _tool_check("H*", "invariant harnesses", ["uv", "run", "pytest", "-q", "-m", "invariants"],
                     not_installed or ("" if has_tests else "no tests yet"), no_harness),

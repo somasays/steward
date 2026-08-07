@@ -33,14 +33,14 @@ Quantified; each is protected by at least one fitness function in `GUARDRAILS.md
 | N4 | Latency | search P95 ≤ 150 ms (no rerank) / 400 ms (reranked); ask P50 ≤ 10 s; non-agent API P99 ≤ 500 ms |
 | N5 | Throughput | 500-table source scanned ≤ 30 min; 50 concurrent `ask` sessions |
 | N6 | Cost control | Every run has hard budgets; cost per task type ≤ 1.2× tracked baseline; workspace daily caps enforced at the gateway |
-| N7 | Privacy & security | Raw sensitive values never reach a model or a trace; source connections are read-only at the DB-role level; no credentials in git |
+| N7 | Privacy & security | Raw sensitive values never reach a model or a trace; **prompts never leave the deployment: production inference runs on approved self-hosted endpoints (I15)**; source connections are read-only at the DB-role level; no credentials in git |
 | N8 | Observability | 100% of agent steps traced; 100% of mutations audited in-transaction; any output traceable to the exact prompt version that produced it |
-| N9 | Evolvability | Provider swap = config change only. Agent-framework swap = one package's internals. Search index = rebuildable from Postgres by a job. Contract changes are visible and compatibility-checked |
+| N9 | Evolvability | Model/endpoint swap = config change only, within the approved self-hosted set (I15); moving production to a hosted provider is an amendment, not a config change. Agent-framework swap = one package's internals. Search index = rebuildable from Postgres by a job. Contract changes are visible and compatibility-checked |
 | N10 | Operability | Fresh-cluster deploy is one command; code and prompts canary and roll back through the same pipeline |
 
 ## 3. Technology decisions
 
-Full rationale for the load-bearing ones in `SPEC.md` §13 (D1–D7).
+Full rationale for the load-bearing ones in `SPEC.md` §13 (D1–D8).
 
 | Technology | Role | Why (one line) | Rejected |
 |---|---|---|---|
@@ -48,7 +48,7 @@ Full rationale for the load-bearing ones in `SPEC.md` §13 (D1–D7).
 | FastAPI + Pydantic v2 | API service & typed seams | contract-first, OpenAPI export feeds contract checks | Flask/Django (weaker typing story) |
 | PostgreSQL | system of record + task queue | transactional enqueue with `SKIP LOCKED`; one less stateful system | Redis/RabbitMQ queue (loses transactional enqueue) — D2 |
 | LangGraph (contained in `steward-agents`) | agent execution: checkpointing, interrupts, streaming | durable execution is undifferentiated to rebuild; containment caps the coupling | custom runtime (weeks of re-derivation); CrewAI/AutoGen (own our semantics) — D1 |
-| LiteLLM proxy | provider gateway | aliases, fallback chains, budgets, caching at one choke point | per-provider SDKs in code (violates N9) |
+| LiteLLM proxy in front of self-hosted vLLM | inference gateway | aliases, fallback chains, budgets, caching at one choke point; production routing is pinned to approved vLLM endpoints by an allowlist the gateway process checks at startup — D8 | per-provider SDKs in code (violates N9); hosted providers as production defaults or fallbacks (violates I15) |
 | Qdrant + ElasticSearch | dense + lexical retrieval | estate search is bimodal (meaning + identifiers); RRF fusion is tuning-free | dense-only (fails identifier queries) — D3 |
 | Langfuse | traces, prompt versions, eval datasets | semantic observability + evals in one place; native LangGraph/LiteLLM integration | hand-rolled trace store |
 | Kubernetes + GitHub Actions + ArgoCD | delivery | GitOps promotion; prompts ride the same canary/rollback path as images — D6 | push-based deploys |
@@ -70,7 +70,7 @@ Properties that hold at every commit, forever. Amendments follow `GUARDRAILS.md`
 | ID | Invariant |
 |----|-----------|
 | I1 | Postgres is the only system of record; Qdrant/ES/caches are derived and rebuildable |
-| I2 | All model access goes through gateway aliases; provider SDKs and `litellm` only inside `steward-llm` |
+| I2 | All model access goes through gateway aliases; provider SDKs and `litellm` only inside `steward-llm`; where those aliases may resolve is I15's subject, not configuration's |
 | I3 | Typed contracts at every seam (API, tools, tasks, packages); published contracts are versioned and compatibility-checked |
 | I4 | One-way dependency flow: `services → packages`; package edges are declared; `steward-schemas` = pydantic + stdlib |
 | I5 | Sources are read-only at the role level; SQL is never assembled from strings; free-form SQL exists only inside the Librarian's bounded tool |
@@ -82,7 +82,8 @@ Properties that hold at every commit, forever. Amendments follow `GUARDRAILS.md`
 | I11 | LLM-dependent behavior ships only with eval coverage; changes pass eval gates |
 | I12 | Autonomy is bounded: hard step/token/cost/wall-clock budgets, enforced by the runtime; exceeding one is a typed, visible failure |
 | I13 | Governance actions pass through policy-gated review states; every auto-approval traces to the policy that allowed it |
-| I14 | Provider or model changes are configuration, not code |
+| I14 | Model or endpoint changes are configuration, not code — within the approved self-hosted set (I15); leaving that set is an amendment |
+| I15 | Production inference resolves only to approved self-hosted endpoints: every model a production gateway config can route to declares a base URL on the deployment's allowlist, and a process whose config resolves anywhere else refuses to start. Hosted providers exist only in an explicitly-selected development mode, never as a production default or fallback |
 
 ## 6. Fitness functions
 

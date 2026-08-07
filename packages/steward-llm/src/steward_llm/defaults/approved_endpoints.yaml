@@ -1,0 +1,19 @@
+# The endpoints production inference may reach (ARCHITECTURE.md I15).
+#
+# The default allowlist: the in-cluster vLLM services this repo's LiteLLM config
+# routes to. A deployment with different service names overrides the whole list via
+# STEWARD_LLM_APPROVED_ENDPOINTS (comma-separated) — it does not edit this file.
+#
+# Matching is on scheme, host and port, with the path as a prefix: an entry ending
+# /v1 covers /v1/chat/completions and nothing else. Adding a hosted provider API here
+# does not work — the deny layer in endpoints.py refuses it whatever this file says.
+
+approved_endpoints:
+  - http://vllm-reasoning-a.steward-inference.svc.cluster.local:8000/v1
+  - http://vllm-reasoning-b.steward-inference.svc.cluster.local:8000/v1
+  - http://vllm-fast-a.steward-inference.svc.cluster.local:8000/v1
+  - http://vllm-fast-b.steward-inference.svc.cluster.local:8000/v1
+  - http://vllm-classify-a.steward-inference.svc.cluster.local:8000/v1
+  - http://vllm-classify-b.steward-inference.svc.cluster.local:8000/v1
+  - http://vllm-embed-a.steward-inference.svc.cluster.local:8000/v1
+  - http://vllm-embed-b.steward-inference.svc.cluster.local:8000/v1

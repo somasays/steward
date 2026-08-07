@@ -39,7 +39,7 @@ Steward is a multi-agent data management platform. It connects to an organizatio
 - **G2 — Trustworthy answers.** Natural-language questions about the data estate are answered with citations to catalog entries and live metadata, never from the model's parametric memory alone.
 - **G3 — Measurable quality.** Every LLM-dependent behavior (documentation, classification, retrieval, answering, triage) has an offline eval suite with golden data, and CI blocks regressions.
 - **G4 — Production discipline.** Typed tool contracts, resumable orchestration, idempotent workers, tracing on every step, cost budgets, and GitOps delivery. The system is built to be operated, not demoed.
-- **G5 — Provider independence.** Any agent can run on Anthropic, OpenAI, Qwen, or an OSS model behind vLLM by config change only, with per-task model routing.
+- **G5 — Self-hosted inference, per-task routing.** Every agent runs on OSS models served by the deployment's own vLLM endpoints; model routing is per-task config, and production aliases resolve only to approved endpoints ([I15](./ARCHITECTURE.md#5-invariants)). Hosted providers are a development convenience, not a production fallback.
 
 ### Non-goals
 
@@ -116,7 +116,7 @@ flowchart LR
 | **API Gateway** | FastAPI service. REST for CRUD/queries, Server-Sent Events for streaming agent runs. AuthN via API keys (v1), OIDC (v2). All request/response bodies are Pydantic v2 models shared with the SDK. |
 | **Orchestrator** | Decomposes goals ("scan this source") into task DAGs, enqueues tasks, tracks run state, handles retries/timeouts, and checkpoints progress so runs survive worker restarts. |
 | **Workers** | Stateless asyncio processes that claim tasks from the queue and execute one agent loop per task. Horizontally scalable; each worker type maps to a K8s Deployment. |
-| **LLM Gateway** | A LiteLLM proxy deployment. Single OpenAI-compatible endpoint for all workers; model routing, fallback chains, rate limiting, and per-run cost budgets live here, not in agent code. |
+| **LLM Gateway** | A LiteLLM proxy deployment in front of the cluster's vLLM services. Single OpenAI-compatible endpoint for all workers; model routing, fallback chains, rate limiting, and per-run cost budgets live here, not in agent code. Its routing table is validated against the endpoint allowlist at startup — a config resolving off it refuses to boot (§6, I15). |
 | **PostgreSQL** | System of record: sources, assets, profiles, classifications, rules, incidents, agent runs, task queue, checkpoints. |
 | **Qdrant** | Dense vector index over catalog documents (asset docs, column docs, profile summaries, incident postmortems). |
 | **ElasticSearch** | BM25 lexical index over the same corpus (exact identifiers like `cust_acct_id` are lexical problems, not semantic ones) plus structured agent/audit logs. |
@@ -134,7 +134,7 @@ packages/
   steward-catalog/     # Deterministic metadata catalog: secret resolution, read-only source inspection, convergent persistence
   steward-agents/      # Agent runtime: owned contracts (tools, budgets, results); LangGraph contained here
   steward-retrieval/   # Hybrid search client: Qdrant + ES + fusion + rerank
-  steward-llm/         # Thin LiteLLM client wrapper: typed completions, structured output helpers
+  steward-llm/         # Thin LiteLLM client wrapper: typed completions; owns the endpoint allowlist and the startup refusal (I15)
   steward-telemetry/   # Tracing seam: owned Tracer contract, Langfuse contained behind it
   steward-sdk/         # Public Python client for the REST API (generated types + hand-written ergonomics)
 services/
@@ -238,7 +238,7 @@ The catalog corpus (asset docs, column docs, profile summaries, quality rules, i
 ### 5.1 Indexing pipeline
 
 - **Chunking:** documents are chunked structurally (a column doc is one chunk; a table doc chunks by section), never by fixed token windows — catalog documents have meaningful structure, and chunk boundaries should follow it.
-- **Dense:** embeddings via the LLM gateway (default `text-embedding-3-large`; configurable to OSS embedders, e.g. `bge-m3`, served by the same vLLM deployment). Stored in Qdrant with payload filters: `asset_type`, `source_id`, `sensitivity`, `updated_at`.
+- **Dense:** embeddings via the LLM gateway (`steward-embed` → `bge-m3` on the deployment's own vLLM; a hosted embedder is a development-mode choice only, I15). Stored in Qdrant with payload filters: `asset_type`, `source_id`, `sensitivity`, `updated_at`.
 - **Lexical:** the same chunks go to ElasticSearch with custom analyzers that preserve identifiers (`cust_acct_id` tokenizes to `cust_acct_id`, `cust`, `acct`, `id`) — users search by exact column names as often as by meaning.
 - **Consistency:** indexing is an orchestrated task downstream of doc generation with deterministic doc IDs, so re-runs converge. A nightly reconciliation job diffs Postgres (truth) against both indexes and repairs drift.
 
@@ -257,7 +257,7 @@ question ──► query analysis ──► parallel: Qdrant top-40 (filtered)
 
 - **Query analysis** (small/fast model): extracts filters (source, sensitivity, asset type) and rewrites the question into one semantic query + zero or more lexical identifier queries.
 - **Fusion:** reciprocal-rank fusion (k=60) — robust to score-scale mismatch between engines, no tuning burden.
-- **Rerank:** cross-encoder (hosted reranker or OSS `bge-reranker-v2-m3` on vLLM) over the fused top-40.
+- **Rerank:** cross-encoder (`bge-reranker-v2-m3` on vLLM) over the fused top-40. It reaches the gateway as a `steward-rerank` alias, which joins §6's table — and therefore the startup check's required set — when retrieval lands in M2.
 - **Agentic search:** the Librarian doesn't get one shot. It can reformulate and re-search, drill into specific assets, and run bounded verification SQL — the retrieval trail is captured in the trace and returned with the answer.
 
 ### 5.3 Retrieval quality targets (eval-gated, see §9)
@@ -274,16 +274,22 @@ question ──► query analysis ──► parallel: Qdrant top-40 (filtered)
 
 All model access goes through a **LiteLLM proxy** deployment. Agent code sees one OpenAI-compatible endpoint and *model aliases*, never provider SDKs.
 
+**Production inference is self-hosted, and that is enforced at runtime.** Every production alias binds to a vLLM endpoint on the deployment's allowlist; the gateway config is validated when a process starts, and a process whose config resolves anywhere else does not start ([I15](./ARCHITECTURE.md#5-invariants), [D8](#13-key-design-decisions)). Hosted providers appear only under `STEWARD_DEPLOYMENT_MODE=development` — a mode that must be selected by name, since production is what an unset variable means.
+
 ### Routing by task tier
 
-| Alias | Used for | Default binding | Fallback chain |
-|---|---|---|---|
-| `steward-reasoning` | Documentarian, Triage, Librarian planning | `claude-sonnet-5` | → `gpt-5.x` → `qwen-max` |
-| `steward-fast` | query analysis, rule compilation, extraction | `claude-haiku-4-5` | → `gpt-mini-tier` → `qwen-turbo` |
-| `steward-classify` | Classifier | fine-tune-ready OSS (`qwen-7b` on vLLM) with `steward-fast` fallback | |
-| `steward-embed` | embeddings | `text-embedding-3-large` | → `bge-m3` (vLLM) |
+| Alias | Used for | Production binding (self-hosted) | Redundancy | Development-only alternative |
+|---|---|---|---|---|
+| `steward-reasoning` | Documentarian, Triage, Librarian planning | `hosted_vllm/qwen3-32b-instruct` | two endpoints (`-a`/`-b`) | `claude-sonnet-*` / `gpt-5.x` — dev mode, never production |
+| `steward-fast` | query analysis, rule compilation, extraction | `hosted_vllm/qwen3-8b-instruct` | two endpoints | `claude-haiku-*` — dev mode, never production |
+| `steward-classify` | Classifier | `hosted_vllm/qwen3-7b-classify` (fine-tune-ready) | two endpoints, then `steward-fast` | — |
+| `steward-embed` | embeddings | `hosted_vllm/bge-m3` | two endpoints | `text-embedding-3-large` — dev mode, never production |
 
-The gateway also owns: per-workspace **cost budgets** (hard caps surfaced as 429s to workers, which pause runs rather than degrade silently), **response caching** for idempotent calls (profiling summaries, embeddings), **retry/fallback** policy, and **key management**. Swapping the entire system to a different provider is a values-file change, not a code change (**G5**).
+The committed routing table is `packages/steward-llm/src/steward_llm/defaults/litellm.production.yaml`, checked on every commit by S9; the endpoints it may name are `approved_endpoints.yaml`, which a deployment overrides wholesale via `STEWARD_LLM_APPROVED_ENDPOINTS`.
+
+**Fallback chains stay inside the allowlist.** Losing hosted providers means losing the fallback that used to answer "what if a model is unavailable", so each alias is served by two approved endpoints and LiteLLM routes around a failed one — redundancy replaces provider diversity (D8). An alias may fall back to another alias; it may never fall back out of the deployment.
+
+The gateway also owns: per-workspace **cost budgets** (hard caps surfaced as 429s to workers, which pause runs rather than degrade silently), **response caching** for idempotent calls (profiling summaries, embeddings), **retry/fallback** policy, and **key management**. Changing which approved endpoint or OSS model an alias uses is a values-file change, not a code change (**G5**); leaving the approved set is a `GUARDRAILS.md` §7 amendment.
 
 ---
 
@@ -430,7 +436,7 @@ Alerting is defined in code (Prometheus rules in the Helm chart): dead tasks, qu
 
 - `api` Deployment (HPA on CPU/RPS) · one Deployment per worker type (HPA on queue depth via KEDA-style custom metric) · `litellm` Deployment · CronJobs for scheduled scans, check execution, and index reconciliation.
 - Postgres/Qdrant/ES via operators or managed services (values-file choice); Langfuse self-hosted in-cluster or cloud.
-- Config via Helm values; secrets via ExternalSecrets (source DSNs and provider keys never in git); NetworkPolicies restrict workers so only connector pods can reach data sources.
+- Config via Helm values; secrets via ExternalSecrets (source DSNs and endpoint keys never in git); NetworkPolicies restrict workers so only connector pods can reach data sources, and restrict egress from worker and `litellm` pods to the approved inference endpoints — the network-level half of I15, which is what binds a process that never goes through our code (M6, issue #59).
 
 ### CI/CD
 
@@ -488,3 +494,11 @@ A handler is executed on a dedicated thread that opens its own Postgres connecti
 *Where "recorded exactly once" stops.* The handoff guarantees at most one context records an attempt; it does not guarantee one of them succeeds. A thread takes the handoff **before** it writes, so a write that then fails for any reason other than `TaskNotClaimable` — a dropped connection, a transaction the handler left aborted — leaves the attempt unrecorded. The loop deliberately does not step in: it has lost the handoff, and the thread it lost it to may still be inside a commit, so writing a terminal state there is the double-record the handoff exists to prevent. The attempt is left `running` and `requeue_stale` returns it at lease expiry — one re-executed idempotent attempt, N1's model again, at the cost of a task sitting for its lease rather than failing at once. Moving the handoff to *after* the write would trade this for the worse failure: two contexts writing terminal states for one attempt.
 
 Rejected: ***`asyncio.to_thread` alone*** — the obvious move and worse than the bug, because on timeout the loop rolls back `ctx.connection` while the handler thread may still be executing on it, and psycopg connections are not thread-safe; the fix has to make that unreachable, not unlikely. ***Handlers become genuinely async (psycopg's async driver)*** — rewrites every data-access module in five packages and still buys a *convention*, not a property: nothing stops a handler from making a blocking call, and the failure mode when one does is the one being fixed here. ***Per-statement `statement_timeout` derived from remaining budget*** — fixes the 2× overrun and nothing else: the loop stays blocked, so N1's half of the defect (SIGTERM latency, no reaping) survives, and it needs an interception layer around every `execute` to work at all. The chosen design gets the 2× property for free — the deadline bounds the execution, not each statement.
+
+**D8 — Production inference runs on self-hosted vLLM; hosted providers are a development mode.**
+Steward reads an organisation's data estate: profiles, masked samples, column names, incident context. Sending that to a third-party API is a decision, and it was being made by a default in a config file. So it is now an invariant (I15): production aliases resolve only to approved self-hosted endpoints, and the deployment is where inference happens — which is also the strongest form of N7 and the thing that makes Steward deployable where hosted inference is not permitted at all.
+Enforcement is a runtime refusal rather than documentation, because the failure is invisible: a base URL pointed at a hosted API returns completions that look exactly right, and S1's import boundaries cannot see it — the call goes through LiteLLM either way, from inside the one package allowed to import it. `steward_llm.config` validates the routing table when a process starts and raises instead of booting; the quietest breach, an entry with *no* `api_base` at all (which resolves to the provider's own API without a URL appearing anywhere), is refused by name.
+
+*What it costs.* The hosted fallback chain is gone, and it was real resilience: when a model was unavailable, traffic moved to another provider. Redundancy has to replace diversity — each alias is served by two approved endpoints, so an outage is routed around inside the deployment, and an approved endpoint set with no redundancy is now an availability defect rather than a config preference. Model quality is bounded by what the deployment can serve, which is why B9 changes meaning: it used to prove that swapping providers works, and now proves the OSS binding is the *only* binding and still clears the eval gates. And an operator who genuinely needs a hosted model must amend (GUARDRAILS §7), not edit a values file — deliberately more expensive than the mistake it prevents.
+
+Rejected: ***hosted default with a self-hosted option*** — the status quo, and the reason this issue exists: the safe configuration was the one you had to remember, and nothing failed when you forgot. ***Documentation plus review*** — the diff that breaches this does not look like a breach; it is one plausible URL in a YAML file. ***A lint over the committed config alone*** — it would pass while a cluster mounts a different config, so the check has to live where the config is loaded; S9 runs the same code over the committed file as a fast gate, but the boot-time refusal is the actual enforcement. ***An egress NetworkPolicy alone*** — necessary (it lands with the M6 chart) and not sufficient: it cannot distinguish an approved endpoint from a proxy to a hosted one, and it fails closed at the wrong altitude, as a timeout during a run rather than a refusal at startup.

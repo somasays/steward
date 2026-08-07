@@ -4,7 +4,7 @@ Steward is a multi-agent data management platform (catalog, classify, quality-mo
 
 ## Source-of-truth documents (read before designing anything)
 
-1. **`ARCHITECTURE.md`** — the system definition: functional requirements, quantified NFRs (N1–N10), technology decisions, invariants (I1–I14). Highest authority.
+1. **`ARCHITECTURE.md`** — the system definition: functional requirements, quantified NFRs (N1–N10), technology decisions, invariants (I1–I15). Highest authority.
 2. **`GUARDRAILS.md`** — the fitness functions derived from ARCHITECTURE.md (tiers S/H/B/P + hygiene G), the smell checklist, and enforcement status.
 3. **`SPEC.md`** — component-level design and roadmap (M0–M6). Implement toward the spec; if implementation reveals the spec is wrong, update the spec in the same PR and say why.
 
@@ -27,7 +27,7 @@ Every change follows this cycle:
 
 ## Non-negotiables
 
-The invariants are **I1–I14 in `ARCHITECTURE.md` §5** — read them there, not from memory; they are the working summary and this file deliberately does not duplicate them (single source, no staleness). The ones agents trip on most: no string-built SQL (I5), LangGraph/provider SDKs only in their home packages with types never leaking (I2/I9), typed seams everywhere (I3), idempotent handlers + transactional enqueue (I8), hard budgets on every run (I12).
+The invariants are **I1–I15 in `ARCHITECTURE.md` §5** — read them there, not from memory; they are the working summary and this file deliberately does not duplicate them (single source, no staleness). The ones agents trip on most: no string-built SQL (I5), LangGraph/provider SDKs only in their home packages with types never leaking (I2/I9), typed seams everywhere (I3), idempotent handlers + transactional enqueue (I8), hard budgets on every run (I12).
 
 When a task seems to require violating an invariant, **stop and redesign** — or, if the invariant is genuinely wrong, follow the amendment process in GUARDRAILS.md §7. Never "temporarily" violate one.
 

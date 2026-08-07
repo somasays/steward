@@ -21,7 +21,7 @@ Data stewardship work — writing docs that go stale, hand-maintaining quality c
 |---|---|
 | API service | Python 3.12, FastAPI, Pydantic v2 (uv workspace monorepo) |
 | Agent runtime | LangGraph for execution (contained in `steward-agents`); owned contracts for tools/budgets/results; Postgres-backed task queue |
-| LLM access | LiteLLM gateway — Anthropic, OpenAI, Qwen, OSS models via vLLM |
+| LLM access | LiteLLM gateway in front of self-hosted vLLM; production inference never leaves the deployment (I15), hosted providers are a development-mode option |
 | Retrieval | Qdrant (dense) + ElasticSearch (BM25) with reciprocal-rank fusion + reranking |
 | System of record | PostgreSQL |
 | Observability & evals | Langfuse (traces, prompt mgmt, LLM-as-judge), OpenTelemetry, Prometheus |
@@ -40,7 +40,7 @@ See [DEMO.md](./DEMO.md) for what each one shows.
 
 ## Documentation
 
-- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — the system definition: functional requirements, quantified NFRs, technology decisions, invariants (I1–I14).
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — the system definition: functional requirements, quantified NFRs, technology decisions, invariants (I1–I15).
 - **[GUARDRAILS.md](./GUARDRAILS.md)** — the fitness functions derived from the architecture: static checks, behavioral harnesses, benchmarks/evals, production fitness — enforced per commit via git hooks and CI.
 - **[SPEC.md](./SPEC.md)** — component-level design: agents, retrieval, data model, API surface, eval framework, deployment, roadmap.
 - **[CLAUDE.md](./CLAUDE.md)** — the development workflow: issue-driven iteration, per-commit fitness gates, and an adversarial `architecture-guardian` subagent that reviews every branch against the guardrails.
