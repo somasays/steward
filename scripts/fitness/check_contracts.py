@@ -29,10 +29,15 @@ Baseline resolution (`_resolve_baseline`) is explicit, because origin/main is
 not reliably present in a shallow CI checkout or an offline clone:
   - CI, pull_request event: the base SHA from the event payload, falling back
     to `origin/$GITHUB_BASE_REF`.
-  - CI, any other event (push, workflow_dispatch): merge-base with the
-    repository default branch.
+  - CI, push to the default branch: the ref's previous tip (`event.before`).
+    Merge-base is HEAD itself there, which would compare a commit with itself
+    and call it a compatibility check.
+  - CI, any other event (push to another ref, workflow_dispatch): merge-base
+    with the repository default branch.
   - local: merge-base with origin/main, when that ref exists.
-  - unresolvable: SKIP with the reason locally (exit 2), FAIL in CI. Never
+  - unresolvable -- including resolved but unreadable, e.g. a blobless clone
+    where `git show` cannot produce the blob: SKIP with the reason locally
+    (exit 2), FAIL in CI. Never
     PASS -- a comparison that could not run is not a comparison that
     succeeded (GUARDRAILS.md §3 "checks fail loud, skip honest"; PROOFS rows
     21 and 23 are what this rule is paying for). The stale axis still runs
@@ -68,6 +73,8 @@ from common import CheckResult, Finding, repo_root
 
 JSONDict = Dict[str, Any]
 GitFn = Callable[[Sequence[str]], Optional[str]]
+# A differ: two contract fragments -> (json-pointer, message) per breaking change.
+BreakingFn = Callable[[Any, Any], List[Tuple[str, str]]]
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
 
@@ -216,7 +223,7 @@ def _diff_openapi_breaking(old: JSONDict, new: JSONDict) -> List[Tuple[str, str]
 
 
 def _classify(
-    old: Optional[JSONDict], new: Optional[JSONDict], breaking_fn: Any,
+    old: Optional[JSONDict], new: Optional[JSONDict], breaking_fn: BreakingFn,
 ) -> Tuple[str, List[Tuple[str, str]]]:
     """pass | breaking | stale, plus (pointer, message) findings."""
     if old is None and new is None:
@@ -298,11 +305,20 @@ def _resolve_baseline(
             return Baseline(None, "CI pull_request: neither the payload base sha nor "
                                   f"origin/{base_ref or '<base ref>'} is in this checkout ({FETCH_DEPTH_HINT})")
         default_branch = _default_branch(env, load_event)
+        event = env.get("GITHUB_EVENT_NAME") or "push"
+        if event == "push" and env.get("GITHUB_REF_NAME") == default_branch:
+            # On the default branch the merge-base IS HEAD, so it would compare the
+            # commit with itself and report a compatibility check that never ran.
+            # What main had before this push is the push event's `before` sha.
+            before = load_event(env).get("before")
+            if isinstance(before, str) and set(before) != {"0"} and _commit_present(git, before):
+                return Baseline(before, f"CI push to {default_branch}: previous tip (event.before)")
+            return Baseline(None, f"CI push to {default_branch}: event.before is unavailable or not in "
+                                  f"this checkout, and merge-base would be HEAD itself ({FETCH_DEPTH_HINT})")
         merge_base = git(["merge-base", "HEAD", f"origin/{default_branch}"])
         if merge_base:
-            event = env.get("GITHUB_EVENT_NAME") or "push"
             return Baseline(merge_base, f"CI {event}: merge-base with origin/{default_branch}")
-        return Baseline(None, f"CI {env.get('GITHUB_EVENT_NAME') or 'push'}: no merge-base with "
+        return Baseline(None, f"CI {event}: no merge-base with "
                               f"origin/{default_branch} in this checkout ({FETCH_DEPTH_HINT})")
 
     merge_base = git(["merge-base", "HEAD", "origin/main"])
@@ -318,35 +334,47 @@ def _default_branch(env: Mapping[str, str], load_event: Callable[[Mapping[str, s
     return branch if isinstance(branch, str) and branch else "main"
 
 
-def _baseline_snapshots(git: GitFn, sha: str) -> Tuple[Dict[str, JSONDict], Optional[JSONDict]]:
+class BaselineContracts(NamedTuple):
+    """What the baseline commit published. `error` distinguishes "git could
+    not read it" from "the baseline had none" -- collapsing those two would
+    disable the compatibility gate while still reporting a baseline sha."""
+
+    schemas: Dict[str, JSONDict]
+    openapi: Optional[JSONDict]
+    error: Optional[str]
+
+
+def _baseline_contracts(git: GitFn, sha: str) -> BaselineContracts:
     """The committed contracts as of `sha`, read from git rather than from a
-    working-tree checkout. Absent files (contracts/ predating the baseline)
-    come back missing, which the baseline axis treats as "new since"."""
+    working-tree checkout. A file absent from the tree listing predates the
+    baseline (the baseline axis treats it as "new since"); a file that is
+    listed but unreadable -- blobless/partial clone, corrupt blob -- is an
+    error, and the caller downgrades the whole baseline to unresolved."""
+    listing = git(["ls-tree", "--name-only", "-r", sha, "--", "contracts/"])
+    if listing is None:
+        return BaselineContracts({}, None, f"git ls-tree failed at {sha[:9]}")
     schemas: Dict[str, JSONDict] = {}
-    listing = git(["ls-tree", "--name-only", "-r", sha, "--", SCHEMAS_PREFIX])
-    for line in (listing or "").splitlines():
-        name = line.strip()
-        if not name.endswith(".json"):
-            continue
-        blob = git(["show", f"{sha}:{name}"])
-        if blob is None:
-            continue
-        try:
-            schemas[Path(name).stem] = json.loads(blob)
-        except ValueError:
-            continue
-    openapi_blob = git(["show", f"{sha}:{OPENAPI_PATH}"])
     openapi: Optional[JSONDict] = None
-    if openapi_blob is not None:
+    for line in listing.splitlines():
+        path = line.strip()
+        if not (path == OPENAPI_PATH or (path.startswith(SCHEMAS_PREFIX) and path.endswith(".json"))):
+            continue
+        blob = git(["show", f"{sha}:{path}"])
+        if blob is None:
+            return BaselineContracts({}, None, f"git show {sha[:9]}:{path} failed (blobless or partial clone?)")
         try:
-            openapi = json.loads(openapi_blob)
+            value = json.loads(blob)
         except ValueError:
-            openapi = None
-    return schemas, openapi
+            return BaselineContracts({}, None, f"{path} at {sha[:9]} is not valid JSON")
+        if path == OPENAPI_PATH:
+            openapi = value
+        else:
+            schemas[Path(path).stem] = value
+    return BaselineContracts(schemas, openapi, None)
 
 
 def _classify_baseline(
-    old: Optional[JSONDict], new: Optional[JSONDict], breaking_fn: Any,
+    old: Optional[JSONDict], new: Optional[JSONDict], breaking_fn: BreakingFn,
 ) -> List[Tuple[str, str]]:
     """Breaking differences between the baseline snapshot and a fresh export.
     Non-breaking drift is not a finding here: evolving away from the baseline
@@ -362,7 +390,7 @@ def _classify_baseline(
 
 class Artifact(NamedTuple):
     label: str
-    breaking_fn: Any
+    breaking_fn: BreakingFn
     baseline: Optional[JSONDict]
     committed: Optional[JSONDict]
     regenerated: Optional[JSONDict]
@@ -386,15 +414,21 @@ def _artifacts(
     return items
 
 
-def _evaluate(artifacts: List[Artifact], baseline_available: bool) -> Tuple[List[Finding], str]:
+def _evaluate(artifacts: List[Artifact], baseline_available: bool) -> Tuple[List[Finding], str, int]:
     """Both axes over every artifact: breaking vs the baseline (only when a
     baseline was resolved) and breaking/stale vs the committed snapshot.
-    Pure -- the selftest drives it with in-memory contracts."""
+    Returns the findings, a summary, and how many artifacts the baseline axis
+    actually compared -- a zero there must reach the detail line, or "the
+    baseline had nothing" reads exactly like "nothing broke". Pure: the
+    selftest drives it with in-memory contracts."""
     findings: List[Finding] = []
     breaking_files: List[str] = []
     stale_files: List[str] = []
+    compared = 0
 
     for art in artifacts:
+        if baseline_available and art.baseline is not None:
+            compared += 1
         baseline_items = (
             _classify_baseline(art.baseline, art.regenerated, art.breaking_fn) if baseline_available else []
         )
@@ -416,10 +450,11 @@ def _evaluate(artifacts: List[Artifact], baseline_available: bool) -> Tuple[List
                 findings.append(Finding(art.label, 0, f"{pointer}: {msg}" if pointer else msg))
 
     if breaking_files:
-        return findings, "breaking: " + ", ".join(breaking_files)
+        return findings, "breaking: " + ", ".join(breaking_files), compared
     if stale_files:
-        return findings, STALE_MESSAGE + " (" + ", ".join(stale_files) + ")"
-    return findings, f"{len(artifacts) - 1} schemas + openapi.json match their snapshots"
+        return findings, STALE_MESSAGE + " (" + ", ".join(stale_files) + ")", compared
+    schema_count = sum(1 for art in artifacts if art.label != OPENAPI_PATH)
+    return findings, f"{schema_count} schemas + openapi.json match their snapshots", compared
 
 
 def _read_dir(schemas_dir: Path) -> Dict[str, JSONDict]:
@@ -444,10 +479,12 @@ def run() -> CheckResult:
 
     git = _git(root)
     baseline = _resolve_baseline(os.environ, git)
-    baseline_schemas: Dict[str, JSONDict] = {}
-    baseline_openapi: Optional[JSONDict] = None
+    contracts = BaselineContracts({}, None, None)
     if baseline.sha is not None:
-        baseline_schemas, baseline_openapi = _baseline_snapshots(git, baseline.sha)
+        contracts = _baseline_contracts(git, baseline.sha)
+        if contracts.error:
+            # Resolved but unreadable is not a comparison either.
+            baseline = Baseline(None, f"{baseline.method}, but {contracts.error}")
 
     with tempfile.TemporaryDirectory() as td:
         tmp_schemas = Path(td) / "schemas"
@@ -465,21 +502,28 @@ def run() -> CheckResult:
                 return CheckResult("S6", "contract compatibility", "FAIL", [],
                                    f"{label} failed ({' '.join(cmd)}):\n    " + "\n    ".join(tail))
 
-        findings, detail = _evaluate(
-            _artifacts(baseline_schemas, _read_dir(schemas_dir), _read_dir(tmp_schemas),
-                       baseline_openapi, _load_json(openapi_path), _load_json(tmp_openapi)),
-            baseline.sha is not None,
-        )
+        artifacts = _artifacts(contracts.schemas, _read_dir(schemas_dir), _read_dir(tmp_schemas),
+                               contracts.openapi, _load_json(openapi_path), _load_json(tmp_openapi))
+        findings, detail, compared = _evaluate(artifacts, baseline.sha is not None)
 
     if baseline.sha is None:
         detail = f"{detail}; baseline unresolved — {baseline.method}"
-        # Never PASS on a comparison that did not happen (GUARDRAILS.md §3).
-        status = "FAIL" if findings or _in_ci(os.environ) else "SKIP"
-        return CheckResult("S6", "contract compatibility", status, findings, detail)
-
-    detail = f"{detail} [baseline {baseline.sha[:9]} — {baseline.method}]"
-    status = "FAIL" if findings else "PASS"
+    else:
+        detail = (f"{detail} [baseline {baseline.sha[:9]}: {compared}/{len(artifacts)} "
+                  f"contracts compared — {baseline.method}]")
+    status = _status_for(baseline.sha is not None, bool(findings), _in_ci(os.environ))
     return CheckResult("S6", "contract compatibility", status, findings, detail)
+
+
+def _status_for(baseline_resolved: bool, has_findings: bool, in_ci: bool) -> str:
+    """FAIL on findings; otherwise PASS only when a baseline was actually
+    compared. An unresolved baseline is a SKIP locally (with the reason) and
+    a FAIL in CI -- never PASS (GUARDRAILS.md §3, PROOFS rows 21 and 23)."""
+    if has_findings:
+        return "FAIL"
+    if baseline_resolved:
+        return "PASS"
+    return "FAIL" if in_ci else "SKIP"
 
 
 # --- self-test ---------------------------------------------------------
@@ -637,12 +681,23 @@ def _selftest_baseline_resolution(ok: bool) -> bool:
     ok = _check(ok, "CI pull_request falls back to origin/<base ref>",
                 base.sha == "c" * 40 and "origin/main" in base.method, base)
 
-    # 2. CI push -> merge-base with the default branch (from the payload)
-    push_env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push"}
+    # 2. CI push (branch != default) -> merge-base with the default branch
+    push_env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push", "GITHUB_REF_NAME": "topic"}
     base = _resolve_baseline(push_env, _fake_git({"merge-base HEAD origin/trunk": "d" * 40}),
                              lambda _env: {"repository": {"default_branch": "trunk"}})
     ok = _check(ok, "CI push resolves merge-base with the default branch",
                 base.sha == "d" * 40 and "merge-base with origin/trunk" in base.method, base)
+
+    # 2a. CI push TO the default branch -> event.before; merge-base would be HEAD
+    # itself, i.e. a compatibility check comparing the commit with itself.
+    main_push = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push", "GITHUB_REF_NAME": "main"}
+    base = _resolve_baseline(main_push, _fake_git({"cat-file -e": "", "merge-base": "h" * 40}),
+                             lambda _env: {"before": "9" * 40})
+    ok = _check(ok, "CI push to the default branch uses event.before, not merge-base",
+                base.sha == "9" * 40 and "event.before" in base.method, base)
+    base = _resolve_baseline(main_push, _fake_git({"merge-base": "h" * 40}), lambda _env: {"before": "0" * 40})
+    ok = _check(ok, "CI push to the default branch with no usable event.before is unresolved",
+                base.sha is None, base)
 
     # 2b. workflow_dispatch takes the same path (it is neither push nor pull_request)
     dispatch_env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "workflow_dispatch"}
@@ -664,8 +719,31 @@ def _selftest_baseline_resolution(ok: bool) -> bool:
                 and ci_unresolved.sha is None and FETCH_DEPTH_HINT in ci_unresolved.method,
                 (local_unresolved, ci_unresolved))
     ok = _check(ok, "unresolvable baseline is a SKIP locally and a FAIL in CI",
+                _status_for(False, False, in_ci=False) == "SKIP"
+                and _status_for(False, False, in_ci=True) == "FAIL"
+                and _status_for(True, False, in_ci=True) == "PASS"
+                and _status_for(False, True, in_ci=False) == "FAIL",
+                [_status_for(r, f, c) for r in (True, False) for f in (True, False) for c in (True, False)])
+    ok = _check(ok, "CI is detected from GITHUB_ACTIONS or CI",
                 not _in_ci({}) and _in_ci({"GITHUB_ACTIONS": "true"}) and _in_ci({"CI": "true"}),
                 (_in_ci({}), _in_ci({"GITHUB_ACTIONS": "true"})))
+
+    # 5. baseline resolved but unreadable (blobless/partial clone) -> error, which
+    # run() folds into the unresolved path rather than comparing nothing quietly
+    listed = f"{SCHEMAS_PREFIX}widget.json\n{OPENAPI_PATH}\n"
+    unreadable = _baseline_contracts(_fake_git({"ls-tree": listed}), "a" * 40)
+    ok = _check(ok, "baseline whose blobs cannot be read is an error, not an empty baseline",
+                unreadable.error is not None and not unreadable.schemas, unreadable)
+    listable = _baseline_contracts(_fake_git({"ls-tree": listed, "show": "{}"}), "a" * 40)
+    ok = _check(ok, "readable baseline blobs load with no error",
+                listable.error is None and set(listable.schemas) == {"widget"} and listable.openapi == {},
+                listable)
+    empty = _baseline_contracts(_fake_git({"ls-tree": ""}), "a" * 40)
+    ok = _check(ok, "baseline predating contracts/ is empty without an error",
+                empty.error is None and not empty.schemas and empty.openapi is None, empty)
+    broken = _baseline_contracts(_fake_git({}), "a" * 40)
+    ok = _check(ok, "baseline whose tree cannot be listed is an error",
+                broken.error is not None, broken)
     return ok
 
 
@@ -677,32 +755,32 @@ def _selftest_baseline_axis(ok: bool) -> bool:
     del broken["properties"]["status"]
     arts = [Artifact("contracts/schemas/widget.json", _diff_schema_breaking, _BASE_SCHEMA, broken, broken)]
 
-    findings, detail = _evaluate(arts, baseline_available=True)
+    findings, detail, compared = _evaluate(arts, baseline_available=True)
     ok = _check(ok, "breaking change + regenerated snapshot in one commit FAILs against the baseline",
                 any("removed property (breaking vs baseline)" in f.message for f in findings)
-                and detail.startswith("breaking:"), (findings, detail))
+                and detail.startswith("breaking:") and compared == 1, (findings, detail, compared))
 
-    findings, detail = _evaluate(arts, baseline_available=False)
+    findings, detail, compared = _evaluate(arts, baseline_available=False)
     ok = _check(ok, "without a baseline the same commit looks clean (the hole #25 closes)",
-                not findings, (findings, detail))
+                not findings and compared == 0, (findings, detail, compared))
 
     # additive drift away from the baseline is evolution, not a finding
     widened = json.loads(json.dumps(_BASE_SCHEMA))
     widened["properties"]["note"] = {"type": "string"}
-    findings, _ = _evaluate(
+    findings, _, _ = _evaluate(
         [Artifact("contracts/schemas/widget.json", _diff_schema_breaking, _BASE_SCHEMA, widened, widened)],
         baseline_available=True)
     ok = _check(ok, "additive change against the baseline is not a finding", not findings, findings)
 
     # a contract removed since the baseline is breaking even if nothing else moved
-    findings, _ = _evaluate(
+    findings, _, _ = _evaluate(
         [Artifact("contracts/schemas/widget.json", _diff_schema_breaking, _BASE_SCHEMA, None, None)],
         baseline_available=True)
     ok = _check(ok, "contract removed since the baseline is breaking",
                 any("removed since baseline" in f.message for f in findings), findings)
 
     # the stale axis survives: changed code, snapshot not regenerated
-    findings, detail = _evaluate(
+    findings, detail, _ = _evaluate(
         [Artifact("contracts/schemas/widget.json", _diff_schema_breaking, _BASE_SCHEMA, _BASE_SCHEMA, widened)],
         baseline_available=True)
     ok = _check(ok, "stale snapshot still reported when the change itself is compatible",
