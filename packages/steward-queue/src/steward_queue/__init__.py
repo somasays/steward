@@ -20,6 +20,9 @@ The moving parts, one module per aggregate behind this façade:
   new handlers are leashed on registration.
 * `worker` -- a minimal asyncio loop that claims and dispatches, opening a task
   span on the run's trace around every execution (I7). No LLM.
+* `execution` -- the mechanism the worker dispatches through: the handler's own
+  thread and connection, its wall-clock deadline, and the handoff that decides
+  which context records the attempt (SPEC.md §13, D7).
 
 A run's status follows its tasks: `pending` until one starts, `running` while
 any is in flight, and `succeeded`/`failed` the moment the last one settles --
