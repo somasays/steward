@@ -52,7 +52,7 @@ Full rationale for the load-bearing ones in `SPEC.md` §13 (D1–D6).
 | Qdrant + ElasticSearch | dense + lexical retrieval | estate search is bimodal (meaning + identifiers); RRF fusion is tuning-free | dense-only (fails identifier queries) — D3 |
 | Langfuse | traces, prompt versions, eval datasets | semantic observability + evals in one place; native LangGraph/LiteLLM integration | hand-rolled trace store |
 | Kubernetes + GitHub Actions + ArgoCD | delivery | GitOps promotion; prompts ride the same canary/rollback path as images — D6 | push-based deploys |
-| ruff, mypy --strict, pytest, import-linter, gitleaks, oasdiff | enforcement toolchain | buy-over-build: hand-roll only checks with no maintained tool | bespoke checkers for solved problems |
+| ruff, mypy --strict, pytest, import-linter, gitleaks | enforcement toolchain | buy-over-build: hand-roll only checks with no maintained tool | bespoke checkers for solved problems; oasdiff for S6 (a Go binary would break Tier S's no-extra-toolchain guarantee — a stdlib differ does the same job) |
 
 ## 4. Architectural approaches
 

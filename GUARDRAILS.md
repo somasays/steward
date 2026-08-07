@@ -21,7 +21,7 @@ Checks are tiered by *how* they measure, because different properties fail at di
 | ID | Fitness function | Protects | Measurement | Status |
 |----|------------------|----------|-------------|--------|
 | S1 | Boundaries & containment | I2, I4, I9, N9 | import-linter contracts (layers `services → packages`, declared package edges, schemas independence — `pyproject.toml` `[tool.importlinter]`) + ruff TID251 banned-api (kitchen-sink frameworks banned everywhere; `langgraph`/`litellm`/provider SDKs unbanned only in their home package's own `pyproject.toml`, which overrides the root banned-api table). Schemas purity additionally enforced by isolated `uv run --isolated --package steward-schemas` import | active (issue #9) |
-| S2 | Runtime size budget | I9 | `check_loc_budget.py` — effective LOC of `packages/steward-agents` ≤ 2,000 (custom: no tool does per-package budgets) | active |
+| S2 | Runtime size budget | I9 | `check_loc_budget.py` — effective LOC of `packages/steward-agents` ≤ 2,000 (custom: no tool does per-package budgets). SKIPs while the package is a skeleton: a budget check over 5 lines would read as "the runtime fits" when there is no runtime (issue #21) | skips until M1 |
 | S3 | SQL string-assembly ban | I5, N7 | ruff S608, selected globally (including `scripts/fitness`, which is otherwise style-exempt) | active (issue #9) |
 | S4 | Prompt literal ban | I10 | `check_prompt_hygiene.py` — prompt-shaped literals outside `prompts/` (custom: domain-specific) | active |
 | S5 | Public-surface lock | I9, I3 | `check_surface.py` — no contained-module type in any package's public signatures, class bases, or re-exports | active |
@@ -142,7 +142,7 @@ Not everything reduces to a check. The `architecture-guardian` subagent and huma
 
 ## 5. Enforcement status
 
-Active now: S1–S5 (S1/S3 tool-backed: import-linter + ruff; S2/S4/S5 stdlib), S7, H1, H3, H4 (wall-clock half), G1–G3, G4 (gitleaks: CI hard gate + local pass-through), G5. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced invariants in the meantime — I6 (until masking lands, M1) and the tracing half of I7 (until #5) — are the `architecture-guardian`'s explicit responsibility.
+Active now: S1, S3–S7 (S1/S3 tool-backed: import-linter + ruff; S4–S7 stdlib), H1, H3, H4 (wall-clock half), G1–G3, G4 (gitleaks CLI, full history, same command on push and PR), G5. S2 skips until there is a runtime to bound. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced invariants in the meantime — I6 (until masking lands, M1) and the tracing half of I7 (until #5) — are the `architecture-guardian`'s explicit responsibility.
 
 ## 6. Amendment process
 
