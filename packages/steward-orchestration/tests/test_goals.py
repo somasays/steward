@@ -8,7 +8,10 @@ the two packages agree on task-type *names*, and this is where that agreement
 is verified instead of assumed.
 
 `test_every_registered_planner_is_deterministic` binds the same way: it is
-ARCHITECTURE.md §4's "planners are deterministic and pure" turned into a check
+ARCHITECTURE.md §4's "planners are deterministic and pure" turned into a harness
+over each goal's representative payload -- falsifiable evidence, not a proof for
+every input: a planner deterministic here but time-dependent on another branch
+would still pass
 (issue #37), run against every registration's required `sample_payload`
 (GUARDRAILS.md §3, the same registry-bound shape H1 uses).
 """
