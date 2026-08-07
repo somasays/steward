@@ -1,0 +1,77 @@
+{
+  "$defs": {
+    "SourceEngine": {
+      "description": "Database engines Steward can connect to (SPEC.md \u00a72 system diagram).",
+      "enum": [
+        "postgres",
+        "mysql",
+        "snowflake"
+      ],
+      "title": "SourceEngine",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "`POST /v1/sources` request body (SPEC.md \u00a78, issue #20).\n\nCarries a **secret reference**, never a DSN: the credential lives in the\ndeployment's secret store and is resolved at connection time, so it is\nreadable from neither the database nor any API response (I5, N7).\n\n`host`, `database` and the schema filter are not decoration -- together with\n`engine` they are the source's natural key, which is what makes\nregistration idempotent. Two registrations of the same database under\ndifferent filters are two sources, because they describe two different\nsubsets of it.\n\nAn empty `include_schemas` means \"every schema except the excluded ones\",\nso schemas created upstream *after* registration are picked up by the next\nscan. A non-empty `include_schemas` is a closed allowlist: new schemas are\nnever scanned until the allowlist is changed, which is the point of asking\nfor one.",
+  "properties": {
+    "database": {
+      "title": "Database",
+      "type": "string"
+    },
+    "dsn_secret_ref": {
+      "title": "Dsn Secret Ref",
+      "type": "string"
+    },
+    "engine": {
+      "$ref": "#/$defs/SourceEngine"
+    },
+    "exclude_schemas": {
+      "default": [
+        "information_schema",
+        "pg_catalog"
+      ],
+      "items": {
+        "type": "string"
+      },
+      "title": "Exclude Schemas",
+      "type": "array"
+    },
+    "host": {
+      "title": "Host",
+      "type": "string"
+    },
+    "include_schemas": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Include Schemas",
+      "type": "array"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "scan_schedule": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Scan Schedule"
+    }
+  },
+  "required": [
+    "name",
+    "engine",
+    "host",
+    "database",
+    "dsn_secret_ref"
+  ],
+  "title": "SourceCreate",
+  "type": "object"
+}

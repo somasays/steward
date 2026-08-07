@@ -1,4 +1,16 @@
 {
+  "$defs": {
+    "AssetLifecycle": {
+      "description": "SPEC.md \u00a77: \"lifecycle: active|missing|deprecated\".",
+      "enum": [
+        "active",
+        "missing",
+        "deprecated"
+      ],
+      "title": "AssetLifecycle",
+      "type": "string"
+    }
+  },
   "additionalProperties": false,
   "description": "A column of an `Asset`. `data_type` is the source engine's own type\nname (e.g. \"varchar\", \"numeric(10,2)\") \u2014 engines disagree on type\nsystems, so this is deliberately a string rather than a closed enum.",
   "properties": {
@@ -20,6 +32,10 @@
       "format": "uuid",
       "title": "Id",
       "type": "string"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/AssetLifecycle",
+      "default": "active"
     },
     "name": {
       "title": "Name",

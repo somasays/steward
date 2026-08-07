@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import UUID
 
 from steward_schemas._base import SchemaModel
+from steward_schemas.asset import AssetLifecycle
 
 
 class Column(SchemaModel):
@@ -19,5 +20,11 @@ class Column(SchemaModel):
     data_type: str
     ordinal: int
     nullable: bool
+    lifecycle: AssetLifecycle = AssetLifecycle.ACTIVE
+    """A column dropped upstream is marked, never deleted — the same
+    append-only rule its asset follows (ARCHITECTURE.md §4). Defaulted rather
+    than required because this contract was published without it and S6 reads a
+    newly-required property as a breaking change."""
+
     created_at: datetime
     updated_at: datetime

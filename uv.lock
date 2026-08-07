@@ -10,6 +10,7 @@ resolution-markers = [
 members = [
     "steward-agents",
     "steward-api",
+    "steward-catalog",
     "steward-llm",
     "steward-orchestration",
     "steward-queue",
@@ -1446,6 +1447,31 @@ dev = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pgserver", specifier = ">=0.1.4" },
 ]
+
+[[package]]
+name = "steward-catalog"
+version = "0.1.0"
+source = { editable = "packages/steward-catalog" }
+dependencies = [
+    { name = "psycopg", extra = ["binary"] },
+    { name = "steward-queue" },
+    { name = "steward-schemas" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pgserver" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "steward-queue", editable = "packages/steward-queue" },
+    { name = "steward-schemas", editable = "packages/steward-schemas" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pgserver", specifier = ">=0.1.4" }]
 
 [[package]]
 name = "steward-llm"
