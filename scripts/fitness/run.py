@@ -120,6 +120,7 @@ def main() -> int:
         _script_or_pending("S5", "public-surface lock", "check_surface.py"),
         _script_or_pending("S6", "contract compatibility", "check_contracts.py"),
         check_filegraph.run(),           # S7
+        _script_or_pending("S8", "checker self-tests", "check_selftests.py"),
         # Tier H — behavioral harnesses
         _tool_check("H*", "invariant harnesses", ["uv", "run", "pytest", "-q", "-m", "invariants"],
                     not_installed or ("" if has_tests else "no tests yet"), no_harness),
