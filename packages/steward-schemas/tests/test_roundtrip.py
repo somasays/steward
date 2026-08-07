@@ -17,7 +17,9 @@ from steward_schemas import (
     CONTRACTS,
     AgentSpec,
     Asset,
+    AssetDetail,
     AssetLifecycle,
+    AssetPage,
     AssetType,
     Column,
     ProblemDetails,
@@ -26,6 +28,7 @@ from steward_schemas import (
     RunCreate,
     RunStatus,
     Source,
+    SourceCreate,
     SourceEngine,
     TaskResult,
     TaskSpec,
@@ -96,6 +99,26 @@ def build_column() -> Column:
         created_at=NOW,
         updated_at=NOW,
     )
+
+
+def build_source_create() -> SourceCreate:
+    return SourceCreate(
+        name="warehouse-prod",
+        engine=SourceEngine.POSTGRES,
+        host="warehouse.internal",
+        database="analytics",
+        dsn_secret_ref="env:STEWARD_SOURCE_DSN_WAREHOUSE",
+        include_schemas=("public", "sales"),
+        scan_schedule="0 * * * *",
+    )
+
+
+def build_asset_page() -> AssetPage:
+    return AssetPage(items=(build_asset(),), next_cursor="cHVibGljLm9yZGVycw")
+
+
+def build_asset_detail() -> AssetDetail:
+    return AssetDetail(asset=build_asset(), columns=(build_column(),))
 
 
 def build_task_spec() -> TaskSpec:
@@ -169,7 +192,10 @@ def build_run() -> Run:
 # test_contract_sample_roundtrips.
 SAMPLES: dict[str, BaseModel] = {
     "source": build_source(),
+    "source_create": build_source_create(),
     "asset": build_asset(),
+    "asset_detail": build_asset_detail(),
+    "asset_page": build_asset_page(),
     "column": build_column(),
     "task_spec": build_task_spec(),
     "task_result": build_task_result_succeeded(),
@@ -184,6 +210,7 @@ SAMPLES: dict[str, BaseModel] = {
 # entry (a second, distinct instance of an already-covered contract).
 EXTRA_SAMPLES: dict[str, BaseModel] = {
     "source_without_schedule": build_source_no_schedule(),
+    "asset_page_last": AssetPage(items=()),
     "task_result_failed": build_task_result_failed(),
     "problem_details_minimal": ProblemDetails(title="Internal error", status=500),
 }

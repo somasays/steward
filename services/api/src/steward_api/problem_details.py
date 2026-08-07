@@ -52,6 +52,21 @@ def not_found(detail: str, *, instance: str | None = None) -> ProblemDetailsErro
     )
 
 
+def bad_request(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `400 Bad Request` problem, e.g. a pagination cursor this API never
+    issued. 400 rather than 422: the cursor is not a field whose *value* is out
+    of range, it is a token the client should only ever be echoing back."""
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:bad-request",
+            title="Malformed request",
+            status=status.HTTP_400_BAD_REQUEST,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
 def conflict(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
     """A `409 Conflict` problem, e.g. an idempotency key reused for a
     different request body."""
@@ -84,6 +99,22 @@ def unknown_goal(detail: str, *, instance: str | None = None) -> ProblemDetailsE
     )
 
 
+def sanitized_errors(errors: Sequence[ErrorDetails]) -> list[dict[str, object]]:
+    """Per-field validation detail with the submitted values stripped out.
+
+    Pydantic's `ErrorDetails` carries `input` (and sometimes `ctx`), which echo
+    the offending value back. That turns any rejected field into a mirror -- and
+    the first field this API rejects for *being* a credential is
+    `SourceCreate.dsn_secret_ref`, where a client that posts a DSN instead of a
+    secret reference would otherwise get the password reflected into the
+    response body, its own logs, and any proxy that records bodies (N7).
+
+    Dropping them costs a client nothing: it knows what it sent. `loc` says
+    which field, `type` and `msg` say what was wrong with it.
+    """
+    return [{"type": error["type"], "loc": list(error["loc"]), "msg": error["msg"]} for error in errors]
+
+
 def invalid_goal_payload(
     detail: str, errors: Sequence[ErrorDetails], *, instance: str | None = None
 ) -> ProblemDetailsError:
@@ -101,7 +132,7 @@ def invalid_goal_payload(
                 "status": status.HTTP_422_UNPROCESSABLE_CONTENT,
                 "detail": detail,
                 "instance": instance,
-                "errors": jsonable_encoder(errors),
+                "errors": jsonable_encoder(sanitized_errors(errors)),
             }
         )
     )
@@ -137,7 +168,7 @@ def install_problem_details(app: FastAPI) -> None:
                 "status": status.HTTP_422_UNPROCESSABLE_CONTENT,
                 "detail": "request body/parameters failed schema validation",
                 "instance": request.url.path,
-                "errors": jsonable_encoder(exc.errors()),
+                "errors": jsonable_encoder(sanitized_errors(exc.errors())),
             }
         )
         return _problem_response(problem)

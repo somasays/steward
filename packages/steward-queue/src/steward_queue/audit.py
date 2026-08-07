@@ -1,10 +1,17 @@
-"""The audit write every mutation in this package makes.
+"""The audit write every mutation makes.
 
-A state mutation and its audit row are one write. `_audit` runs on the
+A state mutation and its audit row are one write. `write_audit` runs on the
 mutation's own connection, between the mutation and the caller's commit, so I7
 holds by construction rather than by reviewer attention -- there is no audit
 row that can survive a rolled-back mutation, and no mutation that can commit
 without one.
+
+It is public because `audit_log` is the whole system's ledger, not this
+package's: the catalog (issue #20) mutates `sources`/`assets`/`columns` in the
+same database and must write the same rows the same way. A second
+implementation of this INSERT elsewhere would be a second opinion about what an
+audit row is, which is exactly the drift I7 exists to prevent -- so the writer
+is shared and the caller supplies the entity vocabulary.
 
 SQL lives in `_sql` as static constants (I5).
 """
@@ -22,7 +29,7 @@ RUN_ENTITY = "run"
 TASK_ENTITY = "task"
 
 
-def _audit(
+def write_audit(
     conn: QueueConnection,
     *,
     actor: Actor,

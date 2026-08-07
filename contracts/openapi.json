@@ -1,6 +1,192 @@
 {
   "components": {
     "schemas": {
+      "Asset": {
+        "additionalProperties": false,
+        "description": "A table or view discovered by scanning a `Source`.",
+        "properties": {
+          "asset_type": {
+            "$ref": "#/components/schemas/AssetType"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "fqn": {
+            "title": "Fqn",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "lifecycle": {
+            "$ref": "#/components/schemas/AssetLifecycle"
+          },
+          "source_id": {
+            "format": "uuid",
+            "title": "Source Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "workspace_id": {
+            "format": "uuid",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "source_id",
+          "fqn",
+          "asset_type",
+          "lifecycle",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "Asset",
+        "type": "object"
+      },
+      "AssetDetail": {
+        "additionalProperties": false,
+        "description": "`GET /v1/assets/{id}`: the asset and the columns discovered on it,\nin the source's own ordinal order.",
+        "properties": {
+          "asset": {
+            "$ref": "#/components/schemas/Asset"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/Column"
+            },
+            "title": "Columns",
+            "type": "array"
+          }
+        },
+        "required": [
+          "asset",
+          "columns"
+        ],
+        "title": "AssetDetail",
+        "type": "object"
+      },
+      "AssetLifecycle": {
+        "description": "SPEC.md \u00a77: \"lifecycle: active|missing|deprecated\".",
+        "enum": [
+          "active",
+          "missing",
+          "deprecated"
+        ],
+        "title": "AssetLifecycle",
+        "type": "string"
+      },
+      "AssetPage": {
+        "additionalProperties": false,
+        "description": "One page of `GET /v1/assets`.\n\n`next_cursor` is opaque and is `None` on the last page. Cursors rather than\noffsets (SPEC.md \u00a78) because a scan running concurrently with a client's\npagination would shift offsets underneath it, silently skipping assets --\nthe one thing a catalog listing must not do.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Asset"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "AssetPage",
+        "type": "object"
+      },
+      "AssetType": {
+        "enum": [
+          "table",
+          "view"
+        ],
+        "title": "AssetType",
+        "type": "string"
+      },
+      "Column": {
+        "additionalProperties": false,
+        "description": "A column of an `Asset`. `data_type` is the source engine's own type\nname (e.g. \"varchar\", \"numeric(10,2)\") \u2014 engines disagree on type\nsystems, so this is deliberately a string rather than a closed enum.",
+        "properties": {
+          "asset_id": {
+            "format": "uuid",
+            "title": "Asset Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "data_type": {
+            "title": "Data Type",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "lifecycle": {
+            "$ref": "#/components/schemas/AssetLifecycle",
+            "default": "active"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "nullable": {
+            "title": "Nullable",
+            "type": "boolean"
+          },
+          "ordinal": {
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "workspace_id": {
+            "format": "uuid",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "asset_id",
+          "name",
+          "data_type",
+          "ordinal",
+          "nullable",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "Column",
+        "type": "object"
+      },
       "ProblemDetails": {
         "additionalProperties": true,
         "description": "A machine-readable error, per RFC 9457 (obsoletes RFC 7807).\n\nDeviates from the package's usual `extra=\"forbid\"` (see `_base.SchemaModel`)\nby design: RFC 9457 defines problem types as extensible with additional\nmembers beyond `type`/`title`/`status`/`detail`/`instance`, and Steward's\nAPI surface uses that \u2014 e.g. a `budget_exceeded` problem carries the\n`RunBudget` that was exceeded as an extension member. Still frozen:\nan error value is a fact about what happened, not something to mutate.",
@@ -189,6 +375,140 @@
         ],
         "title": "RunStatus",
         "type": "string"
+      },
+      "Source": {
+        "additionalProperties": false,
+        "description": "A connection registration. Never carries a raw DSN or credential\n(I5, N7, I4's neighbor \"no credentials in git\") \u2014 only a reference into\nthe secret store the deployment configures.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "dsn_secret_ref": {
+            "title": "Dsn Secret Ref",
+            "type": "string"
+          },
+          "engine": {
+            "$ref": "#/components/schemas/SourceEngine"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "scan_schedule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scan Schedule"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "workspace_id": {
+            "format": "uuid",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "name",
+          "engine",
+          "dsn_secret_ref",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "Source",
+        "type": "object"
+      },
+      "SourceCreate": {
+        "additionalProperties": false,
+        "description": "`POST /v1/sources` request body (SPEC.md \u00a78, issue #20).\n\nCarries a **secret reference**, never a DSN: the credential lives in the\ndeployment's secret store and is resolved at connection time, so it is\nreadable from neither the database nor any API response (I5, N7).\n\n`host`, `database` and the schema filter are not decoration -- together with\n`engine` they are the source's natural key, which is what makes\nregistration idempotent. Two registrations of the same database under\ndifferent filters are two sources, because they describe two different\nsubsets of it.\n\nAn empty `include_schemas` means \"every schema except the excluded ones\",\nso schemas created upstream *after* registration are picked up by the next\nscan. A non-empty `include_schemas` is a closed allowlist: new schemas are\nnever scanned until the allowlist is changed, which is the point of asking\nfor one.",
+        "properties": {
+          "database": {
+            "title": "Database",
+            "type": "string"
+          },
+          "dsn_secret_ref": {
+            "pattern": "^[a-z][a-z0-9_]*:[A-Za-z0-9_.-]+$",
+            "title": "Dsn Secret Ref",
+            "type": "string"
+          },
+          "engine": {
+            "$ref": "#/components/schemas/SourceEngine"
+          },
+          "exclude_schemas": {
+            "default": [
+              "information_schema",
+              "pg_catalog"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "title": "Exclude Schemas",
+            "type": "array"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "include_schemas": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Include Schemas",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "scan_schedule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scan Schedule"
+          }
+        },
+        "required": [
+          "name",
+          "engine",
+          "host",
+          "database",
+          "dsn_secret_ref"
+        ],
+        "title": "SourceCreate",
+        "type": "object"
+      },
+      "SourceEngine": {
+        "description": "Database engines Steward can connect to (SPEC.md \u00a72 system diagram).",
+        "enum": [
+          "postgres",
+          "mysql",
+          "snowflake"
+        ],
+        "title": "SourceEngine",
+        "type": "string"
       }
     }
   },
@@ -220,6 +540,167 @@
         "summary": "Healthz",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/v1/assets": {
+      "get": {
+        "operationId": "list_assets_v1_assets_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Malformed pagination cursor"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "List Assets",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/v1/assets/{asset_id}": {
+      "get": {
+        "operationId": "get_asset_v1_assets__asset_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Asset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Asset not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "Get Asset",
+        "tags": [
+          "assets"
         ]
       }
     },
@@ -362,6 +843,156 @@
         "summary": "Get Run",
         "tags": [
           "runs"
+        ]
+      }
+    },
+    "/v1/sources": {
+      "post": {
+        "operationId": "register_source_v1_sources_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Source"
+                }
+              }
+            },
+            "description": "The source was already registered under this key"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Source"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "Register Source",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/v1/sources/{source_id}/scan": {
+      "post": {
+        "operationId": "scan_source_v1_sources__source_id__scan_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Source Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Source not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Idempotency key reused with a different request"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "Scan Source",
+        "tags": [
+          "sources"
         ]
       }
     }

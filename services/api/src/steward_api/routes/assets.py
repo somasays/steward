@@ -1,0 +1,70 @@
+"""`GET /v1/assets`, `GET /v1/assets/{id}` (SPEC.md §8, issue #20).
+
+Cursor pagination, not offsets: a scan committing between two pages would shift
+offsets underneath a client and silently skip assets. The cursor is opaque and
+the store issues it; a cursor this API did not produce is a 400, never a
+different page.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Any
+from uuid import UUID
+
+from fastapi import APIRouter, Query
+from steward_catalog import InvalidCursor
+from steward_schemas import AssetDetail, AssetPage, ProblemDetails
+
+from steward_api.catalog import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, CatalogStore
+from steward_api.problem_details import bad_request, not_found
+
+ASSETS_PATH = "/v1/assets"
+
+_NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
+    404: {"model": ProblemDetails, "description": "Asset not found"}
+}
+_BAD_REQUEST_RESPONSE: dict[int | str, dict[str, Any]] = {
+    400: {"model": ProblemDetails, "description": "Malformed pagination cursor"}
+}
+_VALIDATION_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
+    422: {"model": ProblemDetails, "description": "Validation error"}
+}
+_INTERNAL_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
+    500: {"model": ProblemDetails, "description": "Unexpected server error"}
+}
+
+PageLimit = Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)]
+
+
+def build_router(store: CatalogStore) -> APIRouter:
+    """Bind the `/v1/assets` router to `store`."""
+
+    router = APIRouter(prefix=ASSETS_PATH, tags=["assets"])
+
+    @router.get(
+        "",
+        response_model=AssetPage,
+        responses={**_BAD_REQUEST_RESPONSE, **_VALIDATION_ERROR_RESPONSE, **_INTERNAL_ERROR_RESPONSE},
+    )
+    async def list_assets(
+        source: UUID | None = None,
+        cursor: str | None = None,
+        limit: PageLimit = DEFAULT_PAGE_SIZE,
+    ) -> AssetPage:
+        try:
+            return await store.list_assets(source_id=source, cursor=cursor, limit=limit)
+        except InvalidCursor as exc:
+            raise bad_request(str(exc), instance=ASSETS_PATH) from exc
+
+    @router.get(
+        "/{asset_id}",
+        response_model=AssetDetail,
+        responses={**_NOT_FOUND_RESPONSE, **_VALIDATION_ERROR_RESPONSE, **_INTERNAL_ERROR_RESPONSE},
+    )
+    async def get_asset(asset_id: UUID) -> AssetDetail:
+        detail = await store.get_asset(asset_id)
+        if detail is None:
+            raise not_found(f"asset {asset_id} not found", instance=f"{ASSETS_PATH}/{asset_id}")
+        return detail
+
+    return router

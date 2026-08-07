@@ -1,0 +1,159 @@
+{
+  "$defs": {
+    "Asset": {
+      "additionalProperties": false,
+      "description": "A table or view discovered by scanning a `Source`.",
+      "properties": {
+        "asset_type": {
+          "$ref": "#/$defs/AssetType"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "fqn": {
+          "title": "Fqn",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "title": "Id",
+          "type": "string"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/AssetLifecycle"
+        },
+        "source_id": {
+          "format": "uuid",
+          "title": "Source Id",
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        },
+        "workspace_id": {
+          "format": "uuid",
+          "title": "Workspace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "source_id",
+        "fqn",
+        "asset_type",
+        "lifecycle",
+        "created_at",
+        "updated_at"
+      ],
+      "title": "Asset",
+      "type": "object"
+    },
+    "AssetLifecycle": {
+      "description": "SPEC.md \u00a77: \"lifecycle: active|missing|deprecated\".",
+      "enum": [
+        "active",
+        "missing",
+        "deprecated"
+      ],
+      "title": "AssetLifecycle",
+      "type": "string"
+    },
+    "AssetType": {
+      "enum": [
+        "table",
+        "view"
+      ],
+      "title": "AssetType",
+      "type": "string"
+    },
+    "Column": {
+      "additionalProperties": false,
+      "description": "A column of an `Asset`. `data_type` is the source engine's own type\nname (e.g. \"varchar\", \"numeric(10,2)\") \u2014 engines disagree on type\nsystems, so this is deliberately a string rather than a closed enum.",
+      "properties": {
+        "asset_id": {
+          "format": "uuid",
+          "title": "Asset Id",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data_type": {
+          "title": "Data Type",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "title": "Id",
+          "type": "string"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/AssetLifecycle",
+          "default": "active"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "nullable": {
+          "title": "Nullable",
+          "type": "boolean"
+        },
+        "ordinal": {
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        },
+        "workspace_id": {
+          "format": "uuid",
+          "title": "Workspace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "asset_id",
+        "name",
+        "data_type",
+        "ordinal",
+        "nullable",
+        "created_at",
+        "updated_at"
+      ],
+      "title": "Column",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "`GET /v1/assets/{id}`: the asset and the columns discovered on it,\nin the source's own ordinal order.",
+  "properties": {
+    "asset": {
+      "$ref": "#/$defs/Asset"
+    },
+    "columns": {
+      "items": {
+        "$ref": "#/$defs/Column"
+      },
+      "title": "Columns",
+      "type": "array"
+    }
+  },
+  "required": [
+    "asset",
+    "columns"
+  ],
+  "title": "AssetDetail",
+  "type": "object"
+}

@@ -88,3 +88,20 @@ def test_an_unexpected_server_error_is_sanitized_problem_details(
     assert record.levelno == logging.ERROR
     assert record.exc_info is not None
     assert _SECRET_DETAIL in caplog.text
+
+
+def test_a_validation_error_never_reflects_the_submitted_value(client: TestClient) -> None:
+    """N7: a rejected field must not become a mirror.
+
+    Pydantic's error details carry `input`, so echoing them verbatim would put
+    whatever the client sent -- including a credential posted into the wrong
+    field -- in the response body, its logs, and any body-recording proxy.
+    """
+    rejected = client.post("/v1/runs", json={"goal": 12345, "payload": {"secret": "hunter2"}})
+
+    assert rejected.status_code == 422
+    assert "hunter2" not in rejected.text
+    assert "12345" not in rejected.text
+    # ...while still telling the client which field was wrong.
+    assert any(error["loc"] == ["body", "goal"] for error in rejected.json()["errors"])
+    assert all(set(error) == {"type", "loc", "msg"} for error in rejected.json()["errors"])

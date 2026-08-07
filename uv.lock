@@ -10,6 +10,7 @@ resolution-markers = [
 members = [
     "steward-agents",
     "steward-api",
+    "steward-catalog",
     "steward-llm",
     "steward-orchestration",
     "steward-queue",
@@ -1418,6 +1419,7 @@ version = "0.1.0"
 source = { editable = "services/api" }
 dependencies = [
     { name = "fastapi" },
+    { name = "steward-catalog" },
     { name = "steward-orchestration" },
     { name = "steward-queue" },
     { name = "steward-schemas" },
@@ -1434,6 +1436,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "steward-catalog", editable = "packages/steward-catalog" },
     { name = "steward-orchestration", editable = "packages/steward-orchestration" },
     { name = "steward-queue", editable = "packages/steward-queue" },
     { name = "steward-schemas", editable = "packages/steward-schemas" },
@@ -1446,6 +1449,31 @@ dev = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "pgserver", specifier = ">=0.1.4" },
 ]
+
+[[package]]
+name = "steward-catalog"
+version = "0.1.0"
+source = { editable = "packages/steward-catalog" }
+dependencies = [
+    { name = "psycopg", extra = ["binary"] },
+    { name = "steward-queue" },
+    { name = "steward-schemas" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pgserver" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "steward-queue", editable = "packages/steward-queue" },
+    { name = "steward-schemas", editable = "packages/steward-schemas" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pgserver", specifier = ">=0.1.4" }]
 
 [[package]]
 name = "steward-llm"
@@ -1468,6 +1496,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "steward-catalog" },
     { name = "steward-queue" },
 ]
 
@@ -1475,7 +1504,10 @@ dev = [
 requires-dist = [{ name = "steward-schemas", editable = "packages/steward-schemas" }]
 
 [package.metadata.requires-dev]
-dev = [{ name = "steward-queue", editable = "packages/steward-queue" }]
+dev = [
+    { name = "steward-catalog", editable = "packages/steward-catalog" },
+    { name = "steward-queue", editable = "packages/steward-queue" },
+]
 
 [[package]]
 name = "steward-queue"
@@ -1547,12 +1579,14 @@ name = "steward-workers"
 version = "0.1.0"
 source = { editable = "services/workers" }
 dependencies = [
+    { name = "steward-catalog" },
     { name = "steward-queue" },
     { name = "steward-telemetry" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "steward-catalog", editable = "packages/steward-catalog" },
     { name = "steward-queue", editable = "packages/steward-queue" },
     { name = "steward-telemetry", editable = "packages/steward-telemetry" },
 ]

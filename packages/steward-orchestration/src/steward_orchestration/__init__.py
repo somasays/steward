@@ -20,7 +20,16 @@ Importing this package registers its goals, the same way importing
 the import alone, with no setup call a caller could forget.
 """
 
-from steward_orchestration.goals import NOOP_BUDGET, NOOP_GOAL, NOOP_TASK_TYPE, NoopParams
+from steward_orchestration.goals import (
+    NOOP_BUDGET,
+    NOOP_GOAL,
+    NOOP_TASK_TYPE,
+    SCAN_SOURCE_BUDGET,
+    SCAN_SOURCE_GOAL,
+    SCAN_SOURCE_TASK_TYPE,
+    NoopParams,
+    ScanSourceParams,
+)
 from steward_orchestration.registry import (
     DEFAULT_MAX_ATTEMPTS,
     DisallowedTaskType,
@@ -43,6 +52,9 @@ __all__ = [
     "NOOP_BUDGET",
     "NOOP_GOAL",
     "NOOP_TASK_TYPE",
+    "SCAN_SOURCE_BUDGET",
+    "SCAN_SOURCE_GOAL",
+    "SCAN_SOURCE_TASK_TYPE",
     "DisallowedTaskType",
     "EmptyRunPlan",
     "GoalParams",
@@ -52,6 +64,7 @@ __all__ = [
     "Planner",
     "PlannedTask",
     "RunPlan",
+    "ScanSourceParams",
     "UnknownGoal",
     "get_goal",
     "goal",

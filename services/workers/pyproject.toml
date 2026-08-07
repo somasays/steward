@@ -6,6 +6,11 @@ requires-python = ">=3.12"
 dependencies = [
     "steward-queue",
     "steward-telemetry",
+    # A worker process can only execute the handlers registered in its own
+    # process. Depending on the catalog -- and importing it in `__main__`
+    # before the worker is built -- is what puts `scan_source` on the list of
+    # task types this process claims.
+    "steward-catalog",
 ]
 
 [project.scripts]
@@ -14,6 +19,7 @@ steward-worker = "steward_workers.__main__:main"
 [tool.uv.sources]
 steward-queue = { workspace = true }
 steward-telemetry = { workspace = true }
+steward-catalog = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

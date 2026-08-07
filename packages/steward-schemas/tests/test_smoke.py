@@ -16,7 +16,10 @@ def test_export_resolves(name: str) -> None:
 def test_contracts_registry_exported() -> None:
     assert set(steward_schemas.CONTRACTS) == {
         "source",
+        "source_create",
         "asset",
+        "asset_detail",
+        "asset_page",
         "column",
         "task_spec",
         "task_result",

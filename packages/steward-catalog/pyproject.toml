@@ -1,0 +1,33 @@
+[project]
+name = "steward-catalog"
+version = "0.1.0"
+description = "Deterministic metadata catalog: secret-resolved read-only source inspection, convergent persistence, scan handler (I1/I5/I7/I8)."
+requires-python = ">=3.12"
+dependencies = [
+    "steward-schemas",
+    # The system of record and the ledger: catalog rows and their audit rows are
+    # written on the queue's connection, inside the task's transaction (I7).
+    "steward-queue",
+    # The read side. A second, separate connection to the *customer's* database,
+    # never the one Steward writes through -- see `inspector`.
+    "psycopg[binary]>=3.2",
+]
+
+[tool.uv.sources]
+steward-schemas = { workspace = true }
+steward-queue = { workspace = true }
+
+[dependency-groups]
+dev = [
+    # Convergence is a Postgres property (unique indexes, transaction
+    # visibility), so the harnesses run against a real server; pgserver ships
+    # the binaries, no Docker (GUARDRAILS.md Tier H).
+    "pgserver>=0.1.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/steward_catalog"]
