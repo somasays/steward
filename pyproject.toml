@@ -38,11 +38,12 @@ select = ["E", "F", "I", "UP", "B", "S608", "TID251"]
 "scripts/fitness/*.py" = ["E", "F", "I", "UP", "B"]
 
 # S1 containment (I2, I9): kitchen-sink frameworks banned everywhere, contained modules
-# (langgraph, litellm, provider SDKs) banned by default and unbanned only inside their
-# home package's own pyproject.toml, which extends this file and replaces this table
+# (langgraph, litellm, langfuse, provider SDKs) banned by default and unbanned only inside
+# their home package's own pyproject.toml, which extends this file and replaces this table
 # (Ruff config tables don't merge across an `extend` chain -- the override must restate
-# the full dict minus the modules that package owns). Keep the two package overrides
-# (packages/steward-agents, packages/steward-llm) in sync with this list.
+# the full dict minus the modules that package owns). Keep the three package overrides
+# (packages/steward-agents, packages/steward-llm, packages/steward-telemetry) in sync with
+# this list.
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "langchain" = { msg = "kitchen-sink framework banned everywhere (I9)" }
 "langchain_community" = { msg = "kitchen-sink framework banned everywhere (I9)" }
@@ -53,6 +54,7 @@ select = ["E", "F", "I", "UP", "B", "S608", "TID251"]
 "pydantic_ai" = { msg = "kitchen-sink framework banned everywhere (I9)" }
 "haystack" = { msg = "kitchen-sink framework banned everywhere (I9)" }
 "langgraph" = { msg = "contained: steward-agents only (I2/I9)" }
+"langfuse" = { msg = "contained: steward-telemetry only (I7/I9)" }
 "langchain_core" = { msg = "contained: steward-agents, steward-llm only (I2/I9)" }
 "langchain_openai" = { msg = "contained: steward-llm only (I2/I9)" }
 "litellm" = { msg = "contained: steward-llm only (I2/I9)" }
@@ -76,6 +78,7 @@ root_packages = [
     "steward_retrieval",
     "steward_schemas",
     "steward_sdk",
+    "steward_telemetry",
     "steward_api",
     "steward_workers",
 ]
@@ -83,7 +86,7 @@ root_packages = [
 [[tool.importlinter.contracts]]
 name = "services import packages, never the reverse (I4)"
 type = "forbidden"
-source_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_schemas", "steward_sdk"]
+source_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_schemas", "steward_sdk", "steward_telemetry"]
 forbidden_modules = ["steward_api", "steward_workers"]
 
 [[tool.importlinter.contracts]]
@@ -92,17 +95,27 @@ type = "forbidden"
 source_modules = ["steward_agents"]
 forbidden_modules = ["steward_queue", "steward_retrieval", "steward_sdk"]
 
+# steward-queue's one package edge beyond schemas: steward-telemetry. The worker
+# opens a task span per execution and every run gets a trace id, so the queue
+# depends on the tracing *contract* — never on Langfuse, which S1's banned-api
+# table keeps inside steward-telemetry.
+[[tool.importlinter.contracts]]
+name = "steward-queue depends only on steward-schemas and steward-telemetry (I4)"
+type = "forbidden"
+source_modules = ["steward_queue"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_retrieval", "steward_sdk"]
+
 [[tool.importlinter.contracts]]
 name = "leaf packages depend only on steward-schemas (I4)"
 type = "forbidden"
-source_modules = ["steward_llm", "steward_queue", "steward_retrieval", "steward_sdk"]
-forbidden_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_sdk"]
+source_modules = ["steward_llm", "steward_retrieval", "steward_sdk", "steward_telemetry"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_sdk", "steward_telemetry"]
 
 [[tool.importlinter.contracts]]
 name = "steward-schemas is independent: pydantic + stdlib only (I4)"
 type = "forbidden"
 source_modules = ["steward_schemas"]
-forbidden_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_sdk"]
+forbidden_modules = ["steward_agents", "steward_llm", "steward_queue", "steward_retrieval", "steward_sdk", "steward_telemetry"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -115,6 +128,7 @@ mypy_path = [
     "packages/steward-queue/src",
     "packages/steward-retrieval/src",
     "packages/steward-sdk/src",
+    "packages/steward-telemetry/src",
 ]
 # Per-package tests share the basename test_smoke.py across sibling packages;
 # they're exercised by pytest (H3), not by strict typing.
