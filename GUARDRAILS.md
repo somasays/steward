@@ -145,7 +145,11 @@ Not everything reduces to a check. The `architecture-guardian` subagent and huma
 
 Active now: S1, S3–S8 (S1/S3 tool-backed: import-linter + ruff; S4–S8 stdlib), H1, H3, H4 (wall-clock; step/token/cost with the M1 agent loop), H11 (M0 and M1-slice-1 exit criteria), G1–G5 (G2 covers `packages/` and `services/` in one `--strict` invocation, issue #17). S2 skips until there is a runtime to bound. Everything else lands with its milestone (tables above) — the runner (`scripts/fitness/run.py`) reports each pending check as `SKIP` with its reason, so the gap is always visible, never silent. Review-enforced in the meantime: I6 (until masking lands, M1) and the span-tree half of I7/H6 (until the M1 agent loop) — the `architecture-guardian`'s explicit responsibility.
 
-## 6. Guardrail freeze (in force from 2026-08-07, M1)
+## 6. Guardrail freeze (LIFTED 2026-08-07 when the catalog shipped — kept for the record)
+
+**Status: lifted.** #20 landed, so the condition below is met. The rule it leaves behind: a new check needs a concrete product change that demonstrates the gap, not an anticipated one. Re-read this section before adding a tier or generalising a check.
+
+<details><summary>The freeze as it stood</summary>
 
 **No new generic fitness infrastructure until the deterministic catalog exists** (issue #20). Measured at the freeze: 1,768 lines of fitness apparatus against 3,637 lines of product, with `check_contracts.py` (854) the largest single module in the repo — larger than anything it protects. S8 gives the checkers test coverage; it does not remove their maintenance cost.
 
@@ -157,6 +161,7 @@ Allowed during the freeze:
 Not allowed: new checks for capabilities that do not exist yet, generalising a check beyond its current need, or new tiers.
 
 The freeze lifts when #20 ships. It exists because this project's failure mode is strengthening the apparatus instead of shipping the capability — the invariants are already ahead of the system they govern.
+</details>
 
 ## 7. Amendment process
 
