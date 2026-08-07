@@ -28,7 +28,7 @@ Every change follows this cycle:
 
 The invariants are **I1–I14 in `ARCHITECTURE.md` §5** — read them there, not from memory; they are the working summary and this file deliberately does not duplicate them (single source, no staleness). The ones agents trip on most: no string-built SQL (I5), LangGraph/provider SDKs only in their home packages with types never leaking (I2/I9), typed seams everywhere (I3), idempotent handlers + transactional enqueue (I8), hard budgets on every run (I12).
 
-When a task seems to require violating an invariant, **stop and redesign** — or, if the invariant is genuinely wrong, follow the amendment process in GUARDRAILS.md §6. Never "temporarily" violate one.
+When a task seems to require violating an invariant, **stop and redesign** — or, if the invariant is genuinely wrong, follow the amendment process in GUARDRAILS.md §7. Never "temporarily" violate one.
 
 ## Commands
 

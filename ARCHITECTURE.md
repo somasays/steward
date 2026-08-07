@@ -65,7 +65,7 @@ Full rationale for the load-bearing ones in `SPEC.md` §13 (D1–D6).
 
 ## 5. Invariants
 
-Properties that hold at every commit, forever. Amendments follow `GUARDRAILS.md` §6.
+Properties that hold at every commit, forever. Amendments follow `GUARDRAILS.md` §7.
 
 | ID | Invariant |
 |----|-----------|
