@@ -195,16 +195,16 @@ class GoalRegistration[P: GoalParams]:
 
 
 REGISTRY: dict[str, GoalRegistration[Any]] = {}
-"""Registered goals by name. Module-private by intent: not re-exported from the
-package, so `goal()` is the only supported way in and the "one registration
-site" property cannot be sidestepped with a dict assignment. Read it through
-`registered_goals()` and `get_goal()`.
+"""Registered goals by name; read it through `registered_goals()`/`get_goal()`.
 
-The value type is erased because the registry is heterogeneous by nature --
-each entry pairs its own params model with a planner that takes exactly that
-model, and the decorator below is what type-checks that pairing at the
-registration site. The erasure is the container's, not a field's: no `Any`
-ever reaches a payload or a task.
+Module-private by intent -- not re-exported from the package -- so `goal()` is
+the only way in and the one-registration-site property cannot be sidestepped
+with a dict assignment.
+
+The value type is erased because the registry is heterogeneous: each entry
+pairs its own params model with a planner taking exactly that model, and the
+decorator below type-checks that pairing at the registration site. The erasure
+is the container's, not a field's -- no `Any` reaches a payload or a task.
 """
 
 
