@@ -82,7 +82,10 @@ class Tracer(Protocol):
     """
 
     def run_span(self, *, trace_id: str, run_id: UUID, goal: str) -> AbstractContextManager[Span]:
-        """Open the trace's root span for a run being created."""
+        """Open the span that records a run's creation on the run's trace.
+
+        A sibling of the task spans, not their parent: the run it names exists
+        before this opens, so a task claimed at once can be traced first."""
         ...
 
     def task_span(
