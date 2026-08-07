@@ -20,7 +20,8 @@ Every change follows this cycle:
    **No stale files:** before committing, look up every changed file in `scripts/fitness/filegraph.json` and update (or explicitly verify unaffected) each listed dependent — `PROOFS.md` and the docs are dependents of almost everything. New files must be added to the graph (S7 fails otherwise).
 4. **Before every commit:** run `make fitness`. Before finishing a branch: run the **`architecture-guardian` subagent** on the diff (`git diff main...HEAD`) and address its findings — treat a FAIL verdict as a broken build.
 5. **Commit format** (enforced by hook): Conventional Commits; `feat`/`fix`/`refactor`/`perf` must reference the issue: `feat(queue): claim tasks with SKIP LOCKED (#12)`.
-6. **Prove it.** When acceptance criteria are met, append an entry to `PROOFS.md` in the same branch: the claim, the exact command to reproduce it, and the observed result. No adjectives — if it can't be demonstrated by a command, test, eval score, or CI run, it doesn't go in.
+6. **Prove it.** When acceptance criteria are met, produce a proof entry: the claim, the exact command to reproduce it, and the observed result. No adjectives — if it can't be demonstrated by a command, test, eval score, or CI run, it doesn't go in.
+   **Where it goes depends on who you are.** Working solo on a branch, append it to `PROOFS.md` directly. Working as a dispatched agent (or alongside one), put it in the **PR body** instead and leave `PROOFS.md` untouched — concurrent branches all appending to one table conflict every time. The maintainer appends PR-body rows to `PROOFS.md` on merge, so the evidence still lands; the ledger just has a single writer. A branch instruction saying "do not edit PROOFS.md" is this rule, not a violation of it — reviewers should not flag it as one.
 7. **PR** with: what changed, which invariants were touched, evidence. Close the issue via `Closes #N`.
 
 ## Non-negotiables

@@ -21,7 +21,7 @@ You are the architecture guardian for the Steward codebase. Your job is to find 
    - I9: any LangGraph/langchain_core type in a public signature, return type, or exported symbol of `steward-agents`? Any contained module imported outside its home (S1 catches imports; you catch type leaks and re-exports)?
    - I12: any loop over LLM calls without a budget guard?
    - I13: any governance-weight action (classification publish, rule activation) that skips the review-state machinery?
-   - Staleness: for every changed file, were its `scripts/fitness/filegraph.json` dependents updated or verifiably unaffected?
+   - Staleness: for every changed file, were its `scripts/fitness/filegraph.json` dependents updated or verifiably unaffected? **Exception:** a missing `PROOFS.md` row is NOT a finding when the proof appears in the PR body — see CLAUDE.md step 6, the ledger has a single writer by design. Do flag a proof row that is *absent from both*, or an existing row the diff has made false.
 5. **Hunt smells.** Apply the GUARDRAILS.md §4 checklist to the diff. Also check: new escape-hatch pragmas (each needs a reason and deserves scrutiny), `# type: ignore` additions, business logic in route handlers, duplicated retry/budget logic.
 6. **Check spec drift.** If behavior differs from `SPEC.md`, flag it: either the code or the spec must change — silently diverging is a finding.
 
