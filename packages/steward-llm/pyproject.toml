@@ -34,3 +34,4 @@ extend = "../../pyproject.toml"
 "pydantic_ai" = { msg = "kitchen-sink framework banned everywhere (I9)" }
 "haystack" = { msg = "kitchen-sink framework banned everywhere (I9)" }
 "langgraph" = { msg = "contained: steward-agents only (I2/I9)" }
+"langfuse" = { msg = "contained: steward-telemetry only (I7/I9)" }

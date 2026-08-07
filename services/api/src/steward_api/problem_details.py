@@ -41,6 +41,20 @@ def not_found(detail: str, *, instance: str | None = None) -> ProblemDetailsErro
     )
 
 
+def conflict(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `409 Conflict` problem, e.g. an idempotency key reused for a
+    different request body."""
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:idempotency-key-reused",
+            title="Idempotency key reused with a different request",
+            status=status.HTTP_409_CONFLICT,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
 def _problem_response(problem: ProblemDetails) -> JSONResponse:
     return JSONResponse(
         status_code=problem.status,

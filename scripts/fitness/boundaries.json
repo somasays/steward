@@ -1,7 +1,8 @@
 {
-  "_doc": "Containment declarations for S5 (public-surface lock, issue #6). S1 enforcement itself moved to tool-native config (issue #9): import-linter contracts and ruff TID251 banned-api in pyproject.toml are now the single source of truth for boundaries and containment, tracked there rather than duplicated here. This file keeps only the map S5 needs — which third-party modules are contained, and where — so a future S5 check doesn't have to parse pyproject.toml's ruff config to find it. Keep this in sync with the banned-api tables in pyproject.toml (root + packages/steward-agents + packages/steward-llm) when a containment home changes.",
+  "_doc": "Containment declarations for S5 (public-surface lock, issue #6). S1 enforcement itself moved to tool-native config (issue #9): import-linter contracts and ruff TID251 banned-api in pyproject.toml are now the single source of truth for boundaries and containment, tracked there rather than duplicated here. This file keeps only the map S5 needs — which third-party modules are contained, and where — so a future S5 check doesn't have to parse pyproject.toml's ruff config to find it. Keep this in sync with the banned-api tables in pyproject.toml (root + packages/steward-agents + packages/steward-llm + packages/steward-telemetry) when a containment home changes.",
   "contained_modules": {
     "langgraph": ["steward-agents"],
+    "langfuse": ["steward-telemetry"],
     "langchain_core": ["steward-agents", "steward-llm"],
     "langchain_openai": ["steward-llm"],
     "litellm": ["steward-llm"],

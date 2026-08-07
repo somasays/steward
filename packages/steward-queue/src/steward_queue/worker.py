@@ -24,6 +24,11 @@ psycopg's synchronous connection is used from the async loop: the blocking
 queue calls run in `asyncio.to_thread`, and the connection is never touched by
 two coroutines at once. Handlers are `async def` (M1+ will call the LLM gateway
 from them) and use the same connection directly for their -- short -- writes.
+
+Every execution runs inside a task span on the run's trace (I7). The worker
+takes a `Tracer`, it does not build one: which backend traces, and whether one
+is configured at all, is a wiring decision (`steward_telemetry.tracer_from_env`)
+that belongs to the process being started, not to the loop.
 """
 
 import asyncio
@@ -32,10 +37,11 @@ from collections.abc import Sequence
 from datetime import timedelta
 
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskStatus
+from steward_telemetry import NoopTracer, Span, SpanOutcome, Tracer
 
 from steward_queue import queue
 from steward_queue.backoff import DEFAULT_BASE_DELAY, DEFAULT_FACTOR, DEFAULT_MAX_DELAY
-from steward_queue.db import QueueConnection, connect
+from steward_queue.db import QueueConnection, connect, set_statement_timeout
 from steward_queue.models import SYSTEM_ACTOR, Actor, ClaimedTask
 from steward_queue.registry import TaskContext, UnknownTaskType, get_handler, registered_types
 
@@ -85,6 +91,7 @@ class Worker:
         retry_factor: float = DEFAULT_FACTOR,
         retry_max_delay: timedelta = DEFAULT_MAX_DELAY,
         actor: Actor | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         self._dsn = dsn
         self._worker_id = worker_id
@@ -96,6 +103,7 @@ class Worker:
         self._retry_factor = retry_factor
         self._retry_max_delay = retry_max_delay
         self._actor = actor or Actor(kind=SYSTEM_ACTOR.kind, id=worker_id)
+        self._tracer: Tracer = tracer if tracer is not None else NoopTracer()
 
     async def run_once(self) -> int:
         """Claim and execute one batch. Returns how many tasks were claimed."""
@@ -149,11 +157,13 @@ class Worker:
         conn.commit()
 
     def _succeed(self, conn: QueueConnection, result: TaskResult) -> None:
+        set_statement_timeout(conn, self._lease)  # bookkeeping runs under the lease, not the task's budget
         queue.complete(conn, result, claimed_by=self._worker_id, actor=self._actor)
         conn.commit()
 
     def _fail(self, conn: QueueConnection, task: ClaimedTask, error: ProblemDetails) -> None:
         conn.rollback()  # discard the failed attempt's partial writes before recording it
+        set_statement_timeout(conn, self._lease)
         queue.fail(
             conn,
             task.spec.task_id,
@@ -177,43 +187,72 @@ class Worker:
         not get to record itself, and handlers are idempotent so the retry is
         safe (I8). Swallowing it here keeps a stalled worker from crash-looping
         its poll loop.
+
+        The execution connection carries a server-side `statement_timeout`, so
+        a handler blocked inside psycopg is interruptible rather than merely
+        supervised (see `db.connect`). It opens under the lease -- the bound on
+        the worker's own bookkeeping -- and is narrowed to the task's
+        wall-clock budget for exactly the span of the handler call.
         """
-        conn = await asyncio.to_thread(connect, self._dsn)
+        conn = await asyncio.to_thread(connect, self._dsn, statement_timeout=self._lease)
         try:
-            return await self._execute_on(conn, task)
+            with self._tracer.task_span(
+                trace_id=task.trace_id,
+                run_id=task.spec.run_id,
+                task_id=task.spec.task_id,
+                task_type=task.spec.task_type,
+            ) as span:
+                return await self._execute_on(conn, task, span)
         except queue.TaskNotClaimable:
             await asyncio.to_thread(conn.rollback)
             return False
         finally:
             await asyncio.to_thread(conn.close)
 
-    async def _execute_on(self, conn: QueueConnection, task: ClaimedTask) -> bool:
+    async def _execute_on(self, conn: QueueConnection, task: ClaimedTask, span: Span) -> bool:
         await asyncio.to_thread(self._start, conn, task)
         try:
             registration = get_handler(task.spec.task_type)
         except UnknownTaskType:
-            await asyncio.to_thread(self._fail, conn, task, _problem(UNKNOWN_TYPE, task.spec.task_type))
+            problem = _problem(UNKNOWN_TYPE, task.spec.task_type)
+            await self._record_failure(conn, task, problem, span)
             return True
         ctx = TaskContext(connection=conn, spec=task.spec, attempts=task.attempts)
+        await asyncio.to_thread(set_statement_timeout, conn, task.spec.budget.wall_clock)
         try:
             # I12: the wall-clock cap is enforced here, by the runtime, not left
-            # to handlers to honour. A handler blocked on a dead connection ends
-            # as a typed `budget_exceeded` failure instead of holding this worker
-            # slot until the lease expires. Step/token/cost caps belong to the
-            # agent loop that spends them (steward-agents, M1) -- M0 has no LLM.
+            # to handlers to honour. Two mechanisms, because one is not enough:
+            # `asyncio.timeout` catches a handler that is awaiting, and the
+            # connection's `statement_timeout` catches one blocked inside the
+            # driver, where no await point exists to cancel at. Either way the
+            # task ends as a typed failure instead of holding this worker slot
+            # until the lease expires. Step/token/cost caps belong to the agent
+            # loop that spends them (steward-agents, M1) -- M0 has no LLM.
             async with asyncio.timeout(task.spec.budget.wall_clock.total_seconds()):
                 result = await registration.fn(ctx)
         except TimeoutError:
-            await asyncio.to_thread(self._fail, conn, task, _budget_exceeded(task.spec.budget))
+            await self._record_failure(conn, task, _budget_exceeded(task.spec.budget), span)
             return True
         except Exception as exc:
-            await asyncio.to_thread(
-                self._fail, conn, task, _problem(HANDLER_FAILED, f"{type(exc).__name__}: {exc}")
-            )
+            problem = _problem(HANDLER_FAILED, f"{type(exc).__name__}: {exc}")
+            await self._record_failure(conn, task, problem, span)
             return True
         if result.status is not TaskStatus.SUCCEEDED:
             error = result.error or _problem(HANDLER_FAILED, result.status.value)
-            await asyncio.to_thread(self._fail, conn, task, error)
+            await self._record_failure(conn, task, error, span)
             return True
         await asyncio.to_thread(self._succeed, conn, result)
+        span.record(SpanOutcome.OK)
         return True
+
+    async def _record_failure(
+        self, conn: QueueConnection, task: ClaimedTask, error: ProblemDetails, span: Span
+    ) -> None:
+        """Persist a failed attempt and mark its span.
+
+        The span is recorded explicitly because these failures are return
+        values, not raises -- the tracer's own exception handling would never
+        see them, and an unmarked span would read as a success.
+        """
+        await asyncio.to_thread(self._fail, conn, task, error)
+        span.record(SpanOutcome.ERROR, error.title)

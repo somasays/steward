@@ -6,7 +6,9 @@ each one has to satisfy the registry contract on its own.
 """
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -15,6 +17,7 @@ import pytest
 from steward_queue import (
     NOOP_TASK_TYPE,
     REGISTRY,
+    RunStatus,
     TaskState,
     Worker,
     claim,
@@ -28,6 +31,7 @@ from steward_queue.db import QueueConnection
 from steward_queue.registry import TaskContext
 from steward_queue.worker import BUDGET_EXCEEDED
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
+from steward_telemetry import Span, SpanOutcome
 
 NO_BACKOFF = timedelta(0)
 EXPIRED_LEASE = timedelta(seconds=-1)
@@ -36,14 +40,17 @@ NO_USAGE = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timede
 EXPLODES = "test.explodes_on_demand"
 REPORTS_FAILURE = "test.reports_failure"
 SLEEPS = "test.sleeps"
+BLOCKS_IN_THE_DRIVER = "test.blocks_in_the_driver"
 UNREGISTERED = "test.unregistered"
 
 TINY_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(milliseconds=20))
+SHORT_WALL_CLOCK = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(milliseconds=250))
 
 SELECT_TASK_RESULT = "SELECT result FROM tasks WHERE id = %s"
 SELECT_TASK_LAST_ERROR = "SELECT last_error FROM tasks WHERE id = %s"
 SELECT_CHECKPOINTS = "SELECT step, state FROM checkpoints WHERE task_id = %s ORDER BY step"
 SELECT_AUDIT_ACTIONS = "SELECT action FROM audit_log WHERE entity_id = %s ORDER BY id"
+SELECT_PG_SLEEP = "SELECT pg_sleep(%(seconds)s)"
 
 
 @task_handler(EXPLODES, sample_payload={"boom": False})
@@ -71,6 +78,19 @@ async def sleeps(ctx: TaskContext) -> TaskResult:
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
 
 
+@task_handler(BLOCKS_IN_THE_DRIVER, sample_payload={"seconds": 0.0})
+async def blocks_in_the_driver(ctx: TaskContext) -> TaskResult:
+    """Blocks inside psycopg -- the case `asyncio.timeout` cannot reach.
+
+    `async def` with no await: the call sits in a blocking C function, so the
+    event loop never gets control back to cancel it. Only a server-side
+    statement timeout can end this. Payload-driven, so the sample payload
+    (zero seconds) stays instant and idempotent under H1.
+    """
+    ctx.connection.execute(SELECT_PG_SLEEP, {"seconds": float(ctx.spec.payload["seconds"])})
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
 @task_handler(REPORTS_FAILURE, sample_payload={})
 async def reports_failure(ctx: TaskContext) -> TaskResult:
     """Returns a typed failure instead of raising -- the other failure path."""
@@ -80,6 +100,43 @@ async def reports_failure(ctx: TaskContext) -> TaskResult:
         usage=NO_USAGE,
         error=ProblemDetails(type="urn:steward:test", title="declined", status=422),
     )
+
+
+@dataclass
+class RecordedSpan:
+    """One span the worker opened, and how it said the work ended."""
+
+    trace_id: str
+    task_id: UUID
+    task_type: str
+    outcome: SpanOutcome | None = None
+    detail: str | None = None
+
+    def record(self, outcome: SpanOutcome, detail: str | None = None) -> None:
+        self.outcome, self.detail = outcome, detail
+
+
+class RecordingTracer:
+    """A `Tracer` that keeps its spans instead of exporting them.
+
+    Spans are the observable output of tracing, so asserting on them is
+    asserting on emitted events -- not on how the worker happened to call its
+    collaborator.
+    """
+
+    def __init__(self) -> None:
+        self.spans: list[RecordedSpan] = []
+
+    @contextmanager
+    def run_span(self, *, trace_id: str, run_id: UUID, goal: str) -> Iterator[Span]:
+        raise NotImplementedError("the worker executes tasks; runs are opened by their creator")
+        yield  # pragma: no cover -- unreachable, kept so the signature is a generator
+
+    @contextmanager
+    def task_span(self, *, trace_id: str, run_id: UUID, task_id: UUID, task_type: str) -> Iterator[Span]:
+        span = RecordedSpan(trace_id=trace_id, task_id=task_id, task_type=task_type)
+        self.spans.append(span)
+        yield span
 
 
 def audit_actions(conn: QueueConnection, task_id: UUID) -> list[str]:
@@ -193,6 +250,42 @@ class TestFailurePaths:
         assert row[0]["title"] == BUDGET_EXCEEDED
         assert row[0]["budget"]["steps"] == 1  # the cap travels with the problem
 
+    async def test_a_handler_blocked_in_the_driver_is_interrupted(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # The hole `asyncio.timeout` alone leaves open (#3 review): a handler
+        # blocked in psycopg has no await point to cancel at, so the budget has
+        # to be enforced server-side or it is not enforced at all.
+        spec = queued(
+            task_type=BLOCKS_IN_THE_DRIVER,
+            payload={"seconds": 30.0},
+            budget=SHORT_WALL_CLOCK,
+            max_attempts=1,
+        )
+        async with asyncio.timeout(20):  # the assertion is that this never fires
+            assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.DEAD
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        assert row is not None
+        assert "QueryCanceled" in row[0]["detail"]  # Postgres aborted it, not the lease
+
+    async def test_recording_an_outcome_is_not_bound_by_the_handlers_budget(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # A 20ms budget must still be able to write its own failure: the
+        # connection widens back to the lease before the worker records.
+        spec = queued(
+            task_type=BLOCKS_IN_THE_DRIVER,
+            payload={"seconds": 30.0},
+            budget=TINY_WALL_CLOCK,
+            max_attempts=1,
+        )
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.DEAD
+
     async def test_a_handler_within_its_budget_is_left_alone(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
     ) -> None:
@@ -274,6 +367,102 @@ class TestLoop:
         assert task is not None and task.state is TaskState.PENDING
 
 
-@pytest.mark.parametrize("task_type", [EXPLODES, REPORTS_FAILURE])
+class TestTracing:
+    """I7's tracing half: every execution is a span on its run's trace."""
+
+    async def test_a_successful_execution_opens_a_span_on_the_runs_trace(
+        self, dsn: str, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        spec = queued(task_type=NOOP_TASK_TYPE, payload={"n": 300})
+        run = get_run(conn, run_id)
+        assert run is not None
+
+        tracer = RecordingTracer()
+        assert await Worker(dsn, "w1", tracer=tracer).run_once() == 1
+
+        [span] = tracer.spans
+        assert span.trace_id == run.trace_id  # the id stored on the row, not a fresh one
+        assert span.task_id == spec.task_id
+        assert span.task_type == NOOP_TASK_TYPE
+        assert span.outcome is SpanOutcome.OK
+
+    async def test_a_typed_failure_is_recorded_on_the_span(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # A handler that returns a failure never raises, so nothing but an
+        # explicit record can stop the span reading as a success.
+        queued(task_type=REPORTS_FAILURE, payload={"n": 301}, max_attempts=1)
+        tracer = RecordingTracer()
+        await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF, tracer=tracer).run_once()
+
+        [span] = tracer.spans
+        assert span.outcome is SpanOutcome.ERROR
+        assert span.detail == "declined"
+
+    async def test_a_budget_failure_is_recorded_on_the_span(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        queued(task_type=SLEEPS, payload={"seconds": 30.0}, budget=TINY_WALL_CLOCK, max_attempts=1)
+        tracer = RecordingTracer()
+        await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF, tracer=tracer).run_once()
+
+        [span] = tracer.spans
+        assert span.outcome is SpanOutcome.ERROR
+        assert span.detail == BUDGET_EXCEEDED
+
+    async def test_every_attempt_gets_its_own_span(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        queued(task_type=EXPLODES, payload={"boom": True}, max_attempts=2)
+        tracer = RecordingTracer()
+        worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF, tracer=tracer)
+        await worker.run_once()
+        await worker.run_once()
+
+        assert [span.outcome for span in tracer.spans] == [SpanOutcome.ERROR, SpanOutcome.ERROR]
+
+    async def test_a_worker_without_a_tracer_still_executes(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # Graceful degradation: no tracer configured is not a degraded system.
+        spec = queued(task_type=NOOP_TASK_TYPE, payload={"n": 302})
+        assert await Worker(dsn, "w1").run_once() == 1
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.SUCCEEDED
+
+
+class TestRunRollup:
+    async def test_a_finished_run_reads_succeeded(
+        self, dsn: str, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        queued(task_type=NOOP_TASK_TYPE, payload={"n": 400})
+        await Worker(dsn, "w1").run_once()
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.SUCCEEDED
+
+    async def test_a_run_whose_task_dead_letters_reads_failed(
+        self, dsn: str, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        queued(task_type=EXPLODES, payload={"boom": True}, max_attempts=1)
+        await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once()
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.FAILED
+
+    async def test_concurrent_workers_settle_a_run_exactly_once(
+        self, dsn: str, conn: QueueConnection, run_id: UUID, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # The race the run lock exists for: several workers finishing the last
+        # tasks of one run at the same moment.
+        for n in range(8):
+            queued(task_type=NOOP_TASK_TYPE, payload={"n": 500 + n})
+        await asyncio.gather(*(drain(Worker(dsn, f"w{n}")) for n in range(4)))
+
+        run = get_run(conn, run_id)
+        assert run is not None and run.status is RunStatus.SUCCEEDED
+        transitions = conn.execute(SELECT_AUDIT_ACTIONS, (str(run_id),)).fetchall()
+        assert [row[0] for row in transitions].count("run.status_changed") == 2
+
+
+@pytest.mark.parametrize("task_type", [EXPLODES, REPORTS_FAILURE, BLOCKS_IN_THE_DRIVER])
 def test_scaffolding_handlers_are_registered(task_type: str) -> None:
     assert task_type in REGISTRY

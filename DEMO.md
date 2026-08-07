@@ -11,14 +11,14 @@ make fitness           # the whole suite as CI runs it
 
 ## make demo
 
-Starts an ephemeral Postgres (`pgserver` ships the binaries), migrates it, then walks the guarantees the architecture is built around. Everything printed is read back out of the database.
+Starts an ephemeral Postgres (`pgserver` ships the binaries), migrates it, starts the real API on a real socket, and then drives the system the way a client does — `POST /v1/runs`, wait, `GET /v1/runs/{id}`. Nothing reaches past the API to move the run along; a worker does that. Everything printed is either an HTTP response or a row read back out of the database.
 
-1. **Transactional enqueue (I8)** — the run row and its task commit in one transaction; until it commits no worker can see either. Replaying the same enqueue returns the same task id, because the dedup key is derived from `(task_type, payload)`.
-2. **Worker claims and executes** — `SELECT … FOR UPDATE SKIP LOCKED`, handler runs, checkpoint written, task `succeeded`, usage recorded against the run's budget.
-3. **Audit trail (I7)** — six rows, each written in the same transaction as the mutation it records: `run.created`, `task.enqueued`, `task.claimed`, `task.started`, `task.succeeded`, `run.usage_recorded`.
+1. **`POST /v1/runs` (I8)** — 202, and the run row and its first task are already committed together. A 202 therefore means work is queued; there is no state where a run exists with nothing to execute it. Replaying the POST with the same `Idempotency-Key` returns the same run and does not enqueue a second task (the same key with a *different* body is a 409, not a silently ignored edit). The response carries the run's `trace_id` — generated locally, so it is on the row whether or not Langfuse credentials are configured (I7) — and its budget (I12).
+2. **A worker claims and executes it** — `SELECT … FOR UPDATE SKIP LOCKED`, handler runs, checkpoint written, task `succeeded`, usage recorded. The run's own status follows its tasks in the same transaction, so `GET /v1/runs/{id}` returns `succeeded` — on the same trace id the POST returned.
+3. **Audit trail (I7)** — eight rows, each written in the same transaction as the mutation it records: `run.created`, `task.enqueued`, `task.claimed`, `task.started`, `run.status_changed` (→ running), `task.succeeded`, `run.usage_recorded`, `run.status_changed` (→ succeeded).
 4. **A second worker finds nothing** — the queue is drained; no double-claim.
 
-The run stays `pending` at the end: rolling task outcomes up to run status is issue #5, not merged yet. The demo says so rather than hiding it.
+That whole path is also the M0 exit criterion (SPEC.md §12) as an executable check — `uv run pytest -q -m acceptance` asserts it, and `make fitness` runs it as H11.
 
 ## make demo-guardrails
 
@@ -35,7 +35,7 @@ Then it moves the same `langgraph` import into `packages/steward-agents`, where 
 
 ## make fitness
 
-The whole suite, tiered by how it measures (GUARDRAILS.md §1). Currently active: S1–S5 and S7 (static architecture), H1/H3 (behavioral harnesses — every registered handler run twice converges; crash injection leaves no lost or ghost tasks), G1–G4 (hygiene). Checks that haven't landed report `SKIP` with a reason rather than a false `PASS`.
+The whole suite, tiered by how it measures (GUARDRAILS.md §1). Currently active: S1–S5 and S7 (static architecture), H1/H3/H11 (behavioral harnesses — every registered handler run twice converges; crash injection leaves no lost or ghost tasks; M0's exit criterion runs API → queue → worker → `succeeded`), G1–G4 (hygiene). Checks that haven't landed report `SKIP` with a reason rather than a false `PASS`.
 
 The same command runs in the pre-commit hook and in CI.
 

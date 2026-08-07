@@ -1,10 +1,12 @@
 [project]
 name = "steward-api"
 version = "0.1.0"
-description = "Steward API service (FastAPI gateway). Skeleton — issue #4."
+description = "Steward API service (FastAPI gateway): runs API over the Postgres queue."
 requires-python = ">=3.12"
 dependencies = [
     "steward-schemas",
+    "steward-queue",
+    "steward-telemetry",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
 ]
@@ -15,10 +17,15 @@ steward-api-export-openapi = "steward_api.export_openapi:main"
 
 [tool.uv.sources]
 steward-schemas = { workspace = true }
+steward-queue = { workspace = true }
+steward-telemetry = { workspace = true }
 
 [dependency-groups]
 dev = [
     "httpx>=0.27",
+    # The H11 acceptance scenario drives the real app against a real Postgres
+    # (GUARDRAILS.md Tier H): pgserver ships the server binaries, no Docker.
+    "pgserver>=0.1.4",
 ]
 
 [build-system]

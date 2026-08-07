@@ -13,6 +13,7 @@ members are two things that can drift (I3).
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -79,15 +80,24 @@ SYSTEM_ACTOR = Actor(kind=ActorKind.SYSTEM, id="steward-queue")
 
 
 class RunRecord(QueueModel):
-    """A `runs` row. Budget and usage share `RunBudget`'s shape (I12): the cap
-    a run was admitted under, and what it has consumed so far."""
+    """A `runs` row -- the authoritative state of a run (I1).
+
+    Budget and usage share `RunBudget`'s shape (I12): the cap a run was
+    admitted under, and what it has consumed so far. `trace_id` is not optional
+    because the column is not nullable: a run that cannot be traced back to a
+    trace does not exist (I7). What the API publishes of this is
+    `steward_schemas.Run` -- a projection, so how the row is stored and
+    what the contract promises can evolve separately (I3).
+    """
 
     id: UUID
     goal: str
+    payload: dict[str, Any]
     status: RunStatus
     budget: RunBudget
     usage: RunBudget
-    trace_id: str | None
+    trace_id: str
+    idempotency_key: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -111,10 +121,19 @@ class TaskRecord(QueueModel):
 
 
 class ClaimedTask(QueueModel):
-    """What `claim()` hands a worker: the typed spec plus the claim facts the
-    worker needs to honour its lease."""
+    """What `claim()` hands a worker: the typed spec, the claim facts the
+    worker needs to honour its lease, and the run's trace id.
+
+    `trace_id` rides along rather than being looked up because the worker needs
+    it on every execution to put its task span on the run's trace (I7), and a
+    per-task round trip for a value the claim already had in hand is a query
+    the design does not need. It is deliberately not on `TaskSpec`: that is a
+    published contract about *what to execute*, and where the execution is
+    observed is not part of it.
+    """
 
     spec: TaskSpec
     attempts: int
     claimed_by: str
     lease_expires_at: datetime
+    trace_id: str

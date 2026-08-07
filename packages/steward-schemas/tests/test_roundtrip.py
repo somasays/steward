@@ -155,6 +155,9 @@ def build_run() -> Run:
         goal="scan_source",
         payload={"source_id": "22222222-2222-2222-2222-222222222222"},
         status=RunStatus.PENDING,
+        trace_id="0123456789abcdef0123456789abcdef",
+        budget=build_run_budget(),
+        usage=RunBudget(steps=0, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(0)),
         created_at=NOW,
         updated_at=NOW,
     )
