@@ -103,7 +103,7 @@ Build-vs-buy rule: a check is hand-rolled only when no maintained tool has the s
 | I12 bounded autonomy | H4 |
 | I13 policy-gated governance | H10 |
 | I14 provider swap = config | B9 |
-| N1 recoverability | H2, H3, P4 (+ worker responsiveness under a running handler: H4's wall-clock scenarios assert `reap_stale` and shutdown are bounded by a poll interval, not a task duration — issue #42) |
+| N1 recoverability | H2, H3, P4 (+ worker responsiveness under a running handler: H4's wall-clock scenarios assert `reap_stale` and shutdown are bounded by a poll interval, not a task duration — issue #42. An attempt whose executor takes the handoff and then fails to write its terminal state is recovered by lease expiry rather than failed on the spot: the loop must not write a row the thread that beat it to the handoff may still be committing, so N1's re-execution *is* the answer there, not a fallback from one — SPEC §13 D7, issue #53) |
 | N2 output correctness | B2–B5, H9, P1 |
 | N3 retrieval quality | B1 |
 | N4 latency | B6, P2 |
