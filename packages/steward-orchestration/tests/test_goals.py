@@ -18,10 +18,14 @@ would still pass
 
 from uuid import uuid4
 
+import steward_catalog
 from steward_orchestration import (
     NOOP_GOAL,
     NOOP_TASK_TYPE,
+    SCAN_SOURCE_GOAL,
+    SCAN_SOURCE_TASK_TYPE,
     GoalParams,
+    InvalidGoalPayload,
     NoopParams,
     PlannedTask,
     get_goal,
@@ -29,6 +33,17 @@ from steward_orchestration import (
     registered_goals,
 )
 from steward_queue import registered_types
+
+SOURCE_ID = "22222222-2222-2222-2222-222222222222"
+
+
+def test_the_task_type_names_on_both_sides_of_the_seam_agree() -> None:
+    """The two packages agree on a *string*, never an import: the queue must
+    not learn what a goal is, and orchestration takes no runtime dependency on
+    the catalog. This is where that agreement stops being an assumption --
+    importing `steward_catalog` here is also what registers the handler the
+    check below looks for."""
+    assert SCAN_SOURCE_TASK_TYPE == steward_catalog.SCAN_SOURCE_TASK_TYPE
 
 
 def test_every_goal_plans_only_executable_task_types() -> None:
@@ -65,6 +80,28 @@ def test_noop_accepts_an_empty_payload() -> None:
 
     assert plan.tasks[0].payload == {"echo": ""}
     assert NoopParams().echo == ""
+
+
+def test_scan_source_plans_exactly_one_task() -> None:
+    """I12, and the constraint issue #37 put on this slice: with one task, the
+    per-task cap the queue enforces is the run cap the API advertises. A plan
+    that grew a second task would silently double what a run may spend."""
+    plan = plan_run(SCAN_SOURCE_GOAL, {"source_id": SOURCE_ID})
+
+    assert [(task.task_type, dict(task.payload)) for task in plan.tasks] == [
+        (SCAN_SOURCE_TASK_TYPE, {"source_id": SOURCE_ID})
+    ]
+    assert plan.budget == get_goal(SCAN_SOURCE_GOAL).budget
+    assert [spec.budget for spec in plan.task_specs(uuid4())] == [plan.budget]
+
+
+def test_scan_source_rejects_a_payload_that_is_not_a_source_id() -> None:
+    for payload in ({}, {"source_id": "not-a-uuid"}, {"source_id": SOURCE_ID, "depth": 2}):
+        try:
+            plan_run(SCAN_SOURCE_GOAL, payload)
+        except InvalidGoalPayload:
+            continue
+        raise AssertionError(f"payload should not have been accepted: {payload}")
 
 
 def test_the_registry_has_subjects() -> None:

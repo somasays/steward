@@ -1,14 +1,14 @@
 """Registered goals.
 
-`noop` is the whole list, and that is the point of issue #19: this module
-delivers the mechanism with the goal M0 already ships as its first subject.
-`scan_source` and the catalog it expands into are issue #20 -- they arrive as
-another block in this file (or a sibling module imported by `__init__`), and
-nothing else in the system changes to admit them.
+`noop` was the whole list at M0, and `scan_source` (issue #20) arrived exactly
+as issue #19 predicted it would: another block in this file, and nothing else
+in the system changed to admit it -- the API validates it, plans it and
+enqueues it through the same registry path.
 """
 
 from datetime import timedelta
 from decimal import Decimal
+from uuid import UUID
 
 from steward_schemas import RunBudget
 
@@ -64,3 +64,56 @@ class NoopParams(GoalParams):
 def plan_noop(params: NoopParams) -> tuple[PlannedTask, ...]:
     """Expand `noop` into the single task M0's exit criterion flows through."""
     return (PlannedTask(task_type=NOOP_TASK_TYPE, payload={"echo": params.echo}),)
+
+
+SCAN_SOURCE_GOAL = "scan_source"
+
+SCAN_SOURCE_TASK_TYPE = "scan_source"
+"""The task type `scan_source` plans; `steward_catalog` registers its handler
+under the same name. Same seam as `NOOP_TASK_TYPE`, checked the same way."""
+
+# What a `scan_source` run may spend (I12). Tight, and it can be, because the
+# plan below is exactly one task: the per-task cap the queue enforces *is* the
+# run cap, so what the API advertises for the run is what the run can spend.
+# `tokens` and `cost_usd` are zero because a metadata-only scan calls no model
+# -- if a later slice makes it call one, the budget has to be raised
+# deliberately rather than being found to be slack. `wall_clock` is also the
+# source connection's connect and statement timeout
+# (`steward_catalog.inspector`), so a source that accepts a connection and then
+# stops answering cannot outlive the cap.
+SCAN_SOURCE_BUDGET = RunBudget(
+    steps=1,
+    tokens=0,
+    cost_usd=Decimal("0.000000"),
+    wall_clock=timedelta(minutes=10),
+)
+
+
+class ScanSourceParams(GoalParams):
+    """`scan_source`'s parameters: which registered source to scan.
+
+    A `UUID`, not a string, so a malformed id is a 422 at the boundary rather
+    than a task that fails on a worker twenty seconds later (I3).
+    """
+
+    source_id: UUID
+
+
+@goal(
+    SCAN_SOURCE_GOAL,
+    params_model=ScanSourceParams,
+    allowed_task_types=[SCAN_SOURCE_TASK_TYPE],
+    budget=SCAN_SOURCE_BUDGET,
+    sample_payload={"source_id": "00000000-0000-0000-0000-000000000000"},
+)
+def plan_scan_source(params: ScanSourceParams) -> tuple[PlannedTask, ...]:
+    """Expand `scan_source` into **exactly one** bounded task (#37).
+
+    The obvious plan is a fan-out -- discover the schema, then one
+    `profile_table` per table -- and SPEC.md §3.1 sketches it. It is wrong to
+    ship it here: `RunPlan.task_specs` gives every planned task the run's whole
+    budget, so an N-way fan-out lets one run spend N times the cap the API
+    published for it (I12). Fan-out waits for run-level budget reservation, and
+    a deterministic metadata scan does not need it to be correct.
+    """
+    return (PlannedTask(task_type=SCAN_SOURCE_TASK_TYPE, payload={"source_id": str(params.source_id)}),)

@@ -1494,6 +1494,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "steward-catalog" },
     { name = "steward-queue" },
 ]
 
@@ -1501,7 +1502,10 @@ dev = [
 requires-dist = [{ name = "steward-schemas", editable = "packages/steward-schemas" }]
 
 [package.metadata.requires-dev]
-dev = [{ name = "steward-queue", editable = "packages/steward-queue" }]
+dev = [
+    { name = "steward-catalog", editable = "packages/steward-catalog" },
+    { name = "steward-queue", editable = "packages/steward-queue" },
+]
 
 [[package]]
 name = "steward-queue"

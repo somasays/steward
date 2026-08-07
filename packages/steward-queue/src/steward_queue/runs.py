@@ -25,6 +25,7 @@ from steward_queue import _sql
 from steward_queue._rows import _budget_from, _budget_params, _require_row
 from steward_queue.audit import RUN_ENTITY, write_audit
 from steward_queue.db import QueueConnection
+from steward_queue.keys import digest
 from steward_queue.models import SYSTEM_ACTOR, Actor, RunRecord, RunStatus
 
 
@@ -94,6 +95,26 @@ def create_run(
         after={"status": record.status.value, "goal": record.goal, "trace_id": record.trace_id},
     )
     return record
+
+
+def claim_single_flight(conn: QueueConnection, *, goal: str, payload: Mapping[str, Any]) -> RunRecord | None:
+    """The run already in flight for this exact goal and payload, or None --
+    and, either way, the right to decide, until the caller commits.
+
+    An advisory lock on the hashed (goal, payload) is taken first and released
+    when the caller's transaction ends. That is what makes "a scan already in
+    flight returns that run" (SPEC.md §8) true under concurrency rather than
+    only under a leisurely test: without it two simultaneous requests both read
+    "nothing in flight" and both create a run, and the endpoint's idempotency
+    would hold only when nobody was in a hurry.
+
+    Generic on purpose. The queue knows goals by name and payload by value and
+    nothing else -- it must not learn what a goal *means* (I4) -- so callers
+    with a narrower notion of "the same request" pass the payload they mean.
+    """
+    conn.execute(_sql.LOCK_RUN_ADMISSION, {"key": digest({"goal": goal, "payload": dict(payload)})})
+    row = conn.execute(_sql.SELECT_IN_FLIGHT_RUN, {"goal": goal, "payload": Jsonb(dict(payload))}).fetchone()
+    return _run_record(row) if row is not None else None
 
 
 def get_run(conn: QueueConnection, run_id: UUID) -> RunRecord | None:

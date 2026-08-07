@@ -32,6 +32,30 @@ FROM runs
 WHERE id = %(id)s
 """
 
+# Single-flight admission (SPEC.md §8: "a scan already in flight returns that
+# run"). Two statements, and both halves are needed.
+#
+# The lock is transaction-scoped and taken on a hash of (goal, payload), so two
+# concurrent requests for the same work serialise: the second waits, then sees
+# the run the first committed instead of both finding nothing and both creating.
+# It is an advisory lock rather than a unique index because "non-terminal" is a
+# moving predicate -- a partial unique index over `status IN (...)` would have to
+# name the goal and dig into the payload, which is the queue learning what a
+# goal means (I4).
+LOCK_RUN_ADMISSION = """
+SELECT pg_advisory_xact_lock(hashtextextended(%(key)s, 0))
+"""
+
+SELECT_IN_FLIGHT_RUN = """
+SELECT id, goal, payload, status, budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
+       used_steps, used_tokens, used_cost_usd, used_wall_clock, trace_id, idempotency_key,
+       created_at, updated_at
+FROM runs
+WHERE goal = %(goal)s AND payload = %(payload)s AND status IN ('pending', 'running')
+ORDER BY created_at
+LIMIT 1
+"""
+
 SELECT_RUN_BY_IDEMPOTENCY_KEY = """
 SELECT id, goal, payload, status, budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
        used_steps, used_tokens, used_cost_usd, used_wall_clock, trace_id, idempotency_key,

@@ -26,8 +26,6 @@ rather than a default anyone can drift into.
 SQL lives in `_sql` as static constants (I5).
 """
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
@@ -41,6 +39,7 @@ from steward_queue._rows import _budget_from, _budget_params, _require_row
 from steward_queue.audit import TASK_ENTITY, write_audit
 from steward_queue.backoff import DEFAULT_BASE_DELAY, DEFAULT_FACTOR, DEFAULT_MAX_DELAY, retry_delay
 from steward_queue.db import QueueConnection
+from steward_queue.keys import digest
 from steward_queue.models import (
     SYSTEM_ACTOR,
     Actor,
@@ -66,13 +65,7 @@ def dedup_key_for(task_type: str, payload: Mapping[str, Any]) -> str:
     on one row instead of a duplicate. Callers that genuinely want two
     identical-looking tasks in one run pass an explicit `dedup_key`.
     """
-    canonical = json.dumps(
-        {"task_type": task_type, "payload": dict(payload)},
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest({"task_type": task_type, "payload": dict(payload)})
 
 
 def enqueue(

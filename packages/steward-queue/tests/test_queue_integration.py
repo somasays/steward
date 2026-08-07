@@ -16,6 +16,7 @@ from steward_queue import (
     TaskNotClaimable,
     TaskState,
     claim,
+    claim_single_flight,
     complete,
     create_run,
     enqueue,
@@ -675,3 +676,75 @@ class TestCheckpoints:
         conn.commit()
         rows = conn.execute(SELECT_CHECKPOINT_STATE, (spec.task_id, 0)).fetchall()
         assert [row[0] for row in rows] == [{"messages": 2}]
+
+
+class TestSingleFlightAdmission:
+    """`claim_single_flight` -- the primitive behind "a scan already in flight
+    returns that run" (SPEC.md §8). Generic: goal name plus payload value, with
+    no idea what either means (I4)."""
+
+    def test_nothing_in_flight_yields_none(self, conn: QueueConnection) -> None:
+        assert claim_single_flight(conn, goal="scan_source", payload={"source_id": "a"}) is None
+        conn.rollback()
+
+    def test_a_pending_run_for_the_same_payload_is_returned(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        payload = {"source_id": "a"}
+        created = create_run(conn, goal="scan_source", payload=payload, budget=budget)
+        conn.commit()
+
+        found = claim_single_flight(conn, goal="scan_source", payload=payload)
+        conn.rollback()
+        assert found is not None and found.id == created.id
+
+    def test_a_different_payload_is_a_different_flight(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        create_run(conn, goal="scan_source", payload={"source_id": "a"}, budget=budget)
+        conn.commit()
+
+        assert claim_single_flight(conn, goal="scan_source", payload={"source_id": "b"}) is None
+        conn.rollback()
+
+    def test_a_finished_run_is_not_in_flight(
+        self, conn: QueueConnection, budget: RunBudget
+    ) -> None:
+        # Otherwise a source could never be rescanned: the first scan would
+        # keep answering for every request that followed it.
+        payload = {"source_id": "a"}
+        created = create_run(conn, goal="scan_source", payload=payload, budget=budget)
+        set_run_status(conn, created.id, RunStatus.SUCCEEDED)
+        conn.commit()
+
+        assert claim_single_flight(conn, goal="scan_source", payload=payload) is None
+        conn.rollback()
+
+    def test_the_lock_serialises_two_simultaneous_admissions(
+        self, conn: QueueConnection, open_conn: Callable[[], QueueConnection], budget: RunBudget
+    ) -> None:
+        """The reason the lock exists. Without it both callers read "nothing in
+        flight" and both create a run, and the endpoint is idempotent only when
+        nobody is in a hurry."""
+        payload = {"source_id": "contended"}
+        first = open_conn()
+        assert claim_single_flight(first, goal="scan_source", payload=payload) is None
+        created = create_run(first, goal="scan_source", payload=payload, budget=budget)
+
+        second = open_conn()
+        seen: list[UUID | None] = []
+
+        def contend() -> None:
+            found = claim_single_flight(second, goal="scan_source", payload=payload)
+            seen.append(found.id if found is not None else None)
+            second.rollback()
+
+        waiter = threading.Thread(target=contend)
+        waiter.start()
+        waiter.join(timeout=0.5)
+        assert waiter.is_alive()  # blocked on the admission lock, as designed
+
+        first.commit()
+        waiter.join(timeout=5)
+        assert seen == [created.id]
+        assert scalar(conn, COUNT_RUNS) == 1
