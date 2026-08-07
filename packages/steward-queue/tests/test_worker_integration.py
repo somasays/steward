@@ -34,7 +34,7 @@ from steward_queue import (
     write_checkpoint,
 )
 from steward_queue.db import QueueConnection
-from steward_queue.execution import EXECUTION_FAILED
+from steward_queue.execution import EXECUTION_FAILED, HANDLER_FAILED
 from steward_queue.registry import TaskContext
 from steward_queue.worker import BUDGET_EXCEEDED, DEADLINE_GRACE
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
@@ -51,6 +51,8 @@ BLOCKS_IN_THE_DRIVER = "test.blocks_in_the_driver"
 BLOCKS_THE_INTERPRETER = "test.blocks_the_interpreter"
 SPENDS_THE_CAP_TWICE = "test.spends_the_cap_twice"
 SWALLOWS_A_DATABASE_ERROR = "test.swallows_a_database_error"
+LEAKS_CANCELLATION = "test.leaks_cancellation"
+CANNOT_REACH_ITS_SOURCE = "test.cannot_reach_its_source"
 UNREGISTERED = "test.unregistered"
 REPORTS_ITS_LEASE = "test.reports_its_lease"
 
@@ -208,6 +210,43 @@ async def swallows_a_database_error(ctx: TaskContext) -> TaskResult:
     if ctx.spec.payload.get("swallow"):
         with contextlib.suppress(psycopg.Error):
             ctx.connection.execute(SELECT_DIVIDE_BY_ZERO)
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(LEAKS_CANCELLATION, sample_payload={"leak": False})
+async def leaks_cancellation(ctx: TaskContext) -> TaskResult:
+    """Lets a bare `CancelledError` escape -- the routine bug behind #55.
+
+    Awaiting a task that has been cancelled raises `CancelledError` in the
+    awaiter without cancelling it, which is exactly what an inner `wait_for` or
+    `TaskGroup` around the LLM gateway leaks when a handler neither absorbs it
+    nor re-raises it as its own error. It is raised on the handler thread's own
+    event loop, so it says nothing about the worker's.
+
+    Payload-driven, so the sample payload is an instant, idempotent no-op that
+    writes nothing under H1.
+    """
+    if ctx.spec.payload.get("leak"):
+        inner = asyncio.create_task(asyncio.sleep(30))
+        inner.cancel()
+        await inner
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(CANNOT_REACH_ITS_SOURCE, sample_payload={"unreachable": False})
+async def cannot_reach_its_source(ctx: TaskContext) -> TaskResult:
+    """Fails the way an unreachable customer database fails: a `TimeoutError`.
+
+    Since 3.11 `socket.timeout` *is* `TimeoutError`, so a `connect_timeout`
+    firing seconds into a long budget reaches the runtime as the same class an
+    overrun does (#57). Raised directly rather than by dialling a black-holed
+    address, so the test asserts the classification and not the network.
+
+    Payload-driven, so the sample payload reaches nothing and stays an instant,
+    idempotent no-op under H1.
+    """
+    if ctx.spec.payload.get("unreachable"):
+        raise TimeoutError("connection to customer-db timed out")
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
 
 
@@ -566,6 +605,42 @@ class TestExecutionFailures:
         assert state_of(conn, spec.task_id) is TaskState.PENDING
 
 
+class TestCancellationIsTaskScoped:
+    """#55: a handler's `CancelledError` is one task's bug, not the process ending.
+
+    The handler runs `asyncio.run` on an event loop of its own, so cancellation
+    escaping it carries no information about the worker's loop. Grouped with
+    `SystemExit` and `KeyboardInterrupt` it travelled out of the future the poll
+    loop reads and killed the worker -- the #45 shape through the one door #45
+    left open, and reachable by any handler that awaits.
+    """
+
+    async def test_a_handler_leaking_cancellation_fails_that_task_and_leaves_the_worker_polling(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        leaking = queued(task_type=LEAKS_CANCELLATION, payload={"leak": True}, max_attempts=1)
+
+        stop = asyncio.Event()
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=20), retry_base_delay=NO_BACKOFF)
+        loop_task = asyncio.create_task(worker.run_forever(stop))
+        try:
+            await until(lambda: state_of(conn, leaking.task_id) is TaskState.DEAD)
+
+            # Enqueued only now, so claiming it proves the loop is still
+            # polling rather than that it had two tasks in one batch.
+            healthy = queued(task_type=NOOP_TASK_TYPE, payload={"n": 904})
+            await until(lambda: state_of(conn, healthy.task_id) is TaskState.SUCCEEDED)
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop_task, timeout=5)
+
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (leaking.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None
+        assert row[0]["title"] == HANDLER_FAILED  # the handler's own bug, named as such
+        assert row[0]["detail"].startswith("CancelledError")
+
+
 class TestConcurrency:
     async def test_two_workers_never_execute_a_task_twice(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
@@ -734,6 +809,8 @@ class TestRunRollup:
         BLOCKS_THE_INTERPRETER,
         SPENDS_THE_CAP_TWICE,
         SWALLOWS_A_DATABASE_ERROR,
+        LEAKS_CANCELLATION,
+        CANNOT_REACH_ITS_SOURCE,
     ],
 )
 def test_scaffolding_handlers_are_registered(task_type: str) -> None:
@@ -839,6 +916,42 @@ class TestWallClockIsOneCap:
         conn.commit()
         assert task is not None
         assert task.state is TaskState.DEAD and task.attempts == 1
+
+
+class TestBudgetIsNotEveryTimeout:
+    """H4's other edge: `budget_exceeded` must mean the budget (#57).
+
+    The three shapes above assert the cap fires when it should. This asserts
+    what the cap must *not* claim -- a timeout from somewhere else, well inside
+    a budget nothing has approached. While every `TimeoutError` classified as an
+    overrun, H4's assertion was satisfiable by an unreachable host, which is the
+    fitness function passing for the wrong reason that GUARDRAILS §3 exists to
+    prevent -- and the operator reading `last_error` was sent to the budget
+    instead of to the host.
+    """
+
+    async def test_a_connect_timeout_inside_the_budget_is_not_a_budget_failure(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        # The fixture budget is five minutes; this fails in milliseconds.
+        spec = queued(
+            task_type=CANNOT_REACH_ITS_SOURCE,
+            payload={"unreachable": True},
+            max_attempts=1,
+        )
+        started = time.monotonic()
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+        elapsed = time.monotonic() - started
+
+        cap = spec.budget.wall_clock.total_seconds()
+        assert elapsed < cap / 10, f"took {elapsed:.2f}s, too near the {cap:.0f}s cap to prove anything"
+        assert state_of(conn, spec.task_id) is TaskState.DEAD
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None
+        assert row[0]["title"] == HANDLER_FAILED  # the host, not the cap
+        assert row[0]["detail"].startswith("TimeoutError")
+        assert "budget" not in row[0]  # and the cap does not travel with it
 
 
 class TestWorkerStaysResponsive:
