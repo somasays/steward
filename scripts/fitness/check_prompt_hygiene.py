@@ -49,6 +49,7 @@ def _sql_module(path: Path) -> bool:
 def run() -> CheckResult:
     root = repo_root()
     findings: List[Finding] = []
+    unparsed: List[str] = []
     pragmas = 0
     scanned = 0
     for base in (root / "packages", root / "services"):
@@ -62,6 +63,12 @@ def run() -> CheckResult:
             try:
                 tree = ast.parse(source)
             except SyntaxError:
+                # Cannot vouch for a file we could not parse. Usually the interpreter
+                # running the checks is older than the project's target (see run.py,
+                # which prefers the venv's Python), so 3.12 syntax reads as invalid.
+                # Silently continuing counted the file as clean -- a PASS for work not
+                # done (issue #35, GUARDRAILS §3).
+                unparsed.append(str(path.relative_to(root)))
                 continue
             # Skip docstring nodes: they legitimately contain instruction-like prose.
             docstring_linenos = set()
@@ -94,8 +101,19 @@ def run() -> CheckResult:
                                         "prompt-shaped literal in application code — move to prompts/ (I10)"))
     if scanned == 0:
         return CheckResult("S4", "prompt hygiene", "SKIP", [], "no Python code yet")
-    status = "FAIL" if findings else "PASS"
-    return CheckResult("S4", "prompt hygiene", status, findings,
+    if findings:
+        return CheckResult("S4", "prompt hygiene", "FAIL", findings,
+                           f"{scanned} files scanned", pragma_count=pragmas)
+    if unparsed:
+        # Some files were unreadable to this interpreter, so a PASS would vouch for
+        # files never examined (issue #35). Skip honest instead.
+        version = ".".join(str(n) for n in sys.version_info[:3])
+        return CheckResult("S4", "prompt hygiene", "SKIP", [],
+                           f"{scanned - len(unparsed)}/{scanned} files scanned; "
+                           f"{len(unparsed)} unparsable by python {version} "
+                           f"(e.g. {unparsed[0]}) — cannot vouch for them",
+                           pragma_count=pragmas)
+    return CheckResult("S4", "prompt hygiene", "PASS", [],
                        f"{scanned} files scanned", pragma_count=pragmas)
 
 
@@ -104,4 +122,4 @@ if __name__ == "__main__":
     for f in result.findings:
         print(f"{f.path}:{f.line}: {f.message}")
     print(f"S4 {result.status} ({result.detail}, {result.pragma_count} pragmas)")
-    sys.exit(1 if result.status == "FAIL" else 0)
+    sys.exit({"FAIL": 1, "SKIP": 2}.get(result.status, 0))

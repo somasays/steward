@@ -81,6 +81,19 @@ def _check_g4() -> CheckResult:
 SCRIPT_SKIP_EXIT = 2
 
 
+def _checker_python() -> str:
+    """The interpreter the stdlib checks run under.
+
+    They must work on a fresh clone before `uv sync`, so they stay 3.9-compatible
+    and fall back to whatever python3 launched the runner. But an older
+    interpreter cannot parse the project's own 3.12 syntax, and a checker that
+    cannot parse a file cannot vouch for it (issue #35). Prefer the venv's
+    interpreter whenever it exists so the checks actually see the code.
+    """
+    venv = repo_root() / ".venv" / "bin" / "python"
+    return str(venv) if venv.exists() else sys.executable
+
+
 def _script_or_pending(check_id: str, name: str, script: str) -> CheckResult:
     """Checks specced in GUARDRAILS.md that land via their own issue.
 
@@ -90,7 +103,7 @@ def _script_or_pending(check_id: str, name: str, script: str) -> CheckResult:
     path = Path(__file__).parent / script
     if not path.exists():
         return CheckResult(check_id, name, "SKIP", [], f"{script} not implemented yet (tracked as an issue)")
-    proc = subprocess.run([sys.executable, str(path)], cwd=repo_root(), capture_output=True, text=True)
+    proc = subprocess.run([_checker_python(), str(path)], cwd=repo_root(), capture_output=True, text=True)
     status = {0: "PASS", SCRIPT_SKIP_EXIT: "SKIP"}.get(proc.returncode, "FAIL")
     detail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else script
     return CheckResult(check_id, name, status, [], detail)

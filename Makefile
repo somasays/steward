@@ -3,7 +3,7 @@
 .PHONY: fitness hooks lint type test evals demo demo-guardrails
 
 fitness:            ## Run the fitness suite: S/H/B tiers + hygiene (GUARDRAILS.md §1)
-	python3 scripts/fitness/run.py
+	@sh scripts/fitness/fitness
 
 demo:               ## Run the platform end to end on an ephemeral Postgres (see DEMO.md)
 	uv run --with pgserver python scripts/demo/run_demo.py

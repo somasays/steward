@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launch the fitness suite under the project's interpreter when it exists.
+# The checks stay 3.9-compatible so they work on a fresh clone before `uv sync`,
+# but an older interpreter cannot parse the project's own 3.12 syntax, and a
+# checker that cannot parse a file cannot vouch for it (issue #35).
+root=$(cd "$(dirname "$0")/../.." && pwd)
+if [ -x "$root/.venv/bin/python" ]; then
+    exec "$root/.venv/bin/python" "$root/scripts/fitness/run.py" "$@"
+fi
+exec python3 "$root/scripts/fitness/run.py" "$@"

@@ -10,4 +10,4 @@ else
     echo "gitleaks not installed — skipping local secret scan (CI still enforces): https://github.com/gitleaks/gitleaks#installing"
 fi
 
-exec python3 scripts/fitness/run.py --stage pre-commit
+exec sh scripts/fitness/fitness --stage pre-commit
