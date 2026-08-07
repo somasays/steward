@@ -254,7 +254,9 @@ def test_a_creation_that_fails_is_still_traced(tracer: RecordingTracer) -> None:
     assert span.trace_id == new_trace_id(seed=str(span.run_id))
 
 
-def test_reusing_a_key_for_a_different_request_is_a_409(client: TestClient, conn: QueueConnection) -> None:
+def test_reusing_a_key_for_a_different_request_is_a_409(
+    client: TestClient, conn: QueueConnection, tracer: RecordingTracer
+) -> None:
     headers = {"Idempotency-Key": "acceptance-conflict"}
     first = client.post("/v1/runs", json={"goal": "noop"}, headers=headers)
     second = client.post("/v1/runs", json={"goal": "noop", "payload": {"echo": "x"}}, headers=headers)
@@ -263,6 +265,11 @@ def test_reusing_a_key_for_a_different_request_is_a_409(client: TestClient, conn
     tasks = conn.execute(SELECT_RUN_TASKS, {"run_id": UUID(first.json()["id"])}).fetchall()
     conn.rollback()
     assert len(tasks) == 1  # the conflicting request queued nothing
+    # The conflict is an error on the original run's trace, not on an orphan.
+    conflict = tracer.spans[-1]
+    assert conflict.outcome is SpanOutcome.ERROR
+    assert conflict.run_id == UUID(first.json()["id"])
+    assert conflict.trace_id == first.json()["trace_id"]
 
 
 def test_a_run_the_api_never_created_is_a_404(client: TestClient) -> None:
