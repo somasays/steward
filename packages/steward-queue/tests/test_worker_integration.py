@@ -132,7 +132,12 @@ class HandlerSighting:
     backend_pid: int
 
 
-_sightings: list[HandlerSighting] = []
+_sightings: dict[UUID, HandlerSighting] = {}
+"""Sightings by task id, so a test reads its own and never another's.
+
+Keyed rather than appended because this handler is also executed by H1 off the
+registry: a list would make every test that reads it depend on what ran before.
+"""
 
 
 @task_handler(BLOCKS_THE_INTERPRETER, sample_payload={"seconds": 0.0})
@@ -150,7 +155,7 @@ async def blocks_the_interpreter(ctx: TaskContext) -> TaskResult:
     checkpoints are upserted at fixed steps, so it is idempotent under H1.
     """
     write_checkpoint(ctx.connection, ctx.spec.task_id, step=0, state={"phase": "before"})
-    _sightings.append(HandlerSighting(threading.get_ident(), ctx.connection.info.backend_pid))
+    _sightings[ctx.spec.task_id] = HandlerSighting(threading.get_ident(), ctx.connection.info.backend_pid)
     time.sleep(float(ctx.spec.payload["seconds"]))
     write_checkpoint(ctx.connection, ctx.spec.task_id, step=1, state={"phase": "after"})
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
@@ -630,7 +635,6 @@ class TestWallClockIsOneCap:
         The handler holds the interpreter for six times its budget and nothing
         can make it stop, so the bound has to come from the worker not waiting.
         """
-        _sightings.clear()
         cap = ONE_SECOND_WALL_CLOCK.wall_clock.total_seconds()
         spec = queued(
             task_type=BLOCKS_THE_INTERPRETER,
@@ -670,7 +674,6 @@ class TestWallClockIsOneCap:
         it, so an abandoned handler is not merely expected not to write -- it
         cannot.
         """
-        _sightings.clear()
         spec = queued(
             task_type=BLOCKS_THE_INTERPRETER,
             payload={"seconds": 6.0},
@@ -679,8 +682,8 @@ class TestWallClockIsOneCap:
         )
         execution = asyncio.create_task(Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once())
 
-        await until(lambda: bool(_sightings))
-        [sighting] = _sightings
+        await until(lambda: spec.task_id in _sightings)
+        sighting = _sightings[spec.task_id]
         assert sighting.thread_ident != threading.get_ident()  # off the loop, which stayed free
         assert backend_state(conn, sighting.backend_pid) == "idle in transaction"
         assert state_of(conn, spec.task_id) is TaskState.RUNNING  # committed by the other session
@@ -731,7 +734,6 @@ class TestWorkerStaysResponsive:
     async def test_shutdown_does_not_wait_out_the_handler(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
     ) -> None:
-        _sightings.clear()
         spec = queued(task_type=BLOCKS_THE_INTERPRETER, payload={"seconds": 6.0})
         stop = asyncio.Event()
         worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=50))
@@ -744,10 +746,16 @@ class TestWorkerStaysResponsive:
         assert time.monotonic() - started < 1.0  # not the handler's remaining seconds
 
         # The attempt is left where a reaper can find it (N1) rather than
-        # failed: nothing about it exceeded a budget.
+        # failed: nothing about it exceeded a budget. "Abandoned" has to mean
+        # abandoned, though -- the worker takes the handoff and drops the
+        # handler's session on the way out, so the thread it leaves behind
+        # cannot come back later and settle a task nobody is supervising.
         assert state_of(conn, spec.task_id) is TaskState.RUNNING
-        [sighting] = _sightings
-        await until(lambda: backend_state(conn, sighting.backend_pid) is None)
+        sighting = _sightings[spec.task_id]
+        assert backend_state(conn, sighting.backend_pid) is None
+        await asyncio.sleep(0.5)
+        assert state_of(conn, spec.task_id) is TaskState.RUNNING
+        assert checkpoints(conn, spec.task_id) == []
 
 
 class TestLeaseCoversBudget:

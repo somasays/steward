@@ -427,20 +427,25 @@ class Worker:
 
         if finished.done():
             return self._settle(finished.result(), span)
-        if time.monotonic() - started < deadline.total_seconds():
-            # `stop` fired first: the budget is intact, so this is not a budget
-            # failure. The attempt is left `running` for a reaper to requeue --
-            # exactly N1's model, at the cost of one re-executed idempotent
-            # attempt (I8).
+        stopping = time.monotonic() - started < deadline.total_seconds()
+        if not handoff.take():
+            # The thread claimed the recording in the moment between the wait
+            # returning and this line; its outcome is the authoritative one.
+            return self._settle(await finished, span)
+        await asyncio.to_thread(self._abandon, conn, handoff)
+        if stopping:
+            # `stop` fired before the cap: the budget is intact, so this is not
+            # a budget failure. The attempt is left `running` for a reaper to
+            # requeue -- exactly N1's model, at the cost of one re-executed
+            # idempotent attempt (I8). Taking the handoff first is what makes
+            # that true rather than aspirational: without it the thread would
+            # go on to commit a terminal state for an attempt this worker has
+            # already walked away from, and for a handler nothing is bounding
+            # any more.
             span.record(SpanOutcome.ERROR, WORKER_STOPPING)
             return True
-        if handoff.take():
-            await asyncio.to_thread(self._abandon, conn, handoff)
-            await self._record_failure(conn, task, _budget_exceeded(task.spec.budget), span)
-            return True
-        # The thread claimed the recording in the moment between the deadline
-        # and the line above; its outcome is the authoritative one.
-        return self._settle(await finished, span)
+        await self._record_failure(conn, task, _budget_exceeded(task.spec.budget), span)
+        return True
 
     def _spawn(
         self, task: ClaimedTask, registration: HandlerRegistration, handoff: _Handoff
