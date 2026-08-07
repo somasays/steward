@@ -1,16 +1,17 @@
 """Round-trip serialization: model -> json -> model == model, for every
 published contract (issue #2 acceptance criteria).
 
-No third-party test framework here on purpose: this package is pydantic +
-stdlib only (I4), enforced by S1 against `packages/steward-schemas` as a
-whole, tests included — see GUARDRAILS.md S1. Plain `test_*` functions and
-stdlib-only assertions.
+Uses pytest.mark.parametrize to run the same assertion once per sample
+instead of one hand-written test per contract: S1 (GUARDRAILS.md) scopes
+the schemas independence contract to the installed package (`src/`), not
+`tests/` (issue #12), so tests are free to import pytest (issue #13).
 """
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
+import pytest
 from pydantic import BaseModel
 from steward_schemas import (
     CONTRACTS,
@@ -163,56 +164,46 @@ def build_run() -> Run:
     )
 
 
-def test_source_roundtrips() -> None:
-    _roundtrips(build_source())
+# One sample per `CONTRACTS` entry -- test_samples_cover_every_registered_contract
+# below asserts nothing is missing, and each one is exercised by
+# test_contract_sample_roundtrips.
+SAMPLES: dict[str, BaseModel] = {
+    "source": build_source(),
+    "asset": build_asset(),
+    "column": build_column(),
+    "task_spec": build_task_spec(),
+    "task_result": build_task_result_succeeded(),
+    "run_budget": build_run_budget(),
+    "agent_spec": build_agent_spec(),
+    "problem_details": build_problem_details(),
+    "run_create": build_run_create(),
+    "run": build_run(),
+}
+
+# Additional shapes worth round-tripping that aren't 1:1 with a CONTRACTS
+# entry (a second, distinct instance of an already-covered contract).
+EXTRA_SAMPLES: dict[str, BaseModel] = {
+    "source_without_schedule": build_source_no_schedule(),
+    "task_result_failed": build_task_result_failed(),
+    "problem_details_minimal": ProblemDetails(title="Internal error", status=500),
+}
 
 
-def test_source_without_schedule_roundtrips() -> None:
-    _roundtrips(build_source_no_schedule())
+def test_samples_cover_every_registered_contract() -> None:
+    """Every `CONTRACTS` entry has a sample here (issue #2 acceptance criteria)."""
+    assert set(SAMPLES) == set(CONTRACTS)
+    for name, model in SAMPLES.items():
+        assert isinstance(model, CONTRACTS[name])
 
 
-def test_asset_roundtrips() -> None:
-    _roundtrips(build_asset())
+@pytest.mark.parametrize("model", list(SAMPLES.values()), ids=list(SAMPLES))
+def test_contract_sample_roundtrips(model: BaseModel) -> None:
+    _roundtrips(model)
 
 
-def test_column_roundtrips() -> None:
-    _roundtrips(build_column())
-
-
-def test_run_budget_roundtrips() -> None:
-    _roundtrips(build_run_budget())
-
-
-def test_task_spec_roundtrips() -> None:
-    _roundtrips(build_task_spec())
-
-
-def test_task_result_succeeded_roundtrips() -> None:
-    _roundtrips(build_task_result_succeeded())
-
-
-def test_task_result_failed_roundtrips() -> None:
-    _roundtrips(build_task_result_failed())
-
-
-def test_agent_spec_roundtrips() -> None:
-    _roundtrips(build_agent_spec())
-
-
-def test_problem_details_roundtrips() -> None:
-    _roundtrips(build_problem_details())
-
-
-def test_problem_details_minimal_roundtrips() -> None:
-    _roundtrips(ProblemDetails(title="Internal error", status=500))
-
-
-def test_run_create_roundtrips() -> None:
-    _roundtrips(build_run_create())
-
-
-def test_run_roundtrips() -> None:
-    _roundtrips(build_run())
+@pytest.mark.parametrize("model", list(EXTRA_SAMPLES.values()), ids=list(EXTRA_SAMPLES))
+def test_extra_sample_roundtrips(model: BaseModel) -> None:
+    _roundtrips(model)
 
 
 def test_problem_details_extension_member_survives_roundtrip() -> None:
@@ -223,23 +214,3 @@ def test_problem_details_extension_member_survives_roundtrip() -> None:
     restored = ProblemDetails.model_validate_json(original.model_dump_json())
     assert restored == original
     assert restored.__pydantic_extra__ == {"budget": {"steps": 20}}
-
-
-def test_all_contract_samples_roundtrip() -> None:
-    """Every `CONTRACTS` entry has a sample here and it round-trips."""
-    samples: dict[str, BaseModel] = {
-        "source": build_source(),
-        "asset": build_asset(),
-        "column": build_column(),
-        "task_spec": build_task_spec(),
-        "task_result": build_task_result_succeeded(),
-        "run_budget": build_run_budget(),
-        "agent_spec": build_agent_spec(),
-        "problem_details": build_problem_details(),
-        "run_create": build_run_create(),
-        "run": build_run(),
-    }
-    assert set(samples) == set(CONTRACTS)
-    for name, model in samples.items():
-        assert isinstance(model, CONTRACTS[name])
-        _roundtrips(model)
