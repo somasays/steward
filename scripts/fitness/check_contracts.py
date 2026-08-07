@@ -35,9 +35,11 @@ not reliably present in a shallow CI checkout or an offline clone:
   - CI, any other event (push to another ref, workflow_dispatch): merge-base
     with the repository default branch.
   - local: merge-base with origin/main, when that ref exists.
-  - any merge-base that equals HEAD (a dispatch run on the default branch, an
-    undiverged ref) is rejected: comparing a commit with itself is not a
-    compatibility check, whatever the event was.
+  - every candidate above passes through `_unless_head`: one equal to HEAD (a
+    dispatch run on the default branch, an undiverged ref, a force-push to the
+    same sha) is rejected, because comparing a commit with itself is not a
+    compatibility check. It fails closed -- an unreadable HEAD refuses the
+    candidate rather than trusting it.
   - unresolvable -- including resolved but unreadable, e.g. a blobless clone
     where `git show` cannot produce the blob: SKIP with the reason locally
     (exit 2), FAIL in CI. Never
@@ -299,12 +301,12 @@ def _resolve_baseline(
             base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
             sha = base.get("sha")
             if isinstance(sha, str) and sha and _commit_present(git, sha):
-                return Baseline(sha, "CI pull_request: base sha from the event payload")
+                return _unless_head(git, sha, "CI pull_request: base sha from the event payload")
             base_ref = env.get("GITHUB_BASE_REF") or ""
             if base_ref:
                 resolved = git(["rev-parse", "--verify", f"origin/{base_ref}^{{commit}}"])
                 if resolved:
-                    return Baseline(resolved, f"CI pull_request: origin/{base_ref}")
+                    return _unless_head(git, resolved, f"CI pull_request: origin/{base_ref}")
             return Baseline(None, "CI pull_request: neither the payload base sha nor "
                                   f"origin/{base_ref or '<base ref>'} is in this checkout ({FETCH_DEPTH_HINT})")
         default_branch = _default_branch(env, load_event)
@@ -315,7 +317,9 @@ def _resolve_baseline(
             # What main had before this push is the push event's `before` sha.
             before = load_event(env).get("before")
             if isinstance(before, str) and set(before) != {"0"} and _commit_present(git, before):
-                return Baseline(before, f"CI push to {default_branch}: previous tip (event.before)")
+                # Through the same predicate: a force-push to the same sha, or a
+                # replayed payload, would otherwise seat HEAD as its own baseline.
+                return _unless_head(git, before, f"CI push to {default_branch}: previous tip (event.before)")
             return Baseline(None, f"CI push to {default_branch}: event.before is unavailable or not in "
                                   f"this checkout, and merge-base would be HEAD itself ({FETCH_DEPTH_HINT})")
         merge_base = git(["merge-base", "HEAD", f"origin/{default_branch}"])
@@ -330,15 +334,20 @@ def _resolve_baseline(
     return Baseline(None, "local: origin/main is not present (offline clone or no remote-tracking ref)")
 
 
-def _unless_head(git: GitFn, merge_base: str, method: str) -> Baseline:
-    """A merge-base equal to HEAD -- on the default branch, or any ref that
-    hasn't diverged -- would compare the commit with itself and call it a
-    compatibility check. That is not a baseline; route it to the unresolved
-    policy (SKIP locally, FAIL in CI) instead of vouching for nothing."""
+def _unless_head(git: GitFn, candidate: str, method: str) -> Baseline:
+    """Every candidate baseline passes through here: one equal to HEAD -- a
+    run on the default branch, an undiverged ref, a force-push to the same
+    sha -- would compare the commit with itself and call it a compatibility
+    check. That is not a baseline; route it to the unresolved policy (SKIP
+    locally, FAIL in CI) instead of vouching for nothing. Fails closed: if
+    HEAD itself can't be read, the predicate can't be evaluated, so the
+    candidate is refused rather than trusted."""
     head = git(["rev-parse", "HEAD"])
-    if head is not None and head == merge_base:
+    if head is None:
+        return Baseline(None, f"{method}, but HEAD could not be read to rule out a self-comparison")
+    if head == candidate:
         return Baseline(None, f"{method} is HEAD itself — no divergence to compare")
-    return Baseline(merge_base, method)
+    return Baseline(candidate, method)
 
 
 def _default_branch(env: Mapping[str, str], load_event: Callable[[Mapping[str, str]], JSONDict]) -> str:
@@ -691,12 +700,14 @@ def _selftest_baseline_resolution(ok: bool) -> bool:
     payload = {"pull_request": {"base": {"sha": "b" * 40}}}
 
     # 1. CI pull_request -> base sha from the event payload
-    base = _resolve_baseline(pr_env, _fake_git({"cat-file -e": ""}), lambda _env: payload)
+    head_fake = {"cat-file -e": "", "rev-parse HEAD": "a" * 40}
+    base = _resolve_baseline(pr_env, _fake_git(head_fake), lambda _env: payload)
     ok = _check(ok, "CI pull_request resolves the payload base sha",
                 base.sha == "b" * 40 and "event payload" in base.method, base)
 
     # 1b. payload sha absent from a shallow checkout -> origin/<base ref> fallback
-    base = _resolve_baseline(pr_env, _fake_git({"rev-parse --verify origin/main": "c" * 40}), lambda _env: {})
+    base = _resolve_baseline(pr_env, _fake_git({"rev-parse --verify origin/main": "c" * 40,
+                                               "rev-parse HEAD": "a" * 40}), lambda _env: {})
     ok = _check(ok, "CI pull_request falls back to origin/<base ref>",
                 base.sha == "c" * 40 and "origin/main" in base.method, base)
 
@@ -711,7 +722,8 @@ def _selftest_baseline_resolution(ok: bool) -> bool:
     # 2a. CI push TO the default branch -> event.before; merge-base would be HEAD
     # itself, i.e. a compatibility check comparing the commit with itself.
     main_push = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push", "GITHUB_REF_NAME": "main"}
-    base = _resolve_baseline(main_push, _fake_git({"cat-file -e": "", "merge-base": "h" * 40}),
+    base = _resolve_baseline(main_push, _fake_git({"cat-file -e": "", "merge-base": "h" * 40,
+                                                  "rev-parse HEAD": "a" * 40}),
                              lambda _env: {"before": "9" * 40})
     ok = _check(ok, "CI push to the default branch uses event.before, not merge-base",
                 base.sha == "9" * 40 and "event.before" in base.method, base)
@@ -739,6 +751,19 @@ def _selftest_baseline_resolution(ok: bool) -> bool:
         base = _resolve_baseline(env_, same, lambda _env: {})
         ok = _check(ok, f"{label}: merge-base equal to HEAD is not accepted as a baseline",
                     base.sha is None and "HEAD itself" in base.method, base)
+
+    # 3c. the invariant is unconditional: no path may seat HEAD as its own
+    # baseline, including event.before after a force-push to the same sha
+    base = _resolve_baseline(main_push, _fake_git({"cat-file -e": "", "rev-parse HEAD": "9" * 40}),
+                             lambda _env: {"before": "9" * 40})
+    ok = _check(ok, "event.before equal to HEAD is not accepted as a baseline",
+                base.sha is None and "HEAD itself" in base.method, base)
+
+    # 3d. fail closed: if HEAD can't be read the predicate can't be evaluated,
+    # so the candidate is refused rather than trusted
+    base = _resolve_baseline(dispatch_env, _fake_git({"merge-base": "e" * 40}), lambda _env: {})
+    ok = _check(ok, "a candidate baseline is refused when HEAD cannot be read",
+                base.sha is None and "HEAD could not be read" in base.method, base)
 
     # 4. unresolvable -> no sha, reason carried; SKIP locally, FAIL in CI
     nothing = _fake_git({})
