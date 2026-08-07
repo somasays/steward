@@ -25,7 +25,7 @@ Checks are tiered by *how* they measure, because different properties fail at di
 | S3 | SQL string-assembly ban | I5, N7 | ruff S608, selected globally (including `scripts/fitness`, which is otherwise style-exempt) | active (issue #9) |
 | S4 | Prompt literal ban | I10 | `check_prompt_hygiene.py` — prompt-shaped literals outside `prompts/` (custom: domain-specific) | active |
 | S5 | Public-surface lock | I9, I3 | `check_surface.py` — no contained-module type in any package's public signatures, class bases, or re-exports | active |
-| S6 | Contract compatibility | I3, N9 | JSON Schema snapshots of published Pydantic contracts (pytest + `contracts/`) and oasdiff on the exported OpenAPI spec; breaking change fails, additive requires snapshot update in the same commit | issue #7 |
+| S6 | Contract compatibility | I3, N9 | `check_contracts.py` — regenerates JSON Schema for every published Pydantic contract and the exported OpenAPI spec, diffs each against its committed snapshot in `contracts/`; a stdlib differ (no external oasdiff binary) classifies removed model/property/path/method, type changes, new-required properties, and enum narrowing as breaking (FAIL), any other drift as a stale snapshot (FAIL), match as PASS | active |
 | S7 | File-graph coverage | doc consistency | `check_filegraph.py` — `scripts/fitness/filegraph.json` maps every file pattern to its impacted files; changing a file means updating/verifying its dependents (workflow law, CLAUDE.md); S7 fails if any tracked file is outside the graph | active |
 
 ### Tier H — behavioral harnesses (every PR; `pytest -m invariants` / `-m acceptance` against Docker fixtures)
