@@ -15,8 +15,8 @@ import psycopg
 import pytest
 from psycopg import sql
 from steward_catalog import DiscoveredColumn, ProfileTarget, Secret, postgres_profiler
-from steward_catalog.profiler import SourceProfiler
-from steward_schemas import SemanticType
+from steward_catalog.profiler import PostgresSourceProfiler, SourceProfiler
+from steward_schemas import SemanticType, TableProfile
 
 BUDGET = timedelta(seconds=30)
 
@@ -192,6 +192,74 @@ def test_a_two_valued_column_publishes_nothing_that_tells_its_values_apart(
     assert [frequency.count for frequency in column_profile.top_values] == [3, 1]  # the split survives
     assert column_profile.min_value == column_profile.max_value  # ...and so do min/max
     assert column_profile.min_value is not None and column_profile.min_value.masked == "***"
+
+
+DRAINING_COLUMN = (
+    "CREATE TABLE sales.draining (v text)",
+    "INSERT INTO sales.draining (v) VALUES ('yes'),('yes'),('yes'),('no'),('no'),('pending')",
+    "GRANT SELECT ON sales.draining TO steward_reader",
+)
+
+DRAIN_THE_THIRD_VALUE = "DELETE FROM sales.draining WHERE v = 'pending'"
+
+
+def test_a_profile_reads_one_snapshot_even_while_the_table_changes(
+    source_secret: Secret, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+) -> None:
+    """The statistics and the samples must describe the same table (I8).
+
+    A profile is one stats pass plus one query per column. Under autocommit each
+    got its own snapshot, so a three-valued column whose third value drained in
+    between reported `distinct_count = 3` from the first statement and a
+    two-row sample from the second -- a now-binary column published with its
+    values distinguishable, because the suppression decision was made against
+    data that no longer existed (#49 review).
+
+    The drain here is committed by a *different* connection while the profile is
+    open, which is the only way to exercise it: under `REPEATABLE READ` the
+    profiler cannot see it, so `distinct_count` and the sample agree and nothing
+    is suppressed. Remove the isolation level and this fails -- the count says
+    three and the sample carries two.
+    """
+    for statement in DRAINING_COLUMN:
+        source_admin.execute(statement)
+    target = ProfileTarget(schema_name="sales", name="draining", columns=(column("v"),))
+
+    with postgres_profiler(source_secret, BUDGET) as reader:
+        # Open the snapshot with the stats pass, then drain the third value from
+        # another connection before the sample is taken.
+        profiler_under_test = reader
+        source_admin.execute("SELECT 1")  # the drain lands between the two statements
+        profile = _profile_with_drain(profiler_under_test, target, source_admin)
+
+    [column_profile] = profile.columns
+    assert column_profile.distinct_count == 3
+    assert len(column_profile.top_values) == 3, "the sample saw a different table than the statistics"
+    assert {frequency.value.masked for frequency in column_profile.top_values} != {"***"}
+
+
+def _profile_with_drain(
+    reader: SourceProfiler,
+    target: ProfileTarget,
+    admin: psycopg.Connection[psycopg.rows.TupleRow],
+) -> TableProfile:
+    """Run a profile with a committed DELETE landing between its two statements.
+
+    The seam is the profiler's own `_top_values`: wrapping it is how the drain
+    is placed *inside* one profile rather than between two, which is where the
+    race lives.
+    """
+    original = type(reader)._top_values
+
+    def draining(self: PostgresSourceProfiler, *args: object, **kwargs: object) -> object:
+        admin.execute(DRAIN_THE_THIRD_VALUE)
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    type(reader)._top_values = draining  # type: ignore[assignment,method-assign]
+    try:
+        return reader.profile(target)
+    finally:
+        type(reader)._top_values = original  # type: ignore[method-assign]
 
 
 def test_top_values_truncate_deterministically_when_a_tie_spans_the_cut(

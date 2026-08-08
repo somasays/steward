@@ -166,7 +166,11 @@ def test_the_profiles_revision_versions_one_profile_per_asset(scratch_dsn: str) 
     # profilers racing on one asset must not both be able to commit version 4.
     definitions = unique_index_defs(scratch_dsn)
     assert "profiles_asset_version" in definitions
-    assert "(asset_id, version" in definitions["profiles_asset_version"]
+    # The exact column list, not a prefix: `(asset_id, version, digest)` would
+    # satisfy a substring check and destroy the property -- two writers could
+    # each commit version 4 with different digests, which is the fork the
+    # append-only history exists to prevent (#49 review).
+    assert definitions["profiles_asset_version"].endswith("(asset_id, version DESC)")
 
 
 def test_a_source_row_cannot_hold_a_dsn(scratch_dsn: str) -> None:

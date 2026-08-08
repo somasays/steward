@@ -25,9 +25,10 @@ connection too: it is the same function.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from contextlib import AbstractContextManager, contextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Protocol
@@ -37,7 +38,13 @@ from psycopg import IsolationLevel
 from psycopg.rows import TupleRow
 from steward_schemas import ColumnProfile, MaskedSample, SemanticType, TableProfile, ValueFrequency
 
-from steward_catalog._profile_sql import STATS_PER_COLUMN, TOP_VALUE_LIMIT, stats_query, top_values_query
+from steward_catalog._profile_sql import (
+    STATS_PER_COLUMN,
+    TOP_VALUE_LIMIT,
+    remaining_statement_timeout,
+    stats_query,
+    top_values_query,
+)
 from steward_catalog.inspector import open_source_connection
 from steward_catalog.masking import (
     LOW_CARDINALITY_MAX,
@@ -111,22 +118,53 @@ def _cell(value: object) -> RawCell | None:
 
 @dataclass(frozen=True, slots=True)
 class PostgresSourceProfiler:
-    """`SourceProfiler` over a psycopg connection on the read-only role."""
+    """`SourceProfiler` over a psycopg connection on the read-only role.
+
+    Carries the wall-clock `budget` because the transaction it opens has to be
+    bounded by something, and `statement_timeout` alone is not it: it bounds a
+    *statement* (`steward_queue.db`), and a profile is one stats pass plus one
+    query per column. Under autocommit that did not matter -- locks and snapshot
+    were released between statements -- but one `REPEATABLE READ` transaction
+    holds an `ACCESS SHARE` lock and pins `xmin` for as long as it lives, so N+1
+    statements each allowed the whole budget would let a 60-column table hold a
+    customer's relation for 61 times the cap, blocking their DDL and their
+    VACUUM long after Steward recorded the task `budget_exceeded` (#49 review).
+
+    So each statement is allowed only what is *left* of the budget: the last one
+    gets the remainder, the total is the cap, and a profile that has already
+    overrun fails on its next statement instead of running one more.
+    """
 
     connection: psycopg.Connection[TupleRow]
+    budget: timedelta
+    started: float = field(default_factory=time.monotonic)
+
+    def _bound_next_statement(self) -> None:
+        """Allow the next statement only the budget that remains."""
+        elapsed = time.monotonic() - self.started
+        self.connection.execute(remaining_statement_timeout(self.budget, elapsed))
 
     def profile(self, target: ProfileTarget) -> TableProfile:
         try:
-            return self._profile(target)
-        finally:
-            # End the snapshot with the profile that needed it. Holding one for
-            # the profiler's whole lifetime would keep a transaction open on the
-            # customer's database across everything the caller does next, and
-            # block their DDL behind our read locks.
-            self.connection.rollback()
+            profile = self._profile(target)
+        except BaseException:
+            # Guarded: on a connection the server has closed, `rollback()` raises
+            # in its own right and would replace the original exception -- which
+            # is the one the handler logs the type and SQLSTATE of, and the only
+            # failure signal that path carries (N7 forbids the message itself).
+            with suppress(psycopg.Error):
+                self.connection.rollback()
+            raise
+        # End the snapshot with the profile that needed it. Holding one for the
+        # profiler's whole lifetime would keep a transaction open on the
+        # customer's database across everything the caller does next, and block
+        # their DDL behind our read locks.
+        self.connection.rollback()
+        return profile
 
     def _profile(self, target: ProfileTarget) -> TableProfile:
         names = tuple(column.name for column in target.columns)
+        self._bound_next_statement()
         row = self.connection.execute(stats_query(target.schema_name, target.name, names)).fetchone()
         if row is None:  # pragma: no cover -- an aggregate always returns a row
             raise RuntimeError(f"no statistics returned for {target.schema_name}.{target.name}")
@@ -186,6 +224,7 @@ class PostgresSourceProfiler:
         )
 
     def _top_values(self, target: ProfileTarget, column: DiscoveredColumn) -> tuple[ValueFrequency, ...]:
+        self._bound_next_statement()
         rows = self.connection.execute(
             top_values_query(target.schema_name, target.name, column.name),
             {"limit": TOP_VALUE_LIMIT},
@@ -234,6 +273,6 @@ def postgres_profiler(secret: Secret, budget: timedelta) -> Iterator[SourceProfi
     try:
         connection.autocommit = False
         connection.isolation_level = IsolationLevel.REPEATABLE_READ
-        yield PostgresSourceProfiler(connection)
+        yield PostgresSourceProfiler(connection, budget)
     finally:
         connection.close()
