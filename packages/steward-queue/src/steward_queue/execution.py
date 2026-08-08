@@ -50,6 +50,19 @@ never touches the task row, and its session is gone by then anyway, so its
 writes are discarded and the attempt the worker recorded stands. At most, not
 exactly -- see below and SPEC.md §13 D7.
 
+The three caps nobody can enforce from outside
+----------------------------------------------
+Wall-clock is bounded above by machinery: the thread's timeout, the driver's,
+and the loop's deadline. Steps, tokens and cost are not observable from here at
+all -- they are counted inside the handler and *reported* on its `TaskResult`.
+So they are enforced where they become visible: a succeeded result whose usage
+exceeds the task's own budget is turned into a `budget_exceeded` failure
+(`_overspent`), and its usage is therefore never rolled up onto the run. That
+is what keeps `runs.used_*` inside `runs.budget_*` once a plan's per-task caps
+are reserved against the run's (issue #48) -- the reservation bounds what tasks
+may spend, this bounds what they may *report*, and the run's totals are the sum
+of the second (I12, N6).
+
 What the thread never does is raise at the loop
 -----------------------------------------------
 Everything that can go wrong here -- the handler, the connection it needs
@@ -138,22 +151,53 @@ def _problem(title: str, detail: str) -> ProblemDetails:
     return ProblemDetails(type="urn:steward:task-failed", title=title, status=500, detail=detail)
 
 
-def _budget_exceeded(budget: RunBudget) -> ProblemDetails:
+def _budget_exceeded(budget: RunBudget, detail: str | None = None) -> ProblemDetails:
     """The typed, visible failure I12 requires when a hard cap is hit.
 
     Carries the budget it blew as an RFC 9457 extension member (which is why
     this goes through `model_validate` rather than the constructor), so an
     operator reading the `last_error` column sees the cap, not just the symptom.
+
+    `detail` defaults to the wall-clock overrun because that is the cap the
+    runtime itself enforces; the other three dimensions are reported by the
+    handler and checked in `_overspent`, which passes its own.
     """
     return ProblemDetails.model_validate(
         {
             "type": "urn:steward:budget-exceeded",
             "title": BUDGET_EXCEEDED,
             "status": 504,
-            "detail": f"wall-clock budget of {budget.wall_clock} exhausted",
+            "detail": detail or f"wall-clock budget of {budget.wall_clock} exhausted",
             "budget": budget.model_dump(mode="json"),
         }
     )
+
+
+def _overspent(result: TaskResult, budget: RunBudget) -> ProblemDetails | None:
+    """The failure a task that outspent its own cap ends on, or None (I12).
+
+    The other half of "budgets are hard" (SPEC.md §3.2). Wall-clock is bounded
+    by the runtime, which does not need the handler's cooperation; steps,
+    tokens and cost are *reported* by the handler, and a report is not a bound
+    until something compares it to the cap. This is that comparison, and it
+    runs on the one path every task's result takes.
+
+    Without it, run-level reservation (issue #48) would bound only what tasks
+    are *allowed* to spend, leaving `runs.used_*` -- the sum of what they say
+    they spent -- free to exceed the run's budget one task at a time. With it,
+    a succeeded result that overran becomes a `budget_exceeded` failure whose
+    usage is never rolled up, so the run's totals stay inside its caps by
+    construction rather than by handlers being well-behaved.
+
+    In-loop enforcement (stopping an agent at the step that would cross the
+    cap, rather than failing the task that already did) lands with the M1 agent
+    loop and is what H4's step/token/cost half measures; this is the outer
+    fence, and it holds whatever the loop inside does.
+    """
+    overrun = result.usage.over(budget)
+    if not overrun:
+        return None
+    return _budget_exceeded(budget, f"reported usage exceeded the task budget: {', '.join(overrun)}")
 
 
 class _Handoff:
@@ -371,11 +415,7 @@ def _run_handler(
                 exc, task.spec.budget, time.monotonic() - started
             )
         else:
-            outcome = (
-                result
-                if result.status is TaskStatus.SUCCEEDED
-                else result.error or _problem(HANDLER_FAILED, result.status.value)
-            )
+            outcome = _settled(result, task.spec.budget)
         return _record_in_thread(conn, task, handoff, record, outcome)
     finally:
         # Whatever was not committed above never happened. Suppressed
@@ -385,6 +425,19 @@ def _run_handler(
         with contextlib.suppress(psycopg.Error):
             conn.rollback()
         conn.close()
+
+
+def _settled(result: TaskResult, budget: RunBudget) -> TaskResult | ProblemDetails:
+    """What a handler's returned result actually settles as.
+
+    A handler answers with a `TaskResult` whichever way its work went, so three
+    outcomes come out of one value: a failure it named itself, a failure it
+    reported without naming, and a success -- which is only a success if what
+    it says it spent fits the cap it was given (`_overspent`).
+    """
+    if result.status is not TaskStatus.SUCCEEDED:
+        return result.error or _problem(HANDLER_FAILED, result.status.value)
+    return _overspent(result, budget) or result
 
 
 def _classify(exc: BaseException, budget: RunBudget, elapsed: float) -> ProblemDetails:

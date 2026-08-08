@@ -768,9 +768,7 @@ class TestBindIdempotencyKey:
         assert fetched is not None and fetched.idempotency_key == "retry-1"
         assert audit_actions(conn) == ["run.created", "run.idempotency_key_bound"]
 
-    def test_a_second_bind_of_the_same_key_is_a_no_op(
-        self, conn: QueueConnection, budget: RunBudget
-    ) -> None:
+    def test_a_second_bind_of_the_same_key_is_a_no_op(self, conn: QueueConnection, budget: RunBudget) -> None:
         created = create_run(conn, goal="scan_source", payload={"source_id": "a"}, budget=budget)
         conn.commit()
         bind_idempotency_key(conn, created.id, "retry-1")
@@ -826,9 +824,7 @@ class TestBindIdempotencyKey:
         assert fetched is not None and fetched.idempotency_key == "k1"  # unchanged, not overwritten
         assert audit_actions(conn) == ["run.created"]  # no bind was recorded
 
-    def test_a_missing_run_id_raises_a_typed_lookup_error(
-        self, conn: QueueConnection
-    ) -> None:
+    def test_a_missing_run_id_raises_a_typed_lookup_error(self, conn: QueueConnection) -> None:
         """Not the schema drifting -- a caller-supplied `run_id` that names
         nothing at all. Same typed shape `set_run_status` uses for the same
         condition, not a bare `RuntimeError`."""

@@ -35,10 +35,9 @@ COUNT_TASKS = "SELECT count(*) FROM tasks"
 
 EMPTY_PLAN_GOAL = "plans_conditionally"
 DISALLOWED_TYPE_GOAL = "plans_conditionally_outside_allowlist"
+OVER_BUDGET_GOAL = "plans_conditionally_over_its_budget"
 
-EMPTY_PLAN_BUDGET = RunBudget(
-    steps=1, tokens=1, cost_usd=Decimal("0.01"), wall_clock=timedelta(seconds=1)
-)
+EMPTY_PLAN_BUDGET = RunBudget(steps=1, tokens=1, cost_usd=Decimal("0.01"), wall_clock=timedelta(seconds=1))
 
 
 class ConditionalPlanParams(GoalParams):
@@ -67,6 +66,17 @@ class ConditionalAllowlistParams(GoalParams):
     """
 
     task_type: str = "noop"
+
+
+class ConditionalFanOutParams(GoalParams):
+    """Plans `tasks` tasks, each declaring the goal's whole budget.
+
+    One is affordable -- the sample -- so registration passes; two is the
+    fan-out the run cannot pay for, which is the case issue #48 is about and
+    the one eager registration cannot see coming.
+    """
+
+    tasks: int = 1
 
 
 @pytest.fixture(scope="session")
@@ -131,7 +141,9 @@ def plans_conditionally_goal() -> Iterator[str]:
         sample_payload={"make_tasks": True},
     )
     def plan(params: ConditionalPlanParams) -> tuple[PlannedTask, ...]:
-        return (PlannedTask(task_type="noop", payload={}),) if params.make_tasks else ()
+        if not params.make_tasks:
+            return ()
+        return (PlannedTask(budget=EMPTY_PLAN_BUDGET, task_type="noop", payload={}),)
 
     try:
         yield EMPTY_PLAN_GOAL
@@ -159,12 +171,42 @@ def plans_conditionally_outside_allowlist_goal() -> Iterator[str]:
         sample_payload={"task_type": "noop"},
     )
     def plan(params: ConditionalAllowlistParams) -> tuple[PlannedTask, ...]:
-        return (PlannedTask(task_type=params.task_type, payload={}),)
+        return (PlannedTask(budget=EMPTY_PLAN_BUDGET, task_type=params.task_type, payload={}),)
 
     try:
         yield DISALLOWED_TYPE_GOAL
     finally:
         unregister(DISALLOWED_TYPE_GOAL)
+
+
+@pytest.fixture
+def fans_out_beyond_its_budget_goal() -> Iterator[str]:
+    """Register a goal whose sample plans one affordable task but whose planner
+    will fan out to as many as a request asks for -- each declaring the run's
+    whole budget. Undoes the registration so it cannot leak into another test.
+
+    The fan-out shape #48 exists to refuse, in the one form eager registration
+    cannot rule out: affordable on its sample, unaffordable on some other
+    payload a client may send.
+    """
+
+    @goal(
+        OVER_BUDGET_GOAL,
+        params_model=ConditionalFanOutParams,
+        allowed_task_types=["noop"],
+        budget=EMPTY_PLAN_BUDGET,
+        sample_payload={"tasks": 1},
+    )
+    def plan(params: ConditionalFanOutParams) -> tuple[PlannedTask, ...]:
+        return tuple(
+            PlannedTask(budget=EMPTY_PLAN_BUDGET, task_type="noop", payload={"echo": str(n)})
+            for n in range(params.tasks)
+        )
+
+    try:
+        yield OVER_BUDGET_GOAL
+    finally:
+        unregister(OVER_BUDGET_GOAL)
 
 
 def _counts(conn: QueueConnection) -> tuple[int, int]:
@@ -270,6 +312,43 @@ def test_a_planner_that_plans_outside_its_allowlist_creates_no_run_and_no_task(
     assert "DisallowedTaskType" not in resp.text
     assert "drop_table" not in resp.text
     assert _counts(conn) == before
+
+
+def test_a_fan_out_over_the_run_budget_is_refused_with_nothing_enqueued(
+    db_client_no_raise: TestClient, conn: QueueConnection, fans_out_beyond_its_budget_goal: str
+) -> None:
+    """Issue #48's refusal, end to end: nothing is queued, so nothing runs.
+
+    Two tasks each declaring the run's whole budget is the fan-out that used
+    to be accepted and would then have spent twice what the API published for
+    the run (I12). Refused at planning time, before the transaction that
+    would have written the run row and its tasks -- so the counts are the
+    proof, not the status code.
+    """
+    before = _counts(conn)
+
+    resp = db_client_no_raise.post(
+        "/v1/runs", json={"goal": fans_out_beyond_its_budget_goal, "payload": {"tasks": 2}}
+    )
+
+    assert resp.status_code == 500
+    assert resp.headers["content-type"] == PROBLEM_CONTENT_TYPE
+    assert resp.json()["type"] == "urn:steward:internal-error"
+    assert "RunBudgetExceeded" not in resp.text  # the reason stays server-side
+    assert _counts(conn) == before
+
+
+def test_the_same_goal_within_its_budget_is_still_admitted(
+    db_client: TestClient, conn: QueueConnection, fans_out_beyond_its_budget_goal: str
+) -> None:
+    # The refusal above must be the budget, not the fixture: one task out of
+    # the same planner is affordable and goes through.
+    runs, tasks = _counts(conn)
+
+    resp = db_client.post("/v1/runs", json={"goal": fans_out_beyond_its_budget_goal, "payload": {"tasks": 1}})
+
+    assert resp.status_code == 202
+    assert _counts(conn) == (runs + 1, tasks + 1)
 
 
 def test_an_admitted_request_creates_the_run_and_its_planned_task(

@@ -23,6 +23,11 @@ worker executes. Everything that turns one into the other is declared here, at
    a valid expansion.
 5. **Budget.** The caps a run of this goal is admitted under. Required, with no
    default: a goal whose runs have no hard limits is unrepresentable (I12).
+   It is also the pot the plan's tasks are funded out of: every `PlannedTask`
+   declares its own budget, and an expansion whose tasks reserve more than this
+   raises `RunBudgetExceeded` before anything is enqueued (issue #48). So the
+   budget the API publishes for a run is a bound on the whole plan, not a
+   per-branch allowance a fan-out multiplies.
 6. **Sample payload.** A payload valid against the goal's own schema, required
    the same way `steward_queue.task_handler`'s `sample_payload` is. It is the
    fixed point ARCHITECTURE §4's "planners are deterministic and pure" is
@@ -75,15 +80,24 @@ class GoalParams(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class PlannedTask:
-    """One node of a planned expansion: what to run, and on what.
+    """One node of a planned expansion: what to run, on what, and for how much.
 
     Deliberately not a `TaskSpec`: a planner names work, it does not mint run
-    identity. `RunPlan.task_specs` supplies the run id and the run's budget,
-    which is what keeps the planner a pure function of its params and makes an
-    expansion assertable in a test without a database.
+    identity. `RunPlan.task_specs` supplies the run id, which is what keeps the
+    planner a pure function of its params and makes an expansion assertable in
+    a test without a database.
+
+    `budget` is required and has no default, for the same reason `RunBudget`'s
+    own fields have none: a defaulted per-task cap would have to default to
+    *something*, and the only available something is the run's whole budget --
+    which is precisely the defect this field exists to remove (issue #48). A
+    planner that fans out must therefore say what each branch may spend, and
+    `GoalRegistration.plan` refuses the expansion if those add up to more than
+    the run was admitted for.
     """
 
     task_type: str
+    budget: RunBudget
     payload: Mapping[str, Any] = field(default_factory=dict)
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
@@ -153,9 +167,40 @@ class EmptyRunPlan(RuntimeError):
         self.goal = goal
 
 
+class RunBudgetExceeded(RuntimeError):
+    """A planner's tasks reserve more than the run's budget allows (I12).
+
+    The refusal issue #48 is about, and it is a refusal rather than a
+    truncation on purpose: silently shrinking the last task's cap, or dropping
+    the tasks that do not fit, would produce a run that does less than the
+    client asked for while reporting that it was accepted -- and I12 requires
+    exceeding a budget to be a *typed, visible* failure, which a quietly
+    shortened plan is not.
+
+    A programming error, like `DisallowedTaskType` and `EmptyRunPlan`, and for
+    the same reason: the request was valid and the goal exists, the planner
+    just asked to spend more than the goal is admitted for. It carries the
+    dimensions that overran, so the reason is in the error rather than left to
+    be recomputed.
+    """
+
+    def __init__(
+        self, goal: str, *, reserved: RunBudget, budget: RunBudget, dimensions: tuple[str, ...]
+    ) -> None:
+        super().__init__(
+            f"goal {goal!r} planned tasks reserving more than its run budget: "
+            f"{', '.join(dimensions)} (reserved {reserved.model_dump(mode='json')}, "
+            f"budget {budget.model_dump(mode='json')})"
+        )
+        self.goal = goal
+        self.reserved = reserved
+        self.budget = budget
+        self.dimensions = dimensions
+
+
 @dataclass(frozen=True, slots=True)
 class RunPlan:
-    """A validated, expanded, allowlist-checked plan for one run.
+    """A validated, expanded, allowlist-checked, budget-reserved plan for one run.
 
     Produced before the run exists (`plan_run`), so every rejection a goal can
     raise happens with nothing persisted. `task_specs` is the only way from a
@@ -167,22 +212,27 @@ class RunPlan:
     budget: RunBudget
     tasks: tuple[PlannedTask, ...]
 
+    def reserved(self) -> RunBudget:
+        """What this plan's tasks reserve of the run's budget, in total.
+
+        The quantity `plan` checks against `budget`, exposed because it is the
+        number that makes the guarantee legible: a caller (or a test) can see
+        that a fan-out reserves the run's cap once between its branches rather
+        than once per branch.
+        """
+        return RunBudget.total(task.budget for task in self.tasks)
+
     def task_specs(self, run_id: UUID) -> tuple[TaskSpec, ...]:
-        """The plan as queue-ready specs for `run_id`, under the goal's budget.
+        """The plan as queue-ready specs for `run_id`, each under its own cap.
 
-        Every task carries the whole run budget, which is the placeholder the
-        queue's per-task caps already imply and *not* the end state: with a
-        fan-out plan it means N tasks may each spend the run's cap, so a run
-        could exceed the budget the API reports for it. No registered goal fans
-        out -- `noop` and `scan_source` each plan exactly one task, and for a
-        one-task plan the per-task cap *is* the run cap, so what the API
-        advertises is what the run can spend. The catalog (#20) shipped
-        single-task for precisely this reason (#37).
-
-        The fix, before any goal fans out, is run-level enforcement: the
-        accumulated `runs.used_*` totals compared against `runs.budget_*` by
-        the runtime, which lands with the agent loop that H4's
-        step/token/cost half measures (I12, N6).
+        A task carries the budget its planner declared for it, not the run's
+        (issue #48). That is what makes the run's advertised budget a real
+        bound on a fan-out: the per-task caps a worker enforces sum to no more
+        than the run's, because `GoalRegistration.plan` refused the expansion
+        otherwise -- so N tasks cannot each spend what the API published for
+        the whole run. A one-task plan is the degenerate case rather than the
+        only safe one: `scan_source` declares a task budget equal to its run
+        budget and stays single-task by choice now, not by necessity (#20, #37).
         """
         return tuple(
             TaskSpec(
@@ -190,7 +240,7 @@ class RunPlan:
                 run_id=run_id,
                 task_type=task.task_type,
                 payload=dict(task.payload),
-                budget=self.budget,
+                budget=task.budget,
                 max_attempts=task.max_attempts,
             )
             for task in self.tasks
@@ -216,13 +266,24 @@ class GoalRegistration[P: GoalParams]:
             raise InvalidGoalPayload(self.goal, exc) from exc
 
     def plan(self, payload: Mapping[str, Any]) -> RunPlan:
-        """Validate `payload`, expand it, and check the expansion's shape.
+        """Validate `payload`, expand it, and check the expansion's shape and cost.
 
         A planner that names zero tasks raises `EmptyRunPlan`; one that names
-        a task type outside its allowlist raises `DisallowedTaskType`. Both
-        checks happen here, the only path from a planner's output to a
-        `TaskSpec`, so neither failure mode is a property of reviewer
-        attention -- it cannot reach the queue by any route.
+        a task type outside its allowlist raises `DisallowedTaskType`; one
+        whose tasks reserve more than the goal's budget raises
+        `RunBudgetExceeded`. All three checks happen here, the only path from a
+        planner's output to a `TaskSpec`, so no failure mode is a property of
+        reviewer attention -- none can reach the queue by any route.
+
+        The budget check is the last of the three because it is the most
+        expensive to explain and the least useful on a plan that is already
+        malformed: a plan of zero tasks reserves nothing and would pass it.
+
+        **Reservation is per plan, not per attempt.** Each task is counted
+        once, so the run's budget bounds one pass of the plan. A task that
+        fails and retries executes again under its own cap, and that spend is
+        neither reserved here nor recorded on the run -- the failure path
+        carries no usage to record. See SPEC.md §13 D9.
         """
         params = self.validate(payload)
         tasks = tuple(self.planner(params))
@@ -231,7 +292,12 @@ class GoalRegistration[P: GoalParams]:
         for task in tasks:
             if task.task_type not in self.allowed_task_types:
                 raise DisallowedTaskType(self.goal, task.task_type, self.allowed_task_types)
-        return RunPlan(goal=self.goal, params=params, budget=self.budget, tasks=tasks)
+        plan = RunPlan(goal=self.goal, params=params, budget=self.budget, tasks=tasks)
+        reserved = plan.reserved()
+        overrun = reserved.over(self.budget)
+        if overrun:
+            raise RunBudgetExceeded(self.goal, reserved=reserved, budget=self.budget, dimensions=overrun)
+        return plan
 
 
 REGISTRY: dict[str, GoalRegistration[Any]] = {}
@@ -271,9 +337,10 @@ def goal[P: GoalParams](
     goal cannot opt out of it by omission.
 
     Registration exercises that subject rather than merely storing it: a
-    mismatched sample, a planner that plans nothing, or a planner that plans
-    outside its own allowlist used to boot fine and fail on a customer's
-    request instead. Planners are required to be deterministic and pure
+    mismatched sample, a planner that plans nothing, a planner that plans
+    outside its own allowlist, or one whose tasks reserve more than the goal's
+    budget used to boot fine and fail on a customer's request instead.
+    Planners are required to be deterministic and pure
     (ARCHITECTURE.md §4), so running one once, here, against its own sample is
     safe and turns a definition bug into an import-time failure -- loud,
     before the goal is reachable, rather than a 500 on whichever request
@@ -334,9 +401,11 @@ def plan_run(name: str, payload: Mapping[str, Any]) -> RunPlan:
 
     Raises `UnknownGoal` or `InvalidGoalPayload` for a request that must not
     become a run, `DisallowedTaskType` for a planner that exceeded its
-    privilege, and `EmptyRunPlan` for a planner that named no work at all
-    (issue #37). Callers create the run only after this returns, which is
-    what makes "no run row for a rejected request" structural rather than an
-    ordering a route handler has to remember (issue #19).
+    privilege, `EmptyRunPlan` for a planner that named no work at all (issue
+    #37), and `RunBudgetExceeded` for one whose tasks would spend more than the
+    goal's budget (issue #48). Callers create the run only after this returns,
+    which is what makes "no run row for a rejected request" -- and, now, "no
+    task enqueued for a plan that cannot be afforded" -- structural rather than
+    an ordering a route handler has to remember (issue #19).
     """
     return get_goal(name).plan(payload)

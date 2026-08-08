@@ -312,6 +312,16 @@ def _record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, ac
     The run's spend is a mutation in its own right -- a reviewer asking "how
     did this run reach its cap" needs a row per increment, not one row about
     the task that caused it.
+
+    `runs.used_*` is therefore the dimension-wise **sum** across the run's
+    succeeded tasks, and it stays inside `runs.budget_*` because of two checks
+    that happen elsewhere (issue #48, SPEC.md §13 D9): the plan's per-task caps
+    were reserved against the run's budget before any of these tasks existed,
+    and a task whose reported usage exceeds its own cap never reaches here --
+    it is a `budget_exceeded` failure instead (`execution._overspent`). Summing
+    is the right operation for steps, tokens and cost; for `wall_clock` it
+    means aggregate task time rather than the run's elapsed duration, which is
+    the conservative reading (`RunBudget.wall_clock`).
     """
     row = conn.execute(
         _sql.ADD_RUN_USAGE,
