@@ -113,7 +113,7 @@ def test_profiling_persists_a_version_and_its_audit_row(
     assert result.output == {
         "asset_id": str(customers_id),
         "columns": 3,
-        "row_count": 2,
+        "row_count": 4,
         "version": 1,
         "changed": True,
     }
@@ -160,7 +160,7 @@ def test_changed_data_appends_a_version_and_keeps_the_old_one(
     assert result.output is not None and result.output == {
         "asset_id": str(customers_id),
         "columns": 3,
-        "row_count": 3,
+        "row_count": 5,
         "version": 2,
         "changed": True,
     }

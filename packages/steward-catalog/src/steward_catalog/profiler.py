@@ -38,7 +38,14 @@ from steward_schemas import ColumnProfile, MaskedSample, TableProfile, ValueFreq
 
 from steward_catalog._profile_sql import STATS_PER_COLUMN, TOP_VALUE_LIMIT, stats_query, top_values_query
 from steward_catalog.inspector import open_source_connection
-from steward_catalog.masking import RawCell, column_semantic_type, mask, mask_optional
+from steward_catalog.masking import (
+    RawCell,
+    column_semantic_type,
+    low_cardinality,
+    mask,
+    mask_optional,
+    suppressed,
+)
 from steward_catalog.models import DiscoveredColumn, ProfileTarget
 from steward_catalog.secrets import Secret
 
@@ -135,6 +142,19 @@ class PostgresSourceProfiler:
     ) -> ColumnProfile:
         non_null, distinct = int(stats[0]), int(stats[1])
         top_values = self._top_values(target, column)
+        minimum, maximum = mask_optional(_cell(stats[2])), mask_optional(_cell(stats[3]))
+        if low_cardinality(distinct):
+            # Too few distinct values for any difference between the masks to be
+            # anything but the domain: `yes`/`no`, `M`/`F`, `true`/`false` are
+            # each recovered from a mask, a length or a preserved delimiter.
+            # Suppressed here rather than in `mask()` because this is where the
+            # column's cardinality is known (#49 review). The counts survive, so
+            # a consumer still learns the split -- just not which way round.
+            minimum, maximum = _suppress_optional(minimum), _suppress_optional(maximum)
+            top_values = tuple(
+                ValueFrequency(value=suppressed(frequency.value), count=frequency.count)
+                for frequency in top_values
+            )
         return ColumnProfile(
             name=column.name,
             data_type=column.data_type,
@@ -142,8 +162,8 @@ class PostgresSourceProfiler:
             null_ratio=_ratio(row_count - non_null, row_count),
             distinct_count=distinct,
             distinct_ratio=_ratio(distinct, row_count),
-            min_value=mask_optional(_cell(stats[2])),
-            max_value=mask_optional(_cell(stats[3])),
+            min_value=minimum,
+            max_value=maximum,
             top_values=top_values,
             semantic_type=column_semantic_type(frequency.value for frequency in top_values),
         )
@@ -154,6 +174,10 @@ class PostgresSourceProfiler:
             {"limit": TOP_VALUE_LIMIT},
         ).fetchall()
         return tuple(ValueFrequency(value=_masked(value), count=int(count)) for value, count in rows)
+
+
+def _suppress_optional(sample: MaskedSample | None) -> MaskedSample | None:
+    return None if sample is None else suppressed(sample)
 
 
 def _masked(value: object) -> MaskedSample:

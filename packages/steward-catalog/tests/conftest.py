@@ -110,14 +110,20 @@ FIXTURE_ESTATE: tuple[str, ...] = (
 # does not have a "but it is only a test" clause -- suppressing it would be the
 # first pragma in this package (I5).
 FIXTURE_DATA: tuple[tuple[str, dict[str, str]], ...] = (
+    # Three or more distinct values per column, deliberately: a column with two
+    # or fewer is suppressed wholesale (`masking.LOW_CARDINALITY_MAX`), so a
+    # narrower fixture would test the suppression rather than the masking these
+    # tests are about. The canary columns need to reach the masker to be
+    # evidence at all.
     (
         "INSERT INTO sales.orders (id, customer, total) VALUES "
-        "(1, 'ada', 10.50), (2, 'grace', 10.50), (3, NULL, 99.99)",
+        "(1, 'ada', 10.50), (2, 'grace', 10.50), (3, NULL, 99.99), (4, 'hopper', 12.75)",
         {},
     ),
     (
         "INSERT INTO sales.customers (id, email, card) VALUES "
-        "(1, 'ada@example.com', NULL), (2, %(email)s, %(card)s)",
+        "(1, 'ada@example.com', '4111111111111111'), (2, %(email)s, %(card)s), "
+        "(3, 'grace@example.org', '5555555555554444'), (4, 'hopper@example.net', NULL)",
         {"email": CANARY_EMAIL, "card": CANARY_CARD},
     ),
     (

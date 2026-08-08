@@ -99,9 +99,17 @@ _NUMBER = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
 _PHONE = re.compile(r"^\+?[\d][\d\s().-]{5,20}$")
 _DIGITS = re.compile(r"\D")
 
-BOOLEAN_VALUES = frozenset({"true", "false", "t", "f"})
-"""Postgres renders `boolean` as `true`/`false`; `t`/`f` covers a source (or a
-future connector) that renders the short form."""
+BOOLEAN_VALUES = frozenset({"true", "false"})
+"""Postgres renders `boolean` as `true`/`false`, and profiling reads every value
+through `(col)::text`, so those are the only two renderings that can arrive.
+
+`t`/`f` used to be here for "a future connector that renders the short form",
+and had no true-positive path in this slice while doing active harm: it made a
+single-character `F` the *only* one-character value treated as a closed domain,
+so a `grade` column of A/B/C/D/F published four look-alike entries and one
+distinguishable `F`, and a `sex char(1)` column was recovered outright. A
+connector that renders `t`/`f` can add them back together with the column-level
+suppression that makes them safe (#49 review)."""
 
 CARD_DIGITS = range(13, 20)
 """Digit counts a payment card can have. Combined with a Luhn check below --
@@ -151,9 +159,41 @@ safety this module does not provide for them, and a `data:` URI carries its
 payload inline. They are classified and masked as ordinary text.
 """
 
+LOW_CARDINALITY_MAX = 2
+"""Distinct values at or below which a column's samples are published without
+anything that distinguishes them (`suppressed`).
+
+**The general form of the closed-domain problem, and the level it belongs at.**
+A mask sees one value; "this domain is closed and tiny" is a property of the
+*column*. Keying the protection on `SemanticType` covered exactly one rendering
+of one domain -- `true`/`false` -- and left every other two-valued column
+publishing its values as booleans had: `yes`/`no` masked to `***`/`**`,
+`male`/`female` to `****`/`f****e`, `O+`/`A-` to `*+`/`*-` through preserved
+delimiters. The motivating column was protected as `is_hiv_positive boolean`
+and unprotected as `hiv_status text CHECK (v IN ('yes','no'))` -- one DDL
+choice apart, same data (#49 review).
+
+`_column_profile` knows `distinct_count` at the moment it builds `top_values`,
+so the publishing layer has the context the masker cannot have.
+
+**Two, and what that does not cover.** At two distinct values any difference
+between the masks is the whole domain, which is what makes suppression
+unarguable there. A three-valued column is *not* protected: its masks still
+differ, and an attacker who knows the domain can often map them. Suppressing
+further would empty the profile of the shape classification (#50) works from,
+so the line is drawn here and the residue is stated rather than implied --
+GUARDRAILS' H7 row and SPEC.md D10 both say so, and moving it is a decision
+with evidence, not a tweak.
+"""
+
 CLOSED_DOMAIN_TYPES = frozenset({SemanticType.BOOLEAN})
 """Semantic types whose domain is closed and small enough that *any* faithful
 description of a value names it.
+
+Subsumed by `LOW_CARDINALITY_MAX` for anything that reaches a profile -- a
+boolean column has at most two distinct values -- and kept because it also
+protects a caller who masks a single value outside a column context, which is
+the seam #50's prompt builders will use.
 
 A boolean renders as `true` or `false`, so publishing a length says which one:
 `(BOOLEAN, 4)` and `(BOOLEAN, 5)` are the two values, and shaping the mask
@@ -516,6 +556,24 @@ def mask(cell: RawCell) -> MaskedSample:
         masked = _shape(text, keep_first=False, keep_last=0)
     length = None if semantic_type in CLOSED_DOMAIN_TYPES else len(text)
     return MaskedSample(masked=masked, semantic_type=semantic_type, length=length)
+
+
+def suppressed(sample: MaskedSample) -> MaskedSample:
+    """`sample` with everything that distinguishes it from its peers removed.
+
+    The constant token and no length -- the same shape a closed-domain value
+    gets, applied by the publishing layer once it knows the column has too few
+    distinct values for any difference between masks to be anything but the
+    domain itself. `semantic_type` survives: it describes the column, and a
+    consumer that knows a column is boolean, or an email, learns nothing about
+    *which* rows are which.
+    """
+    return MaskedSample(masked=MASK_RUN, semantic_type=sample.semantic_type, length=None)
+
+
+def low_cardinality(distinct_count: int) -> bool:
+    """Does a column have so few distinct values that its masks identify them?"""
+    return 0 < distinct_count <= LOW_CARDINALITY_MAX
 
 
 def mask_optional(cell: RawCell | None) -> MaskedSample | None:

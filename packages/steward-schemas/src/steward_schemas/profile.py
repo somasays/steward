@@ -73,14 +73,15 @@ class MaskedSample(SchemaModel):
     so in a field is better than a mask that leaks it by being length-preserving
     while claiming not to.
 
-    **It is `None` when a length would be the value.** A semantic type whose
-    domain is closed and tiny makes the size decisive rather than descriptive:
-    Postgres renders `boolean` as `true`/`false`, so `(BOOLEAN, 4)` and
-    `(BOOLEAN, 5)` name the two values exactly, and an `is_hiv_positive` column
-    would have published every sampled value and its distribution into an
-    append-only table (#49 review). The masker decides -- `steward_catalog`
-    holds the list of such types -- and a consumer that treats `length` as
-    always-present is the bug this optionality exists to surface.
+    **It is `None` when a length would be the value.** In a column with very few
+    distinct values, the size is decisive rather than descriptive: `(BOOLEAN, 4)`
+    and `(BOOLEAN, 5)` name `true` and `false` exactly, and `yes`/`no` or
+    `male`/`female` do the same in any column two values wide. An
+    `is_hiv_positive` column would have published every sampled value and its
+    distribution into an append-only table (#49 review). `steward_catalog`
+    decides -- at the column level, where the cardinality is known -- and a
+    consumer that treats `length` as always-present is the bug this optionality
+    exists to surface.
     """
 
     masked: str

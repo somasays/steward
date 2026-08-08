@@ -53,6 +53,22 @@ def names(dsn: str, sql: str) -> set[str]:
         return {row[0] for row in conn.execute(sql).fetchall()}
 
 
+def unique_index_defs(dsn: str) -> dict[str, str]:
+    """Every UNIQUE index's definition, keyed by name.
+
+    Names and even uniqueness are not enough on their own: `CREATE UNIQUE INDEX
+    profiles_asset_version ON profiles (id)` is unique, and useless -- the
+    claim is that two writers cannot both create version N *of one asset*, so
+    the columns are the assertion (#49 review).
+    """
+    with psycopg.connect(dsn) as conn:
+        return {
+            row[0]: row[1]
+            for row in conn.execute(SELECT_INDEX_DEFS).fetchall()
+            if row[1].upper().startswith("CREATE UNIQUE INDEX")
+        }
+
+
 def unique_indexes(dsn: str) -> set[str]:
     """Indexes Postgres installed as UNIQUE, read out of their definitions.
 
@@ -153,7 +169,9 @@ def test_the_profiles_revision_versions_one_profile_per_asset(scratch_dsn: str) 
     # UNIQUE specifically: `record_profile` reads the latest version and inserts
     # version+1, so this index is the whole of its concurrency safety. Two
     # profilers racing on one asset must not both be able to commit version 4.
-    assert "profiles_asset_version" in unique_indexes(scratch_dsn)
+    definitions = unique_index_defs(scratch_dsn)
+    assert "profiles_asset_version" in definitions
+    assert "(asset_id, version" in definitions["profiles_asset_version"]
 
 
 def test_a_source_row_cannot_hold_a_dsn(scratch_dsn: str) -> None:

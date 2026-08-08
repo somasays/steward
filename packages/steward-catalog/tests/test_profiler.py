@@ -46,13 +46,13 @@ def test_a_profile_counts_rows_nulls_and_distinct_values(profiler: SourceProfile
         )
     )
 
-    assert profile.row_count == 3
+    assert profile.row_count == 4
     by_name = {column_profile.name: column_profile for column_profile in profile.columns}
     assert by_name["id"].null_count == 0
-    assert by_name["id"].distinct_count == 3
+    assert by_name["id"].distinct_count == 4
     assert by_name["customer"].null_count == 1
-    assert by_name["customer"].null_ratio == Decimal("0.333333")
-    assert by_name["customer"].distinct_count == 2
+    assert by_name["customer"].null_ratio == Decimal("0.250000")
+    assert by_name["customer"].distinct_count == 3
 
 
 def test_every_value_a_profile_carries_is_masked(profiler: SourceProfiler, canary_email: str) -> None:
@@ -81,7 +81,7 @@ def test_a_columns_semantic_type_comes_from_its_values(profiler: SourceProfiler,
     # this used to assert as expected behaviour. `_is_card` is a Luhn checksum
     # over the value, so it fires on IMEIs and on roughly one in ten long
     # numeric ids; a reveal riding on it published their tails too (#49 review).
-    assert [frequency.value.masked for frequency in card.top_values] == ["****-****-****-****"]
+    assert [frequency.value.masked for frequency in card.top_values] == ["****-****-****-****"] * 3
     assert card.null_count == 1
     assert canary_card not in card.top_values[0].value.masked
     assert canary_card[-4:] not in card.top_values[0].value.masked
@@ -105,8 +105,9 @@ def test_top_values_are_ordered_by_frequency_then_value(profiler: SourceProfiler
     assert [(frequency.value.masked, frequency.count) for frequency in total.top_values] == [
         ("**.**", 2),
         ("**.**", 1),
+        ("**.**", 1),
     ]
-    assert [frequency.count for frequency in total.top_values] == [2, 1]
+    assert [frequency.count for frequency in total.top_values] == [2, 1, 1]
 
 
 # Six distinct values competing for five sample slots, with a three-way tie
@@ -126,6 +127,62 @@ TIED_COLUMN = (
     "('figgy66'),('figgy66')",
     "GRANT SELECT ON sales.tied TO steward_reader",
 )
+
+
+# Two-valued domains that are not `boolean`. Each was fully recoverable from
+# the mask, the length or a preserved delimiter before column-level suppression
+# (#49 review): the motivating column is protected as `is_hiv_positive boolean`
+# and was not as `hiv_status text CHECK (v IN ('yes','no'))`.
+BINARY_DOMAINS: tuple[tuple[str, str, str], ...] = (
+    ("consent", "yes", "no"),
+    ("sex", "male", "female"),
+    ("state", "active", "inactive"),
+    ("blood", "O+", "A-"),
+    ("flag", "true", "false"),
+)
+
+
+@pytest.mark.parametrize(("name", "first", "second"), BINARY_DOMAINS)
+def test_a_two_valued_column_publishes_nothing_that_tells_its_values_apart(
+    profiler: SourceProfiler,
+    source_admin: psycopg.Connection[psycopg.rows.TupleRow],
+    name: str,
+    first: str,
+    second: str,
+) -> None:
+    """I6 at the column level, which is where "closed domain" is a property.
+
+    Masking one value at a time cannot see this: `yes` and `no` mask to `***`
+    and `**`, `O+` and `A-` to `*+` and `*-` through preserved delimiters, and
+    `male`/`female` differ in length. With two distinct values any difference
+    between the masks *is* the domain, so an `is_hiv_positive` column published
+    every sampled value and its distribution — protected only if it happened to
+    be typed `boolean`.
+
+    The counts survive: a consumer still learns the split, just not which way
+    round.
+    """
+    relation = sql.Identifier("sales", f"binary_{name}")
+    source_admin.execute(sql.SQL("CREATE TABLE {} (v text)").format(relation))
+    source_admin.execute(
+        sql.SQL("INSERT INTO {} (v) VALUES (%(a)s), (%(a)s), (%(a)s), (%(b)s)").format(relation),
+        {"a": first, "b": second},
+    )
+    source_admin.execute(sql.SQL("GRANT SELECT ON {} TO steward_reader").format(relation))
+
+    profile = profiler.profile(
+        ProfileTarget(schema_name="sales", name=f"binary_{name}", columns=(column("v"),))
+    )
+
+    [column_profile] = profile.columns
+    assert column_profile.distinct_count == 2
+    masks = {frequency.value.masked for frequency in column_profile.top_values}
+    lengths = {frequency.value.length for frequency in column_profile.top_values}
+    assert masks == {"***"}, f"{name}: masks distinguish the two values: {masks}"
+    assert lengths == {None}, f"{name}: lengths distinguish the two values: {lengths}"
+    assert [frequency.count for frequency in column_profile.top_values] == [3, 1]  # the split survives
+    assert column_profile.min_value is not None and column_profile.min_value.masked == "***"
+    assert column_profile.max_value is not None and column_profile.max_value.length is None
 
 
 def test_top_values_truncate_deterministically_when_a_tie_spans_the_cut(
@@ -186,7 +243,7 @@ def test_a_hostile_column_name_is_an_identifier_not_a_statement(
     assert profile.row_count == 1
     assert profile.columns[0].name == HOSTILE_COLUMN
     # The table the name tried to drop is still there.
-    assert source_admin.execute("SELECT count(*) FROM sales.customers").fetchone() == (2,)
+    assert source_admin.execute("SELECT count(*) FROM sales.customers").fetchone() == (4,)
 
 
 def test_an_empty_table_profiles_as_zeroes_rather_than_failing(

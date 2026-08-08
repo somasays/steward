@@ -48,7 +48,11 @@ CASES: tuple[tuple[str, SemanticType, str], ...] = (
     # the value outright (#49 review, `CLOSED_DOMAIN_TYPES`).
     ("true", SemanticType.BOOLEAN, "***"),
     ("false", SemanticType.BOOLEAN, "***"),
-    ("t", SemanticType.BOOLEAN, "***"),
+    # `t`/`f` are no longer boolean renderings: profiling reads `(col)::text`,
+    # so only `true`/`false` can arrive, and treating `t`/`f` as a closed domain
+    # made a single-character `F` the one 1-char value published differently
+    # from every other (#49 review).
+    ("t", SemanticType.TEXT, "*"),
     # Below the floor: nothing is revealed, because the first and last
     # character of a short value *are* the value (`MIN_MASKED_ALNUM`).
     ("", SemanticType.EMPTY, ""),

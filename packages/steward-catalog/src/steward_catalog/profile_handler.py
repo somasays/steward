@@ -268,7 +268,24 @@ def _profile(
             ),
         )
 
-    recorded = profiles.record_profile(conn, asset.id, profile, actor=_actor(spec))
+    try:
+        recorded = profiles.record_profile(conn, asset.id, profile, actor=_actor(spec))
+    except psycopg.errors.UniqueViolation:
+        # Two workers profiling one asset at once: both read the same latest
+        # version and one loses the `(asset_id, version)` index. N1 already
+        # covers it -- the attempt retries and converges on the winner's digest
+        # -- but every other exit from this handler is a typed `TaskResult`, and
+        # a raise here would be the one path that is not (#49 review).
+        _logger.info("asset %s was profiled concurrently; the attempt will retry", payload.asset_id)
+        return _failed(
+            spec,
+            _problem(
+                "urn:steward:profile-version-conflict",
+                "Profile version conflict",
+                f"another profiler wrote a version of asset {payload.asset_id} first",
+                409,
+            ),
+        )
     return TaskResult(
         task_id=spec.task_id,
         status=TaskStatus.SUCCEEDED,
