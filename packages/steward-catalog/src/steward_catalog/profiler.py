@@ -36,12 +36,19 @@ from typing import Any, Protocol
 import psycopg
 from psycopg import IsolationLevel
 from psycopg.rows import TupleRow
-from steward_schemas import ColumnProfile, MaskedSample, SemanticType, TableProfile, ValueFrequency
+from steward_queue import statement_timeout_ms
+from steward_schemas import (
+    ColumnProfile,
+    MaskedSample,
+    SemanticType,
+    TableProfile,
+    ValueFrequency,
+)
 
 from steward_catalog._profile_sql import (
+    SET_LOCAL_STATEMENT_TIMEOUT,
     STATS_PER_COLUMN,
     TOP_VALUE_LIMIT,
-    remaining_statement_timeout,
     stats_query,
     top_values_query,
 )
@@ -138,11 +145,22 @@ class PostgresSourceProfiler:
     connection: psycopg.Connection[TupleRow]
     budget: timedelta
     started: float = field(default_factory=time.monotonic)
+    """When the budget started running -- set by `postgres_profiler` *before* it
+    connects, not at construction. `connect_timeout` is itself derived from the
+    budget, so a slow connect could otherwise hand the transaction a fresh full
+    budget on a task the worker had already recorded `budget_exceeded`."""
+
+    def remaining(self) -> timedelta:
+        """What is left of the budget. Never negative: an exhausted profile gets
+        the floor `statement_timeout_ms` applies, so its next statement fails
+        immediately rather than running unbounded."""
+        return max(timedelta(0), self.budget - timedelta(seconds=time.monotonic() - self.started))
 
     def _bound_next_statement(self) -> None:
         """Allow the next statement only the budget that remains."""
-        elapsed = time.monotonic() - self.started
-        self.connection.execute(remaining_statement_timeout(self.budget, elapsed))
+        self.connection.execute(
+            SET_LOCAL_STATEMENT_TIMEOUT, {"milliseconds": str(statement_timeout_ms(self.remaining()))}
+        )
 
     def profile(self, target: ProfileTarget) -> TableProfile:
         try:
@@ -269,10 +287,11 @@ def postgres_profiler(secret: Secret, budget: timedelta) -> Iterator[SourceProfi
     bounded by the same budget-derived `statement_timeout` and by the task's
     deadline.
     """
+    started = time.monotonic()
     connection = open_source_connection(secret, budget)
     try:
         connection.autocommit = False
         connection.isolation_level = IsolationLevel.REPEATABLE_READ
-        yield PostgresSourceProfiler(connection, budget)
+        yield PostgresSourceProfiler(connection, budget, started)
     finally:
         connection.close()

@@ -33,14 +33,12 @@ merely equivalent.
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 from psycopg import sql
 
 __all__ = [
     "ROW_COUNT_ONLY",
     "TOP_VALUE_LIMIT",
-    "remaining_statement_timeout",
+    "SET_LOCAL_STATEMENT_TIMEOUT",
     "stats_query",
     "top_values_query",
 ]
@@ -79,32 +77,24 @@ STATS_PER_COLUMN = 4
 max. The reader slices the result row by this, so the two must agree."""
 
 
-MIN_STATEMENT_TIMEOUT_MS = 1
-"""libpq reads 0 as "no timeout", which is the opposite of what an exhausted
-budget means -- the same floor `inspector.MIN_CONNECT_TIMEOUT_SECONDS` exists
-for."""
+SET_LOCAL_STATEMENT_TIMEOUT = "SELECT set_config('statement_timeout', %(milliseconds)s, true)"
+"""Charge the next statement only what is left of the budget.
 
+A profile is one statement per column plus one, all inside a single
+`REPEATABLE READ` transaction, so a per-statement timeout of the whole budget
+bounds nothing that matters: the transaction -- and the `ACCESS SHARE` lock and
+`xmin` pin it holds on a *customer's* relation -- would live for N+1 times the
+cap (#49 review). Charging each statement the remaining time makes the
+transaction's total the budget, and a profile that has already overrun fails on
+its next statement rather than starting another.
 
-def remaining_statement_timeout(budget: timedelta, elapsed: float) -> sql.Composed:
-    """`SET LOCAL statement_timeout` to whatever is left of `budget`.
-
-    A profile is one statement per column plus one, all inside a single
-    `REPEATABLE READ` transaction, so a per-statement timeout of the whole
-    budget bounds nothing that matters: the transaction -- and the `ACCESS
-    SHARE` lock and `xmin` pin it holds on a *customer's* relation -- would live
-    for N+1 times the cap (#49 review). Charging each statement the remaining
-    time makes the transaction's total the budget, and a profile that has
-    already overrun fails on its next statement rather than starting another.
-
-    `SET LOCAL` rather than `SET`: it reverts when the transaction ends, so the
-    connection is not left carrying a timeout from a profile that finished.
-    `sql.Literal` because `SET` takes no bind parameters -- it is composition,
-    not interpolation, and the value is an integer this module computed (I5).
-    """
-    remaining = int(budget.total_seconds() * 1000) - int(elapsed * 1000)
-    return sql.SQL("SET LOCAL statement_timeout = {}").format(
-        sql.Literal(max(MIN_STATEMENT_TIMEOUT_MS, remaining))
-    )
+`set_config(..., is_local => true)` rather than `SET LOCAL`: it is the same
+thing, reverts when the transaction ends, and takes the value as a **bound
+parameter** -- so this stays a static statement with a placeholder like every
+other in this package, instead of composing a literal into SQL (I5). The queue
+already writes its own timeout this way (`steward_queue._sql`); the floor and
+the conversion are its `statement_timeout_ms`, not a second copy here.
+"""
 
 
 def _relation(schema_name: str, name: str) -> sql.Identifier:

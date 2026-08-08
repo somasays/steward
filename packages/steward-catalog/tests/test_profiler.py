@@ -7,6 +7,7 @@ database and in what shape. Persistence and convergence are
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from datetime import timedelta
 from decimal import Decimal
@@ -226,11 +227,7 @@ def test_a_profile_reads_one_snapshot_even_while_the_table_changes(
     target = ProfileTarget(schema_name="sales", name="draining", columns=(column("v"),))
 
     with postgres_profiler(source_secret, BUDGET) as reader:
-        # Open the snapshot with the stats pass, then drain the third value from
-        # another connection before the sample is taken.
-        profiler_under_test = reader
-        source_admin.execute("SELECT 1")  # the drain lands between the two statements
-        profile = _profile_with_drain(profiler_under_test, target, source_admin)
+        profile = _profile_with_drain(reader, target, source_admin)
 
     [column_profile] = profile.columns
     assert column_profile.distinct_count == 3
@@ -260,6 +257,95 @@ def _profile_with_drain(
         return reader.profile(target)
     finally:
         type(reader)._top_values = original  # type: ignore[method-assign]
+
+
+SHOW_STATEMENT_TIMEOUT = "SHOW statement_timeout"
+
+MEASURABLE_DELAY = 0.05
+"""Long enough that the budget shrinks by whole milliseconds between columns."""
+
+TWO_COLUMN_TABLE = (
+    "CREATE TABLE sales.timed (a text, b text)",
+    "INSERT INTO sales.timed (a, b) VALUES ('x','p'),('y','q'),('z','r')",
+    "GRANT SELECT ON sales.timed TO steward_reader",
+)
+
+
+def test_each_statement_is_charged_only_what_is_left_of_the_budget(
+    source_secret: Secret, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+) -> None:
+    """I12 on a resource held on someone else's database.
+
+    A profile is one stats pass plus one query per column, all in one
+    `REPEATABLE READ` transaction. `statement_timeout` bounds a *statement*, so
+    allowing each the whole budget would let a 60-column table hold an
+    `ACCESS SHARE` lock and an `xmin` pin on a customer's relation for 61 times
+    the advertised cap -- long after the worker recorded the task
+    `budget_exceeded` (#49 review).
+
+    Asserted on what the server reports inside the transaction: the timeout is
+    below the whole budget and never grows. Remove either `_bound_next_statement`
+    call and the session keeps the connection-level value, which is the whole
+    budget, and the first assertion fails.
+    """
+    for statement in TWO_COLUMN_TABLE:
+        source_admin.execute(statement)
+    target = ProfileTarget(schema_name="sales", name="timed", columns=(column("a"), column("b", ordinal=2)))
+    observed: list[int] = []
+
+    with postgres_profiler(source_secret, BUDGET) as reader:
+        original = type(reader)._top_values
+
+        def observing(self: PostgresSourceProfiler, *args: object, **kwargs: object) -> object:
+            # Sleep first, so the budget measurably shrinks between the two
+            # columns, then record what the server has *after* this column's
+            # own bind. Without the delay both observations are the same
+            # millisecond and the "never grows" assertion passes on a profile
+            # that bound only its first statement -- `SET LOCAL` persists for
+            # the transaction, so one early call looks identical to N.
+            time.sleep(MEASURABLE_DELAY)
+            result = original(self, *args, **kwargs)  # type: ignore[arg-type]
+            [(value,)] = self.connection.execute(SHOW_STATEMENT_TIMEOUT).fetchall()
+            observed.append(_timeout_ms(value))
+            return result
+
+        type(reader)._top_values = observing  # type: ignore[assignment,method-assign]
+        try:
+            reader.profile(target)
+        finally:
+            type(reader)._top_values = original  # type: ignore[method-assign]
+
+    budget_ms = int(BUDGET.total_seconds() * 1000)
+    assert len(observed) == 2, "both per-column statements should have been bounded"
+    assert all(0 < seen < budget_ms for seen in observed), f"{observed} vs the whole budget {budget_ms}"
+    # Strictly: the second column was charged less than the first, which is only
+    # true if each statement is bound rather than one early call standing for all.
+    assert observed[1] < observed[0], f"the later statement was not charged the elapsed time: {observed}"
+
+
+def _timeout_ms(shown: str) -> int:
+    """Postgres renders `statement_timeout` as `30s`, `29500ms` or `0`."""
+    if shown.endswith("ms"):
+        return int(shown[:-2])
+    if shown.endswith("s"):
+        return int(float(shown[:-1]) * 1000)
+    return int(shown) * 1000
+
+
+def test_an_exhausted_budget_leaves_no_time_for_another_statement(
+    source_secret: Secret, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+) -> None:
+    """The floor, at the boundary: a profile that has already overrun must not
+    start another statement on an unbounded clock."""
+    for statement in TWO_COLUMN_TABLE:
+        source_admin.execute(statement)
+
+    with postgres_profiler(source_secret, BUDGET) as reader:
+        assert isinstance(reader, PostgresSourceProfiler)
+        spent = PostgresSourceProfiler(
+            reader.connection, BUDGET, time.monotonic() - BUDGET.total_seconds() - 1
+        )
+        assert spent.remaining() == timedelta(0)
 
 
 def test_top_values_truncate_deterministically_when_a_tie_spans_the_cut(
