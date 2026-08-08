@@ -1,12 +1,19 @@
 """`scan_source` — the one task a scan run plans, and the whole scan.
 
-**Exactly one bounded task, deliberately** (issue #20, #37). A per-table fan-out
-is the obvious shape and it is wrong here: `RunPlan.task_specs` gives every
-planned task the *run's* budget, so an N-way fan-out lets one run spend N times
-the cap the API published for it (I12). A deterministic metadata scan does not
-need parallelism to be correct, and one task whose budget is the run's budget
-is honest about what it may cost. Fan-out waits for run-level budget
-reservation.
+**Exactly one bounded task -- now by choice, not by necessity** (issues #20,
+#37, #48). It used to be necessity: every planned task got the *run's* budget,
+so an N-way fan-out let one run spend N times the cap the API published for it
+(I12), and one task was the only shape that could not lie about its cost. Since
+#48 a plan declares a budget per task and is refused if the tasks do not fit the
+run, so a fan-out here would be representable and enforceable.
+
+It stays one task on the merits. A metadata scan is one round trip per schema,
+so per-table tasks would open N connections to the customer's database to fetch
+what one query already returns, and `plan_convergence` diffs the *whole*
+observed catalog against the stored one -- split it per table and a dropped
+table stops being detectable without re-reading everything anyway. Profiling
+(#49) is the case that genuinely wants fan-out: per-column work with per-column
+cost, which is what the reservation was built for.
 
 The handler reads through two different connections and that separation is the
 point:
