@@ -8,6 +8,7 @@ each one has to satisfy the registry contract on its own.
 import asyncio
 import contextlib
 import itertools
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -58,6 +59,8 @@ BLOCKS_THE_INTERPRETER = "test.blocks_the_interpreter"
 SPENDS_THE_CAP_TWICE = "test.spends_the_cap_twice"
 SWALLOWS_A_DATABASE_ERROR = "test.swallows_a_database_error"
 LEAKS_CANCELLATION = "test.leaks_cancellation"
+EXITS_THE_PROCESS = "test.exits_the_process"
+FAILS_HARD = "test.fails_hard"
 CANNOT_REACH_ITS_SOURCE = "test.cannot_reach_its_source"
 UNREGISTERED = "test.unregistered"
 REPORTS_ITS_LEASE = "test.reports_its_lease"
@@ -236,6 +239,44 @@ async def leaks_cancellation(ctx: TaskContext) -> TaskResult:
         inner = asyncio.create_task(asyncio.sleep(30))
         inner.cancel()
         await inner
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+class LibraryHardFail(BaseException):
+    """A dependency's own fail-fast exception, raised from outside `Exception`.
+
+    Third-party code does this to make itself uncatchable by ordinary handling
+    -- a fatal-error class deriving from `BaseException` rather than from
+    `Exception`. Nothing about it says anything about this process (#63).
+    """
+
+
+@task_handler(EXITS_THE_PROCESS, sample_payload={"exit": False})
+async def exits_the_process(ctx: TaskContext) -> TaskResult:
+    """Calls `sys.exit()` the way an argparse/click-style dependency does (#63).
+
+    A `SystemExit` raised here is raised on the handler's *thread*, where
+    Python's own semantics end that thread and nothing else -- so escalating it
+    to a worker exit manufactures a process death the interpreter would not
+    perform. Payload-driven, so the sample payload exits nothing and stays an
+    instant, idempotent no-op under H1.
+    """
+    if ctx.spec.payload.get("exit"):
+        sys.exit("dependency refused to continue")
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(FAILS_HARD, sample_payload={"hard_fail": False})
+async def fails_hard(ctx: TaskContext) -> TaskResult:
+    """Lets a dependency's `BaseException` subclass escape (#63).
+
+    It is the task's own code that failed, so the operator belongs at the
+    handler -- not at the connection `execution failed` sends them to.
+    Payload-driven, so the sample payload raises nothing and stays an instant,
+    idempotent no-op under H1.
+    """
+    if ctx.spec.payload.get("hard_fail"):
+        raise LibraryHardFail("the driver gave up")
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
 
 
@@ -584,26 +625,34 @@ class TestExecutionFailures:
         assert row[0]["title"] == EXECUTION_FAILED  # not the handler's fault, and named as such
         assert row[0]["detail"].startswith("OperationalError")
 
-    async def test_a_shutdown_on_the_handler_thread_still_stops_the_worker(
+    async def test_an_interrupt_raised_around_the_handler_is_still_the_tasks_failure(
         self,
         dsn: str,
         conn: QueueConnection,
         queued: Callable[..., TaskSpec],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The other half of the distinction: not every raise is a task's fault.
+        """The other half of the distinction: which *part* failed, not how fatal it is.
 
-        `KeyboardInterrupt` and `SystemExit` mean the process is ending, so they
-        travel out of the worker instead of being filed as a failed task. The
-        attempt is left where lease recovery can find it (N1).
+        This is the same seam as the test above -- the connection opened before
+        the handler is called -- reached by a `BaseException` rather than an
+        `OperationalError`. `KeyboardInterrupt` used to travel out of the worker
+        from here on the ground that it is the process ending; on a handler
+        thread it is nothing of the sort, since the interpreter delivers one to
+        the main thread only (#63). So it is filed like any other machinery
+        failure, and the worker goes on claiming.
         """
-        spec = queued(task_type=NOOP_TASK_TYPE, payload={"n": 902})
+        spec = queued(task_type=NOOP_TASK_TYPE, payload={"n": 902}, max_attempts=1)
         break_handler_connections(monkeypatch, KeyboardInterrupt())
 
-        with pytest.raises(KeyboardInterrupt):
-            await Worker(dsn, "w1").run_once()
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
 
-        assert state_of(conn, spec.task_id) is TaskState.RUNNING
+        assert state_of(conn, spec.task_id) is TaskState.DEAD
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None
+        assert row[0]["title"] == EXECUTION_FAILED  # the machinery, not the handler
+        assert row[0]["detail"].startswith("KeyboardInterrupt")
 
     async def test_an_executor_that_cannot_persist_leaves_the_task_to_lease_recovery(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
@@ -848,6 +897,69 @@ class TestCancellationIsTaskScoped:
         assert row[0]["detail"].startswith("CancelledError")
 
 
+class TestNothingOnTheHandlerThreadIsFatal:
+    """#63: what a handler thread raises is scoped to that thread, whatever it is.
+
+    #55 emptied the fatal door of `CancelledError` and left `SystemExit` and
+    `KeyboardInterrupt` named in it as "the process ending". On a handler
+    thread neither is that: Python ends only the raising thread on `SystemExit`,
+    and `KeyboardInterrupt` is delivered to the *main* thread, so one reaching
+    here can only be an explicit raise by handler code. A real shutdown does not
+    come through this door at all -- `services/workers` wires SIGINT/SIGTERM to
+    the stop event on the loop, and handler threads are daemons.
+
+    The pair below asserts the taxonomy from both sides: what the handler raised
+    is `handler raised`, what the machinery around it raised is `execution
+    failed`, and neither costs the worker.
+    """
+
+    async def test_a_handler_whose_dependency_exits_fails_that_task_only(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """`sys.exit()` on a fail-fast path costs its task, not the worker."""
+        exiting = queued(task_type=EXITS_THE_PROCESS, payload={"exit": True}, max_attempts=1)
+
+        stop = asyncio.Event()
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=20), retry_base_delay=NO_BACKOFF)
+        loop_task = asyncio.create_task(worker.run_forever(stop))
+        try:
+            await until(lambda: state_of(conn, exiting.task_id) is TaskState.DEAD)
+
+            # Enqueued only now, so claiming it proves the loop is still
+            # polling rather than that it had two tasks in one batch.
+            healthy = queued(task_type=NOOP_TASK_TYPE, payload={"n": 905})
+            await until(lambda: state_of(conn, healthy.task_id) is TaskState.SUCCEEDED)
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop_task, timeout=5)
+
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (exiting.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None
+        assert row[0]["title"] == HANDLER_FAILED  # the dependency the task chose, so the task's own
+        assert row[0]["detail"].startswith("SystemExit")
+
+    async def test_a_handler_raising_a_base_exception_is_titled_handler_raised(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """The title has to name the task's code, not the machinery around it.
+
+        Falling past `_run_handler`'s catch into the thread entry point's filed
+        this under `execution failed`, which per D7's own taxonomy sends an
+        operator to the connection when the bug is in the handler.
+        """
+        spec = queued(task_type=FAILS_HARD, payload={"hard_fail": True}, max_attempts=1)
+
+        assert await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once() == 1
+
+        assert state_of(conn, spec.task_id) is TaskState.DEAD
+        row = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        conn.commit()
+        assert row is not None
+        assert row[0]["title"] == HANDLER_FAILED
+        assert row[0]["detail"].startswith("LibraryHardFail")
+
+
 class TestConcurrency:
     async def test_two_workers_never_execute_a_task_twice(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
@@ -1018,6 +1130,8 @@ class TestRunRollup:
         SPENDS_THE_CAP_TWICE,
         SWALLOWS_A_DATABASE_ERROR,
         LEAKS_CANCELLATION,
+        EXITS_THE_PROCESS,
+        FAILS_HARD,
         CANNOT_REACH_ITS_SOURCE,
     ],
 )

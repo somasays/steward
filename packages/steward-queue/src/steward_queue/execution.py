@@ -71,18 +71,32 @@ one task's failure and is reported as an `_Executed`, never as an exception on
 the future. The loop reads that future from inside its poll loop, so an
 exception on it is a worker killed by one task: #45, reached in practice by a
 handler connection that could not be opened once #42 doubled the connections a
-task holds. Exactly two things still travel -- `SystemExit` and
-`KeyboardInterrupt`, which are the process ending rather than a task failing.
+task holds. **Nothing travels.** Not `CancelledError` (#55), and since #63 not
+`SystemExit` or `KeyboardInterrupt` either.
 
-Cancellation is not one of them. The handler gets an event loop of its own
-(`asyncio.run` below), so a `CancelledError` escaping it -- an inner `wait_for`
-or `TaskGroup` a handler leaked, which is a routine bug once handlers await the
-gateway -- says nothing about the worker's loop or the process; treating it as
-fatal let one buggy handler kill the worker (#55). It is task-scoped, and it is
-classified like any other raise. The trade in the other direction is real and
-recorded in SPEC.md §13 D7: `MemoryError` and an fd-exhausted `OSError` *are*
-`Exception`s, so a degraded worker files them as its task's failure and keeps
-claiming.
+The fatal set is empty here because a thread has nothing to say about a
+process. `SystemExit` on a non-main thread ends that thread under Python's own
+threading semantics and nothing else, so escalating it to a worker exit
+manufactured a process death the interpreter would not perform -- and any
+dependency with an argparse/click-style fail-fast path calls `sys.exit()`,
+which made it the #55 shape through the one door #55 left named.
+`KeyboardInterrupt` cannot be *delivered* here at all: the interpreter raises
+it on the main thread, so one arriving on a handler thread can only be an
+explicit raise by the code running there, which is a task's bug wearing a
+shutdown's name.
+
+A real shutdown never used this door. `services/workers` wires SIGINT and
+SIGTERM to the loop's stop event, which `wait` below already honours: the loop
+takes the handoff, drops the handler's session, and leaves the attempt to its
+lease (N1). Where `add_signal_handler` is unavailable, a `KeyboardInterrupt`
+still lands on the main thread -- where the loop runs -- and ends the process
+from there. Handler threads are daemons, so an abandoned one cannot hold the
+process open either way.
+
+What that costs is stated plainly in SPEC.md §13 D7 and unchanged in kind by
+#63: `MemoryError` and an fd-exhausted `OSError` are one task's failure here, so
+a degraded worker consumes attempts instead of exiting for a fresh pod. #63 adds
+the same trade for two more classes nobody has seen a worker recover from.
 
 An outcome the thread could not write reaches the loop as `recorded=False`, and
 the handoff decides whether the loop may write it instead. That covers a thread
@@ -277,8 +291,11 @@ class _WallClockExpired(Exception):
     an overrun does. Raised only by `_bounded`, and only when the cap it set is
     the thing that fired, so the type is evidence rather than a guess (#57).
 
-    An `Exception`, deliberately: `_run_handler` answers for `Exception`, and a
-    sentinel outside that is #55 with a different name.
+    An `Exception` rather than a `BaseException` subclass: it is a fault like
+    any other and nothing on the way to `_classify` reads it as more than that.
+    It was also the load-bearing choice while `_run_handler` answered only for
+    `Exception` -- a sentinel outside that was #55 with a different name -- and
+    is now merely the accurate one (#63).
     """
 
 
@@ -365,17 +382,15 @@ def _execute_in_thread(
     worker and leaving its task `running` for a budget-length lease.
 
     The exception becomes this task's typed failure instead, unrecorded, for
-    the loop to settle. `SystemExit` and `KeyboardInterrupt` still travel: the
-    process is ending, and dressing that up as a failed task would hide a
-    shutdown as a data point. They are named, rather than reached by asking
-    whether the exception is an `Exception`, because that question has a third
-    answer -- `asyncio.CancelledError` -- which is task-scoped here and killed
-    the worker while it was grouped with the other two (#55).
+    the loop to settle. Nothing is excepted from that any more, which is what
+    `except BaseException` with no branch above it says: this frame runs on a
+    thread, and a thread cannot end a process (#63). `SystemExit` and
+    `KeyboardInterrupt` were named here as "the process ending" until they were
+    read as what they are on a thread -- the argument is in SPEC.md §13 D7 and
+    in this module's docstring.
     """
     try:
         future.set_result(_run_handler(dsn, task, registration, handoff, record))
-    except (SystemExit, KeyboardInterrupt) as exc:
-        future.set_exception(exc)
     except BaseException as exc:
         detail = f"{type(exc).__name__}: {exc}"
         failure = _Executed(error=_problem(EXECUTION_FAILED, detail), lost_claim=False, recorded=False)
@@ -401,6 +416,14 @@ def _run_handler(
     out of `asyncio.run` is caught here with everything else: it was raised on a
     loop nobody outside this frame can reach, so it is one handler's bug and not
     a signal about the worker (#55).
+
+    The catch is `BaseException` for the same reason, one level out: what the
+    handler raised is the handler's, whatever it inherits from. A dependency
+    that calls `sys.exit()` on a fail-fast path, or one whose fatal-error class
+    sits outside `Exception`, is a bug in the code this task chose to run --
+    `handler raised`, per `_classify`. Narrower, it fell through to
+    `_execute_in_thread` and was titled `execution failed`, which sends the
+    operator to the connection when the fault is in the task (#63).
     """
     budget = task.spec.budget.wall_clock
     conn = connect(dsn, statement_timeout=budget)
@@ -410,7 +433,7 @@ def _run_handler(
         started = time.monotonic()
         try:
             result = asyncio.run(_bounded(registration.fn(ctx), budget))
-        except (Exception, asyncio.CancelledError) as exc:
+        except BaseException as exc:
             outcome: TaskResult | ProblemDetails = _classify(
                 exc, task.spec.budget, time.monotonic() - started
             )
