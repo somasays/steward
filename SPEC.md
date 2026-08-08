@@ -170,7 +170,7 @@ discover_schema ──► profile_table (×N, fan-out per table)
                                 └─► propose_quality_rules
 ```
 
-**That DAG is the target shape, and fan-out is now permitted** (issue #48).
+**That DAG is the target shape. Plan-time fan-out is structurally reservable; model-backed fan-out is still blocked** (issue #48, partially landed). Reservation is not accounting: failed attempts, retries and spend before a task reports failure are not debited, so a run with `max_attempts=3` can consume roughly three times its advertised reservation and `runs.used_*` is a **lower bound** on actual consumption. A deterministic fan-out that spends no model budget is safe under reservation alone; a model-consuming one is not, until failed-attempt usage and incremental agent-loop enforcement land.
 Until it landed, every planned task carried the *run's* budget, so an N-way
 fan-out let a single run spend N times the cap the API published for it (I12) —
 which is why `scan_source` shipped as exactly one task (#20, #37). A plan now
