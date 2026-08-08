@@ -447,7 +447,18 @@ def _masked_text(text: str, semantic_type: SemanticType) -> str:
         return _mask_card(text)
     if semantic_type is SemanticType.URL:
         return _mask_url(text)
-    if semantic_type in (SemanticType.UUID, SemanticType.IP_ADDRESS, SemanticType.TIMESTAMP):
+    if semantic_type in (
+        SemanticType.UUID,
+        SemanticType.IP_ADDRESS,
+        SemanticType.TIMESTAMP,
+        SemanticType.BOOLEAN,
+    ):
+        # BOOLEAN joins these because the module claims no exemption and then
+        # had one: `true` masked to `****` only because it is four characters
+        # and the floor zeroed the request, while `false` -- five -- came out
+        # `f***e`. The suite contained no `false`, so the table encoded the
+        # case that happened to pass (#49 review). `semantic_type` and `length`
+        # already determine a boolean, so revealing its ends buys nothing.
         return _shape(text, keep_first=False, keep_last=0)
     if semantic_type is SemanticType.PHONE:
         # No suffix reveal. It used to keep the last two digits, on the reasoning

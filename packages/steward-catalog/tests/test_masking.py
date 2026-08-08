@@ -43,9 +43,14 @@ CASES: tuple[tuple[str, SemanticType, str], ...] = (
     ("2026-08-08", SemanticType.TIMESTAMP, "****-**-**"),
     ("https://example.com/orders", SemanticType.URL, "https://e******.***/******"),
     ("-1234.50", SemanticType.NUMBER, "-1***.*0"),
+    # Booleans reveal nothing at any length. `true` used to pass only because
+    # four characters put it below the floor; `false` is five and came out
+    # `f***e`, and no `false` was in this table to say so (#49 review).
+    ("true", SemanticType.BOOLEAN, "****"),
+    ("false", SemanticType.BOOLEAN, "*****"),
+    ("t", SemanticType.BOOLEAN, "*"),
     # Below the floor: nothing is revealed, because the first and last
     # character of a short value *are* the value (`MIN_MASKED_ALNUM`).
-    ("true", SemanticType.BOOLEAN, "****"),
     ("", SemanticType.EMPTY, ""),
     ("shipped", SemanticType.TEXT, "s*****d"),
     ("x", SemanticType.TEXT, "*"),

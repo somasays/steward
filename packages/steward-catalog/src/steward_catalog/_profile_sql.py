@@ -78,10 +78,13 @@ def _relation(schema_name: str, name: str) -> sql.Identifier:
 def stats_query(schema_name: str, name: str, columns: tuple[str, ...]) -> sql.Composed:
     """Row count plus four aggregates per column, in one pass over the table.
 
-    One statement rather than one per column because a profile of a wide table
-    would otherwise be a table scan per column: the cost of profiling is a
-    property a customer notices (N5), and the read-only role gives us no way to
-    apologise for it.
+    One statement rather than one per column, so the *aggregates* cost one pass
+    over the relation however wide it is. That argument covers this query only:
+    `top_values_query` below still runs one grouped scan per column, so a full
+    profile is 1 + N passes and the honest bound on it is the task's wall-clock
+    budget, not this shape. Folding the frequencies into the same pass wants a
+    lateral aggregate and belongs with whatever first profiles a table wide
+    enough to notice (N5).
     """
     relation = _relation(schema_name, name)
     if not columns:
