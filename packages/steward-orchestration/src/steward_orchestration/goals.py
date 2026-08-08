@@ -150,8 +150,10 @@ def plan_scan_source(params: ScanSourceParams) -> tuple[PlannedTask, ...]:
     work one connection already does, and the convergence diff (`plan_convergence`)
     is computed against the whole observed catalog at once -- a per-table task
     would have to either re-read the rest or give up detecting a dropped table.
-    Profiling (#49) is the opposite shape -- per-column work, per-column cost --
-    and that is the fan-out this unblocked.
+
+    Profiling (#49) was expected to be the fan-out this unblocked, and turned
+    out not to be one: see `plan_profile_asset` below. A planner cannot read the
+    catalog, so there is nothing here to fan out *to*.
     """
     return (
         PlannedTask(
