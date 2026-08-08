@@ -49,6 +49,7 @@ from steward_catalog.models import (
     SourceKey,
     SourceRecord,
 )
+from steward_catalog.profiles import PROFILE_ENTITY
 
 __all__ = [
     "ASSET_ENTITY",
@@ -68,11 +69,14 @@ SOURCE_ENTITY = "source"
 ASSET_ENTITY = "asset"
 COLUMN_ENTITY = "column"
 
-CATALOG_ENTITIES: tuple[str, ...] = (SOURCE_ENTITY, ASSET_ENTITY, COLUMN_ENTITY)
+CATALOG_ENTITIES: tuple[str, ...] = (SOURCE_ENTITY, ASSET_ENTITY, COLUMN_ENTITY, PROFILE_ENTITY)
 """The `audit_log.entity_type` values catalog mutations write.
 
 Named here so a test can ask "what did this scan record" without hardcoding
-three strings that the writer could drift away from.
+strings that the writer could drift away from. `profile` (issue #49) is
+included by importing the constant from the module that writes it rather than
+by restating it, so a harness sweeping catalog audit rows picks up a new entity
+type when it appears, not when someone remembers this tuple.
 """
 
 
