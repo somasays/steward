@@ -17,6 +17,13 @@ from steward_schemas.budget import RunBudget
 from steward_schemas.catalog import AssetDetail, AssetPage
 from steward_schemas.column import Column
 from steward_schemas.errors import ProblemDetails
+from steward_schemas.profile import (
+    ColumnProfile,
+    MaskedSample,
+    SemanticType,
+    TableProfile,
+    ValueFrequency,
+)
 from steward_schemas.run import Run, RunCreate, RunStatus
 from steward_schemas.source import (
     DEFAULT_EXCLUDED_SCHEMAS,
@@ -38,17 +45,22 @@ __all__ = [
     "AssetPage",
     "AssetType",
     "Column",
+    "ColumnProfile",
+    "MaskedSample",
     "ProblemDetails",
     "RunBudget",
     "RunCreate",
     "Run",
     "RunStatus",
+    "SemanticType",
     "Source",
     "SourceCreate",
     "SourceEngine",
+    "TableProfile",
     "TaskResult",
     "TaskSpec",
     "TaskStatus",
+    "ValueFrequency",
 ]
 
 CONTRACTS: dict[str, type[BaseModel]] = {
@@ -58,6 +70,10 @@ CONTRACTS: dict[str, type[BaseModel]] = {
     "asset_detail": AssetDetail,
     "asset_page": AssetPage,
     "column": Column,
+    "masked_sample": MaskedSample,
+    "value_frequency": ValueFrequency,
+    "column_profile": ColumnProfile,
+    "table_profile": TableProfile,
     "task_spec": TaskSpec,
     "task_result": TaskResult,
     "run_budget": RunBudget,
