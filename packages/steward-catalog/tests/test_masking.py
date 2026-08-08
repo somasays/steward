@@ -13,6 +13,7 @@ import pytest
 from steward_catalog.masking import (
     MIN_MASKED_ALNUM,
     RawCell,
+    _required_concealment,
     column_semantic_type,
     mask,
     mask_optional,
@@ -119,7 +120,7 @@ def test_a_short_value_is_masked_rather_than_republished(raw: str) -> None:
     weak a bar, since `4*` differs from `42` and gives it away.
     """
     assert raw not in mask(RawCell(raw)).masked
-    assert concealed(raw) >= min(alnum_total(raw), MIN_MASKED_ALNUM)
+    assert concealed(raw) >= _required_concealment(alnum_total(raw))
 
 
 # Values whose sensitive content sits *after the last dot* -- the region
@@ -145,7 +146,7 @@ def test_nothing_after_the_last_dot_is_published_verbatim(raw: str) -> None:
     tail = raw.rpartition(".")[2]
 
     assert tail not in masked
-    assert concealed(raw) >= min(alnum_total(raw), MIN_MASKED_ALNUM)
+    assert concealed(raw) >= _required_concealment(alnum_total(raw))
 
 
 ALPHABET = "abZ40+-._@?:/ "
@@ -211,7 +212,7 @@ def test_no_short_value_survives_its_own_mask() -> None:
         for combination in itertools.product(ALPHABET, repeat=length):
             value = "".join(combination)
             masked = mask(RawCell(value)).masked
-            if value in masked or concealed(value) < min(alnum_total(value), MIN_MASKED_ALNUM):
+            if value in masked or concealed(value) < _required_concealment(alnum_total(value)):
                 survivors.append((value, masked))
 
     assert survivors == []
@@ -232,7 +233,7 @@ def test_no_format_publishes_the_payload_in_the_segment_it_interpolates(template
     masked = mask(RawCell(raw)).masked
 
     assert payload not in masked, f"{raw!r} -> {masked!r}"
-    assert concealed(raw) >= min(alnum_total(raw), MIN_MASKED_ALNUM)
+    assert concealed(raw) >= _required_concealment(alnum_total(raw))
 
 
 def test_a_long_value_collapses_instead_of_shaping_character_by_character() -> None:
@@ -302,3 +303,36 @@ def test_empty_values_do_not_outvote_the_rest() -> None:
     assert column_semantic_type([sample(SemanticType.EMPTY), sample(SemanticType.EMAIL)]) is (
         SemanticType.EMAIL
     )
+
+
+def test_the_floor_is_both_absolute_and_proportional() -> None:
+    """`_required_concealment`'s own contract, asserted directly.
+
+    The proportional term is the half of the fix that generalises -- it is what
+    catches the *next* branch that publishes a segment because of where it sits,
+    the way the URL scheme did (21 of 24 alphanumerics published, an absolute
+    floor of three satisfied by the rest). Without this test, reverting the
+    function to `min(alnums, MIN_MASKED_ALNUM)` leaves the whole suite green,
+    because the scheme allowlist independently covers the one value that
+    motivated it. A guard nothing asserts is a guard that gets refactored away.
+    """
+    # Short values: everything, since a fraction of two characters is nothing.
+    assert _required_concealment(0) == 0
+    assert _required_concealment(1) == 1
+    assert _required_concealment(2) == 2
+    # The absolute floor governs while it is the larger of the two.
+    assert _required_concealment(3) == 3
+    assert _required_concealment(6) == 3
+    # Past that, the proportion does -- and rounds up, never down.
+    assert _required_concealment(7) == 4
+    assert _required_concealment(24) == 12
+    assert _required_concealment(101) == 51
+
+
+def test_the_proportional_term_rejects_a_long_value_revealed_by_its_ends() -> None:
+    """The shape the count-only floor let through, as a property of the gate
+    rather than of the branch that happened to produce it."""
+    alnums = 24
+    assert _required_concealment(alnums) > MIN_MASKED_ALNUM
+    # 21 of 24 published — what `X-CONFIDENTIAL-CASE-2019://abc` used to do.
+    assert alnums - 21 < _required_concealment(alnums)

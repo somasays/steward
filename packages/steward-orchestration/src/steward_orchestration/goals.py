@@ -225,11 +225,16 @@ def plan_profile_asset(params: ProfileAssetParams) -> tuple[PlannedTask, ...]:
     reservation altogether -- which is the hole #48 exists to close.
 
     So the asset is the unit that carries a budget, and a client asks for the
-    assets it wants profiled. That also keeps this slice inside what #48
-    actually enforces: reservation counts each planned task once, and spend on
-    a failed or retried attempt is debited nowhere (SPEC.md §13 D9), so an
-    N-way fan-out would multiply an unaccounted tail under one advertised cap.
-    A per-source expansion belongs with the accounting that can bound it.
+    assets it wants profiled.
+
+    Budget is *not* the reason, and SPEC.md §3.1 is explicit about it: a
+    deterministic fan-out spending no model budget is safe under reservation
+    alone, which is precisely what profiling is. #48's scope explains only why
+    the workaround is worse than the constraint -- a handler enqueuing its own
+    children skips plan-time reservation, and since retried and failed spend is
+    debited nowhere (SPEC.md §13 D9) those children would run under a cap
+    nothing reconciles. A per-source expansion belongs with a planner that may
+    consult the catalog.
     """
     return (
         PlannedTask(

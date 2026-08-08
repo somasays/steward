@@ -111,6 +111,18 @@ class PostgresSourceProfiler:
         row = self.connection.execute(stats_query(target.schema_name, target.name, names)).fetchone()
         if row is None:  # pragma: no cover -- an aggregate always returns a row
             raise RuntimeError(f"no statistics returned for {target.schema_name}.{target.name}")
+        expected = 1 + STATS_PER_COLUMN * len(names)
+        if len(row) != expected:
+            # The row is sliced positionally below, so a mismatch between the
+            # aggregates `_COLUMN_STATS` emits and `STATS_PER_COLUMN` would not
+            # fail -- it would shift every column's min/max onto its neighbour
+            # and produce a profile that is wrong rather than absent. The
+            # comment on the constant says the two must agree; this is what
+            # makes disagreeing loud.
+            raise RuntimeError(
+                f"statistics row has {len(row)} columns, expected {expected} "
+                f"({len(names)} columns x {STATS_PER_COLUMN} aggregates + row count)"
+            )
         row_count = int(row[0])
         columns = tuple(
             self._column_profile(target, column, row_count, row[1 + index * STATS_PER_COLUMN :])

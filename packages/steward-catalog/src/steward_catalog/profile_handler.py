@@ -2,23 +2,21 @@
 
 **One task per asset, and no fan-out.** SPEC.md §3.1 sketches `profile_table
 (×N)` hanging off a scan, and #48 made a fan-out *representable* by having a
-plan divide its run's budget. It is still not the shape this slice ships, for
-two reasons and in this order:
+plan divide its run's budget. It is still not the shape this slice ships, and
+the reason is singular: **a planner cannot enumerate a source's assets.**
+Planners are pure functions of their validated params (ARCHITECTURE.md §4,
+enforced by `test_every_registered_planner_is_deterministic`); they touch no
+connection. A `profile_source(source_id)` goal would have to read the catalog at
+plan time, which is what makes a planner impure. So the asset is the unit that
+carries a budget, and one asset is one run.
 
-1. **A planner cannot enumerate a source's assets.** Planners are pure
-   functions of their validated params (ARCHITECTURE.md §4, enforced by
-   `test_every_registered_planner_is_deterministic`); they touch no connection.
-   A `profile_source(source_id)` goal would therefore have to either read the
-   catalog at plan time -- which is what makes a planner impure -- or have its
-   handler enqueue children, which bypasses the plan-time reservation entirely
-   and is precisely the accounting hole #48 closed. Neither is available, so
-   the fan-out has no safe expression yet: the run is the unit that carries a
-   budget, so one asset is one run.
-2. **Budgets are reserved, not accounted.** #48 landed reservation only: a
-   failed attempt, a retry, and everything spent before a task reports failure
-   are debited nowhere (SPEC.md §13 D9). An N-way fan-out multiplies that
-   unaccounted tail by N under one advertised cap. One task per run keeps the
-   gap the size it already was for `scan_source`.
+Budget is explicitly *not* the reason, and SPEC.md §3.1 says so: a deterministic
+fan-out that spends no model budget is safe under reservation alone, and
+profiling is exactly that. What #48's scope does explain is why the available
+workaround is the wrong move -- a handler that enqueues its own children skips
+plan-time reservation entirely, and since reservation counts each planned task
+once and spend on failed or retried attempts is debited nowhere (SPEC.md §13
+D9), those children would put an unaccounted tail under one advertised cap.
 
 What the task itself is bounded by: one statistics pass over the relation plus
 one top-values query per column, all on the read-only role, all under the

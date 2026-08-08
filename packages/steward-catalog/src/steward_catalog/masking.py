@@ -26,17 +26,19 @@ runs canaries end to end (GUARDRAILS.md §1, Tier H).
 **Masks are format-preserving, not value-preserving, and there is a floor.** A
 mask reveals a character or two so a human reviewer can read a profile, which is
 the whole value on a short one. The property the rest of the system may rely on
-is exactly this, and no more:
-
-    a mask conceals at least `MIN_MASKED_ALNUM` of a value's alphanumeric
-    characters -- or all of them, when the value has fewer than that.
+is **`_required_concealment`, and that function is the only statement of it** --
+prose is a second copy that drifts, which this one twice did (once false in four
+documents, once stale in three). In words, for orientation only: a mask conceals
+the greater of an absolute floor and half of a value's alphanumerics, and all of
+them when the value is shorter than the floor.
 
 Stated in alphanumerics because that is what is enforced and what is
 measurable: delimiters are preserved as shape, and `length` is published
 outright, so neither is concealed and a guarantee phrased over "characters"
 would be false the moment anyone checked. `_conceals_enough` is the check,
-`mask()` applies it to every branch's output, and `test_masking.py` asserts it
-exhaustively over short values. Classification (#50) and
+`mask()` applies it to every branch's output, and `test_masking.py` asserts both
+that function's contract and the masks that must satisfy it. Classification
+(#50) and
 documentation (#51) work from shape, name and statistics -- SPEC.md §4's second
 design rule -- so the mask keeps delimiters and character classes and discards
 the payload. Uniformly: there is no exemption for numbers, booleans or dates.
@@ -129,8 +131,6 @@ KNOWN_SCHEMES = frozenset(
         "redis",
         "kafka",
         "jdbc",
-        "mailto",
-        "data",
     }
 )
 """URL schemes a mask may publish verbatim -- a closed taxonomy, checked.
@@ -142,6 +142,11 @@ had its identifier published whole. A member of this set carries no customer
 data by construction; a non-member is shaped like any other segment. Adding a
 scheme here is a deliberate act, which is the property the previous version
 lacked.
+
+Schemes without `://` are deliberately absent. `_URL` requires the separator, so
+`mailto:` and `data:` never reach this branch -- listing them would imply a
+safety this module does not provide for them, and a `data:` URI carries its
+payload inline. They are classified and masked as ordinary text.
 """
 
 MIN_MASKED_ALNUM = 3
@@ -309,7 +314,8 @@ def _required_concealment(alnums: int) -> int:
 
     * an **absolute floor** (`MIN_MASKED_ALNUM`), which is what protects `M`,
       `42`, a PIN or a CVV -- a fraction of a two-character value is nothing;
-    * a **proportion** (`MIN_CONCEALED_FRACTION`), which is what protects a long
+    * a **proportion** (`MIN_CONCEALED_NUMERATOR`/`_DENOMINATOR`), which is what
+      protects a long
       one. A count alone made "a branch cannot make a mask less safe" false in
       the only direction that matters: `X-CONFIDENTIAL-CASE-2019://abc`
       published 21 of its 24 alphanumerics and cleared a floor of three.

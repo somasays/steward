@@ -56,7 +56,23 @@ one takes the shape a notes or reference column produces by accident: no
 whitespace, one `@`, a dot, and something confidential behind it.
 """
 
-CANARIES: tuple[str, ...] = (CANARY_EMAIL, CANARY_CARD, CANARY_SECRET, CANARY_AFTER_LAST_DOT)
+CANARY_BEFORE_SCHEME = "X-CANARY-CASE-7d21e9f0://host/path"
+"""A canary whose payload sits *before* the `://`.
+
+The third escape of #49 in canary form: `_mask_url` published the scheme
+verbatim because of where it sat, and no canary was URL-shaped, so H7 could not
+see it -- exactly as no canary had a meaningful TLD when `_mask_email` published
+that. The unit sweep in `test_masking.py` is the primary cover for both; this
+is here so the *harness* stops being blind to the shape as well.
+"""
+
+CANARIES: tuple[str, ...] = (
+    CANARY_EMAIL,
+    CANARY_CARD,
+    CANARY_SECRET,
+    CANARY_AFTER_LAST_DOT,
+    CANARY_BEFORE_SCHEME,
+)
 
 CANARY_TAIL = CANARY_AFTER_LAST_DOT.rpartition(".")[2]
 """The payload alone -- `CANARY-DIAGNOSIS-4b81f7ac`. Swept for separately,
@@ -96,8 +112,12 @@ FIXTURE_DATA: tuple[tuple[str, dict[str, str]], ...] = (
     ),
     (
         "INSERT INTO staging.raw_events (id, body) VALUES "
-        "(1, %(secret)s), (2, 'ordinary event'), (3, %(tail)s)",
-        {"secret": CANARY_SECRET, "tail": CANARY_AFTER_LAST_DOT},
+        "(1, %(secret)s), (2, 'ordinary event'), (3, %(tail)s), (4, %(scheme)s)",
+        {
+            "secret": CANARY_SECRET,
+            "tail": CANARY_AFTER_LAST_DOT,
+            "scheme": CANARY_BEFORE_SCHEME,
+        },
     ),
 )
 
