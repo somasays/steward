@@ -44,7 +44,7 @@ therefore `DEADLINE_GRACE` plus one terminate round trip plus one bookkeeping
 transaction, *independent of what the handler is doing*, because nothing on
 that path waits on the handler thread.
 
-`_Handoff` is what makes "*at most* one of them records" true rather than
+`Handoff` is what makes "*at most* one of them records" true rather than
 likely, and what makes an abandoned thread harmless: having lost the handoff it
 never touches the task row, and its session is gone by then anyway, so its
 writes are discarded and the attempt the worker recorded stands. At most, not
@@ -67,7 +67,7 @@ What the thread never does is raise at the loop
 -----------------------------------------------
 Everything that can go wrong here -- the handler, the connection it needs
 before the handler can run at all, the statement that records the outcome -- is
-one task's failure and is reported as an `_Executed`, never as an exception on
+one task's failure and is reported as an `Executed`, never as an exception on
 the future. The loop reads that future from inside its poll loop, so an
 exception on it is a worker killed by one task: #45, reached in practice by a
 handler connection that could not be opened once #42 doubled the connections a
@@ -126,6 +126,31 @@ from steward_queue.db import QueueConnection, connect
 from steward_queue.models import ClaimedTask
 from steward_queue.registry import HandlerRegistration, TaskContext
 
+__all__ = [
+    "BUDGET_EXCEEDED",
+    "DEADLINE_GRACE",
+    "EXECUTION_FAILED",
+    "HANDLER_FAILED",
+    "Executed",
+    "Handoff",
+    "RecordOutcome",
+    "budget_exceeded",
+    "problem",
+    "spawn",
+    "wait",
+]
+"""The seam `worker` runs an execution through, and nothing else (I3, #58).
+
+`spawn` and `wait` are the entry points; `Handoff`, `Executed` and
+`RecordOutcome` are the types their signatures carry -- contracts between two
+modules, not internals, which is how `_Handoff` and `_Executed` read while
+`worker` imported them anyway. The titles and `DEADLINE_GRACE` are re-exported
+by `worker`, the module tests and operators address.
+
+Everything else stays underscored because none of it crosses a boundary:
+`_run_handler`, `_classify`, `_bounded`, the `_WallClockExpired` it raises.
+"""
+
 DEADLINE_GRACE = timedelta(milliseconds=500)
 """How long past the cap the loop lets the handler thread record its own overrun.
 
@@ -160,12 +185,12 @@ the queue bookkeeping behind it -- retry policy, actor, lease -- stays in
 """
 
 
-def _problem(title: str, detail: str) -> ProblemDetails:
+def problem(title: str, detail: str) -> ProblemDetails:
     """A typed failure record for the `last_error` column (SPEC.md §8)."""
     return ProblemDetails(type="urn:steward:task-failed", title=title, status=500, detail=detail)
 
 
-def _budget_exceeded(budget: RunBudget, detail: str | None = None) -> ProblemDetails:
+def budget_exceeded(budget: RunBudget, detail: str | None = None) -> ProblemDetails:
     """The typed, visible failure I12 requires when a hard cap is hit.
 
     Carries the budget it blew as an RFC 9457 extension member (which is why
@@ -211,10 +236,10 @@ def _overspent(result: TaskResult, budget: RunBudget) -> ProblemDetails | None:
     overrun = result.usage.over(budget)
     if not overrun:
         return None
-    return _budget_exceeded(budget, f"reported usage exceeded the task budget: {', '.join(overrun)}")
+    return budget_exceeded(budget, f"reported usage exceeded the task budget: {', '.join(overrun)}")
 
 
-class _Handoff:
+class Handoff:
     """Which of an attempt's two contexts gets to record its outcome -- once.
 
     Both the handler thread and the event loop can reach the point of writing a
@@ -255,7 +280,7 @@ class _Handoff:
 
 
 @dataclass(frozen=True, slots=True)
-class _Executed:
+class Executed:
     """What the handler thread did, reported back to the loop that owns the span.
 
     `error` is the typed failure it settled on (None on success) and is carried
@@ -270,7 +295,7 @@ class _Executed:
     recorded: bool
 
 
-def _consume(finished: asyncio.Future[_Executed]) -> None:
+def _consume(finished: asyncio.Future[Executed]) -> None:
     """Retrieve an abandoned execution's outcome so asyncio does not log it.
 
     A handler the loop stopped waiting for still finishes and still resolves
@@ -325,9 +350,9 @@ def spawn(
     dsn: str,
     task: ClaimedTask,
     registration: HandlerRegistration,
-    handoff: _Handoff,
+    handoff: Handoff,
     record: RecordOutcome,
-) -> asyncio.Future[_Executed]:
+) -> asyncio.Future[Executed]:
     """Start the handler on a thread of its own; return its awaitable result.
 
     A plain daemon thread, not `asyncio.to_thread`'s shared executor: a
@@ -335,7 +360,7 @@ def spawn(
     pool that thread is one the worker also needs for its own bookkeeping
     calls. Daemon, so an abandoned handler cannot keep the process alive.
     """
-    future: concurrent.futures.Future[_Executed] = concurrent.futures.Future()
+    future: concurrent.futures.Future[Executed] = concurrent.futures.Future()
     threading.Thread(
         target=_execute_in_thread,
         args=(dsn, task, registration, handoff, record, future),
@@ -347,7 +372,7 @@ def spawn(
     return awaitable
 
 
-async def wait(finished: asyncio.Future[_Executed], deadline: timedelta, stop: asyncio.Event | None) -> None:
+async def wait(finished: asyncio.Future[Executed], deadline: timedelta, stop: asyncio.Event | None) -> None:
     """Wait for the handler, the deadline, or a shutdown -- whichever is first.
 
     `asyncio.wait` rather than `wait_for`, because a timeout here must not
@@ -368,9 +393,9 @@ def _execute_in_thread(
     dsn: str,
     task: ClaimedTask,
     registration: HandlerRegistration,
-    handoff: _Handoff,
+    handoff: Handoff,
     record: RecordOutcome,
-    future: concurrent.futures.Future[_Executed],
+    future: concurrent.futures.Future[Executed],
 ) -> None:
     """Thread entry point. Never raises, and never fails the worker.
 
@@ -393,7 +418,7 @@ def _execute_in_thread(
         future.set_result(_run_handler(dsn, task, registration, handoff, record))
     except BaseException as exc:
         detail = f"{type(exc).__name__}: {exc}"
-        failure = _Executed(error=_problem(EXECUTION_FAILED, detail), lost_claim=False, recorded=False)
+        failure = Executed(error=problem(EXECUTION_FAILED, detail), lost_claim=False, recorded=False)
         future.set_result(failure)
 
 
@@ -401,9 +426,9 @@ def _run_handler(
     dsn: str,
     task: ClaimedTask,
     registration: HandlerRegistration,
-    handoff: _Handoff,
+    handoff: Handoff,
     record: RecordOutcome,
-) -> _Executed:
+) -> Executed:
     """The whole execution, on this thread, through a connection of its own.
 
     The connection is a local of this frame and is closed before it returns,
@@ -459,7 +484,7 @@ def _settled(result: TaskResult, budget: RunBudget) -> TaskResult | ProblemDetai
     it says it spent fits the cap it was given (`_overspent`).
     """
     if result.status is not TaskStatus.SUCCEEDED:
-        return result.error or _problem(HANDLER_FAILED, result.status.value)
+        return result.error or problem(HANDLER_FAILED, result.status.value)
     return _overspent(result, budget) or result
 
 
@@ -481,17 +506,17 @@ def _classify(exc: BaseException, budget: RunBudget, elapsed: float) -> ProblemD
     non-budget failure could satisfy (#57).
     """
     if isinstance(exc, _WallClockExpired) or elapsed >= budget.wall_clock.total_seconds():
-        return _budget_exceeded(budget)
-    return _problem(HANDLER_FAILED, f"{type(exc).__name__}: {exc}")
+        return budget_exceeded(budget)
+    return problem(HANDLER_FAILED, f"{type(exc).__name__}: {exc}")
 
 
 def _record_in_thread(
     conn: QueueConnection,
     task: ClaimedTask,
-    handoff: _Handoff,
+    handoff: Handoff,
     record: RecordOutcome,
     outcome: TaskResult | ProblemDetails,
-) -> _Executed:
+) -> Executed:
     """Write this attempt's terminal state -- if the loop has not already.
 
     Losing the handoff means the loop gave up on this thread and recorded
@@ -507,9 +532,9 @@ def _record_in_thread(
     """
     error = outcome if isinstance(outcome, ProblemDetails) else None
     if not handoff.take():
-        return _Executed(error=error, lost_claim=False, recorded=False)
+        return Executed(error=error, lost_claim=False, recorded=False)
     try:
         record(conn, task, outcome)
     except tasks.TaskNotClaimable:
-        return _Executed(error=error, lost_claim=True, recorded=False)
-    return _Executed(error=error, lost_claim=False, recorded=True)
+        return Executed(error=error, lost_claim=True, recorded=False)
+    return Executed(error=error, lost_claim=False, recorded=True)

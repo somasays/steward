@@ -5,6 +5,10 @@ a `RunBudget` as SQL parameters, a row's budget columns back as a `RunBudget`,
 and narrowing a `RETURNING` row the statement guarantees exists. Private,
 because the shape of a row is an implementation detail of `_sql`, not something
 this package offers.
+
+The privacy is carried by the module name, once: what is inside it is named
+plainly, because `tasks` and `runs` both import it and a name that crosses a
+module boundary is a contract there whatever it is spelled (I3, #58).
 """
 
 from collections.abc import Sequence
@@ -15,14 +19,14 @@ from typing import Any
 from steward_schemas import RunBudget
 
 
-def _require_row(row: Sequence[Any] | None, what: str) -> Sequence[Any]:
+def require_row(row: Sequence[Any] | None, what: str) -> Sequence[Any]:
     """Narrow a `RETURNING` result that the statement guarantees exists."""
     if row is None:  # pragma: no cover -- unreachable unless the schema drifts
         raise RuntimeError(what)
     return row
 
 
-def _budget_params(budget: RunBudget) -> dict[str, Any]:
+def budget_params(budget: RunBudget) -> dict[str, Any]:
     return {
         "budget_steps": budget.steps,
         "budget_tokens": budget.tokens,
@@ -31,5 +35,5 @@ def _budget_params(budget: RunBudget) -> dict[str, Any]:
     }
 
 
-def _budget_from(steps: int, tokens: int, cost_usd: Decimal, wall_clock: timedelta) -> RunBudget:
+def budget_from(steps: int, tokens: int, cost_usd: Decimal, wall_clock: timedelta) -> RunBudget:
     return RunBudget(steps=steps, tokens=tokens, cost_usd=cost_usd, wall_clock=wall_clock)

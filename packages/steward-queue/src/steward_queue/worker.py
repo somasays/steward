@@ -38,8 +38,13 @@ runs on, the connection it opens there, the deadline the loop holds over it,
 and the handoff that decides which of the two contexts records the attempt
 (SPEC.md §13, D7). What stays here is the loop -- polling, claiming, the
 worker's own bookkeeping connection, and settling whatever the execution
-reports. The two meet at exactly three points: a `_Handoff` this module
-creates, the `record` callable it hands down, and the `_Executed` it gets back.
+reports. The two meet at exactly three points: a `Handoff` this module
+creates, the `record` callable it hands down, and the `Executed` it gets back.
+All three are public names in `execution`, because a type that crosses a module
+boundary is a contract whatever it is spelled: they were `_Handoff` and
+`_Executed`, so the underscore meant "private to the package" here and "private
+to the module" everywhere else, and I3's typed seams stopped being readable as a
+rule (#58).
 
 Every execution runs inside a task span on the run's trace (I7). The worker
 takes a `Tracer`, it does not build one: which backend traces, and whether one
@@ -63,21 +68,30 @@ from steward_queue.db import QueueConnection, connect, set_statement_timeout, te
 from steward_queue.execution import (
     BUDGET_EXCEEDED,
     DEADLINE_GRACE,
-    _budget_exceeded,
-    _Executed,
-    _Handoff,
-    _problem,
+    EXECUTION_FAILED,
+    HANDLER_FAILED,
+    Executed,
+    Handoff,
+    budget_exceeded,
+    problem,
     spawn,
     wait,
 )
 from steward_queue.models import SYSTEM_ACTOR, Actor, ClaimedTask
 from steward_queue.registry import HandlerRegistration, UnknownTaskType, get_handler, registered_types
 
-__all__ = ["BUDGET_EXCEEDED", "DEADLINE_GRACE", "Worker"]
-"""`BUDGET_EXCEEDED` and `DEADLINE_GRACE` are defined next to the mechanism that
-raises them and re-exported here, because this is the module operators, tests
-and wiring code address -- the vocabulary of a task's outcome should not move
-when the machinery behind it does."""
+__all__ = ["BUDGET_EXCEEDED", "DEADLINE_GRACE", "EXECUTION_FAILED", "HANDLER_FAILED", "Worker"]
+"""The vocabulary of a task's outcome, addressed where the worker is addressed.
+
+All three titles, and the grace the deadline allows, are defined next to the
+mechanism that produces them and re-exported here: the vocabulary should not
+move when the machinery does. It did, though -- `HANDLER_FAILED` moved to
+`execution` with no re-export and `EXECUTION_FAILED` never got one, so a test
+reached past this module for a title until #58.
+
+The mechanism itself is deliberately not re-exported: `Handoff`, `Executed`,
+`spawn` and `wait` are `execution`'s public seam and are imported from there.
+"""
 
 DEFAULT_POLL_INTERVAL = timedelta(milliseconds=200)
 
@@ -275,7 +289,7 @@ class Worker:
         )
         conn.commit()
 
-    def _abandon(self, conn: QueueConnection, handoff: _Handoff) -> None:
+    def _abandon(self, conn: QueueConnection, handoff: Handoff) -> None:
         """Dispose of the session of a handler this worker has stopped waiting for.
 
         The thread cannot be killed -- Python has no such operation -- but its
@@ -395,11 +409,11 @@ class Worker:
         try:
             registration = get_handler(task.spec.task_type)
         except UnknownTaskType:
-            problem = _problem(UNKNOWN_TYPE, task.spec.task_type)
-            await self._record_failure(conn, task, problem, span)
+            unknown = problem(UNKNOWN_TYPE, task.spec.task_type)
+            await self._record_failure(conn, task, unknown, span)
             return True
 
-        handoff = _Handoff()
+        handoff = Handoff()
         finished = self._spawn(task, registration, handoff)
         deadline = task.spec.budget.wall_clock + DEADLINE_GRACE
         started = time.monotonic()
@@ -424,12 +438,12 @@ class Worker:
             # any more.
             span.record(SpanOutcome.ERROR, WORKER_STOPPING)
             return True
-        await self._record_failure(conn, task, _budget_exceeded(task.spec.budget), span)
+        await self._record_failure(conn, task, budget_exceeded(task.spec.budget), span)
         return True
 
     def _spawn(
-        self, task: ClaimedTask, registration: HandlerRegistration, handoff: _Handoff
-    ) -> asyncio.Future[_Executed]:
+        self, task: ClaimedTask, registration: HandlerRegistration, handoff: Handoff
+    ) -> asyncio.Future[Executed]:
         """Hand one claimed task to `execution`, with this worker's way of recording it."""
         return spawn(
             dsn=self._dsn,
@@ -443,8 +457,8 @@ class Worker:
         self,
         conn: QueueConnection,
         task: ClaimedTask,
-        handoff: _Handoff,
-        executed: _Executed,
+        handoff: Handoff,
+        executed: Executed,
         span: Span,
     ) -> bool:
         """Close out an execution the handler thread has finished with.

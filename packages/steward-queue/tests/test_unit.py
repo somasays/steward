@@ -13,10 +13,10 @@ import pytest
 from steward_queue import NOOP_TASK_TYPE, REGISTRY, dedup_key_for, registered_types, retry_delay
 from steward_queue.backoff import DEFAULT_MAX_DELAY
 from steward_queue.db import MIN_STATEMENT_TIMEOUT_MS, statement_timeout_ms
+from steward_queue.execution import Handoff
 from steward_queue.handlers import noop
 from steward_queue.migrate import sqlalchemy_url
 from steward_queue.registry import UnknownTaskType, get_handler, task_handler
-from steward_queue.worker import _Handoff
 
 THREADS = 8
 
@@ -132,7 +132,7 @@ class TestSqlalchemyUrl:
 
 
 class TestHandoff:
-    """Exactly one context records an attempt (worker.py, SPEC.md D7).
+    """Exactly one context records an attempt (execution.py, SPEC.md D7).
 
     The handler thread and the event loop both reach the point of writing a
     terminal state for the same attempt. Two of them writing would count the
@@ -141,12 +141,12 @@ class TestHandoff:
     """
 
     def test_only_the_first_caller_takes_it(self) -> None:
-        handoff = _Handoff()
+        handoff = Handoff()
         assert handoff.take() is True
         assert handoff.take() is False
 
     def test_only_one_of_many_threads_takes_it(self) -> None:
-        handoff = _Handoff()
+        handoff = Handoff()
         start = threading.Barrier(THREADS)
         winners: list[bool] = []
         lock = threading.Lock()
@@ -168,9 +168,9 @@ class TestHandoff:
     def test_a_backend_that_was_never_published_is_none(self) -> None:
         # The loop asks before the thread has opened its connection: there is
         # nothing to end, and that is not an error.
-        assert _Handoff().backend_pid() is None
+        assert Handoff().backend_pid() is None
 
     def test_a_published_backend_is_readable_from_another_thread(self) -> None:
-        handoff = _Handoff()
+        handoff = Handoff()
         threading.Thread(target=lambda: handoff.publish(4242)).start()
         assert wait_for(lambda: handoff.backend_pid() == 4242)

@@ -35,13 +35,14 @@ from steward_queue import (
     write_checkpoint,
 )
 from steward_queue.db import QueueConnection
-from steward_queue.execution import EXECUTION_FAILED, HANDLER_FAILED
 from steward_queue.registry import TaskContext
 from steward_queue.worker import (
     BOOKKEEPING_CONNECTION_FAILED,
     BUDGET_EXCEEDED,
     CONNECT_RETRY_ATTEMPTS,
     DEADLINE_GRACE,
+    EXECUTION_FAILED,
+    HANDLER_FAILED,
 )
 from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
 from steward_telemetry import Span, SpanOutcome
