@@ -22,11 +22,31 @@ from steward_schemas import RunBudget, TaskResult
 from steward_telemetry import new_trace_id
 
 from steward_queue import _sql
-from steward_queue._rows import _budget_from, _budget_params, _require_row
+from steward_queue._rows import budget_from, budget_params, require_row
 from steward_queue.audit import RUN_ENTITY, write_audit
 from steward_queue.db import QueueConnection
 from steward_queue.keys import digest
 from steward_queue.models import SYSTEM_ACTOR, Actor, RunRecord, RunStatus
+
+__all__ = [
+    "bind_idempotency_key",
+    "claim_single_flight",
+    "create_run",
+    "get_run",
+    "record_usage",
+    "rollup_run_status",
+    "set_run_status",
+    "start_run",
+]
+"""What this module offers, and to whom.
+
+The first four and `set_run_status`/`start_run`/`rollup_run_status` are on the
+package façade. `record_usage` deliberately is not: it is the seam `tasks`
+crosses inside a task's own transaction, and the only path that reaches it runs
+the I12 reported-usage check first (`execution._overspent`). Naming it here
+rather than underscoring it says which it is -- an underscore said "do not call
+this" to `tasks`, which has to (#58).
+"""
 
 
 def _run_record(row: Sequence[Any]) -> RunRecord:
@@ -35,8 +55,8 @@ def _run_record(row: Sequence[Any]) -> RunRecord:
         goal=row[1],
         payload=row[2],
         status=RunStatus(row[3]),
-        budget=_budget_from(row[4], row[5], row[6], row[7]),
-        usage=_budget_from(row[8], row[9], row[10], row[11]),
+        budget=budget_from(row[4], row[5], row[6], row[7]),
+        usage=budget_from(row[8], row[9], row[10], row[11]),
         trace_id=row[12],
         idempotency_key=row[13],
         created_at=row[14],
@@ -89,14 +109,14 @@ def create_run(
         "status": status.value,
         "trace_id": trace_id if trace_id is not None else new_trace_id(seed=str(identifier)),
         "idempotency_key": idempotency_key,
-        **_budget_params(budget),
+        **budget_params(budget),
     }
     row = conn.execute(_sql.INSERT_RUN, params).fetchone()
     if row is None:
         existing = conn.execute(
             _sql.SELECT_RUN_BY_IDEMPOTENCY_KEY, {"idempotency_key": idempotency_key}
         ).fetchone()
-        return _run_record(_require_row(existing, "idempotency conflict without an existing row"))
+        return _run_record(require_row(existing, "idempotency conflict without an existing row"))
     record = _run_record(row)
     write_audit(
         conn,
@@ -167,7 +187,7 @@ def bind_idempotency_key(
         # failed: this run's column already holds a different key.
         current = conn.execute(_sql.SELECT_RUN, {"id": run_id}).fetchone()
         if current is None:
-            # Not "the schema drifted" (that's what `_require_row` guards
+            # Not "the schema drifted" (that's what `require_row` guards
             # elsewhere) -- a caller-supplied `run_id` naming nothing at all.
             # Same typed shape `set_run_status` uses for the same condition.
             raise LookupError(f"no such run: {run_id}")
@@ -306,7 +326,7 @@ def _usage_fields(budget: RunBudget) -> dict[str, Any]:
     }
 
 
-def _record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, actor: Actor) -> None:
+def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, actor: Actor) -> None:
     """Add a task's usage to its run's totals, audited on the run entity (I7).
 
     The run's spend is a mutation in its own right -- a reviewer asking "how
@@ -333,14 +353,14 @@ def _record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, ac
             "wall_clock": result.usage.wall_clock,
         },
     ).fetchone()
-    before = _require_row(row, "run usage update returned no row")
+    before = require_row(row, "run usage update returned no row")
     write_audit(
         conn,
         actor=actor,
         action="run.usage_recorded",
         entity_type=RUN_ENTITY,
         entity_id=str(run_id),
-        before=_usage_fields(_budget_from(before[0], before[1], before[2], before[3])),
-        after=_usage_fields(_budget_from(before[4], before[5], before[6], before[7]))
+        before=_usage_fields(budget_from(before[0], before[1], before[2], before[3])),
+        after=_usage_fields(budget_from(before[4], before[5], before[6], before[7]))
         | {"task_id": str(result.task_id)},
     )

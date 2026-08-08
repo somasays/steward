@@ -35,7 +35,7 @@ from psycopg.types.json import Jsonb
 from steward_schemas import ProblemDetails, TaskResult, TaskSpec
 
 from steward_queue import _sql
-from steward_queue._rows import _budget_from, _budget_params, _require_row
+from steward_queue._rows import budget_from, budget_params, require_row
 from steward_queue.audit import TASK_ENTITY, write_audit
 from steward_queue.backoff import DEFAULT_BASE_DELAY, DEFAULT_FACTOR, DEFAULT_MAX_DELAY, retry_delay
 from steward_queue.db import QueueConnection
@@ -47,7 +47,7 @@ from steward_queue.models import (
     TaskRecord,
     TaskState,
 )
-from steward_queue.runs import _record_usage, rollup_run_status, start_run
+from steward_queue.runs import record_usage, rollup_run_status, start_run
 
 DEFAULT_LEASE = timedelta(minutes=5)
 """How long a claim is honoured before `requeue_stale` may take it back."""
@@ -98,14 +98,14 @@ def enqueue(
         "max_attempts": spec.max_attempts,
         "dedup_key": key,
         "available_at": available_at,
-        **_budget_params(spec.budget),
+        **budget_params(spec.budget),
     }
     inserted = conn.execute(_sql.INSERT_TASK, params).fetchone()
     if inserted is None:
         existing = conn.execute(
             _sql.SELECT_TASK_ID_BY_DEDUP, {"run_id": spec.run_id, "dedup_key": key}
         ).fetchone()
-        deduped_id: UUID = _require_row(existing, "dedup conflict without an existing row")[0]
+        deduped_id: UUID = require_row(existing, "dedup conflict without an existing row")[0]
         return deduped_id
     write_audit(
         conn,
@@ -156,7 +156,7 @@ def claim(
             run_id=row[1],
             task_type=row[2],
             payload=row[3],
-            budget=_budget_from(row[6], row[7], row[8], row[9]),
+            budget=budget_from(row[6], row[7], row[8], row[9]),
             max_attempts=row[5],
         )
         claimed.append(
@@ -257,7 +257,7 @@ def complete(
         before={"state": previous.value},
         after={"state": TaskState.SUCCEEDED.value},
     )
-    _record_usage(conn, run_id, result, actor=actor)
+    record_usage(conn, run_id, result, actor=actor)
     rollup_run_status(conn, run_id, actor=actor)
 
 
@@ -312,7 +312,7 @@ def fail(
             _sql.TERMINATE_TASK, {"id": task_id, "state": landed.value, "error": error_json}
         )
         after = {"state": landed.value, "attempts": attempts}
-    run_id: UUID = _require_row(outcome.fetchone(), "task transition returned no row")[0]
+    run_id: UUID = require_row(outcome.fetchone(), "task transition returned no row")[0]
     write_audit(
         conn,
         actor=actor,
