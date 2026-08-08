@@ -130,6 +130,30 @@ JOIN sources AS s ON s.id = a.source_id
 WHERE a.id = %(id)s
 """
 
+# Profiles are append-only and versioned (SPEC.md §7). There is deliberately no
+# UPDATE or DELETE statement for them anywhere in this package: the only write
+# is the INSERT below, so "a profile version is never rewritten" is a property
+# of the statements that exist rather than of who remembers not to write one.
+SELECT_LATEST_PROFILE = """
+SELECT id, workspace_id, asset_id, version, digest, profile, created_at
+FROM profiles
+WHERE asset_id = %(asset_id)s
+ORDER BY version DESC
+LIMIT 1
+"""
+
+INSERT_PROFILE = """
+INSERT INTO profiles (id, workspace_id, asset_id, version, digest, profile)
+VALUES (%(id)s, %(workspace_id)s, %(asset_id)s, %(version)s, %(digest)s, %(profile)s)
+"""
+
+SELECT_ASSET_PROFILES = """
+SELECT version, digest, profile
+FROM profiles
+WHERE asset_id = %(asset_id)s
+ORDER BY version
+"""
+
 SELECT_ASSET_COLUMNS = """
 SELECT id, workspace_id, asset_id, name, data_type, ordinal, nullable, lifecycle,
        created_at, updated_at

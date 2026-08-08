@@ -23,6 +23,8 @@ from steward_orchestration import (
     NOOP_GOAL,
     NOOP_TASK_BUDGET,
     NOOP_TASK_TYPE,
+    PROFILE_ASSET_GOAL,
+    PROFILE_ASSET_TASK_TYPE,
     SCAN_SOURCE_GOAL,
     SCAN_SOURCE_TASK_TYPE,
     GoalParams,
@@ -36,6 +38,7 @@ from steward_orchestration import (
 from steward_queue import registered_types
 
 SOURCE_ID = "22222222-2222-2222-2222-222222222222"
+ASSET_ID = "33333333-3333-3333-3333-333333333333"
 
 
 def test_the_task_type_names_on_both_sides_of_the_seam_agree() -> None:
@@ -45,6 +48,7 @@ def test_the_task_type_names_on_both_sides_of_the_seam_agree() -> None:
     importing `steward_catalog` here is also what registers the handler the
     check below looks for."""
     assert SCAN_SOURCE_TASK_TYPE == steward_catalog.SCAN_SOURCE_TASK_TYPE
+    assert PROFILE_ASSET_TASK_TYPE == steward_catalog.PROFILE_ASSET_TASK_TYPE
 
 
 def test_every_goal_plans_only_executable_task_types() -> None:
@@ -97,6 +101,33 @@ def test_scan_source_plans_exactly_one_task() -> None:
     assert plan.budget == get_goal(SCAN_SOURCE_GOAL).budget
     assert [spec.budget for spec in plan.task_specs(uuid4())] == [plan.budget]
     assert plan.reserved() == plan.budget
+
+
+def test_profile_asset_plans_exactly_one_task_per_asset() -> None:
+    """The fan-out decision of issue #49, stated as an assertion.
+
+    SPEC.md §3.1 sketches `profile_table (×N)` and #48 made such a plan
+    representable -- but a planner is a pure function of its params and cannot
+    read the catalog to find out what N is, so the expansion that would need
+    one is not available here. The asset is the unit that carries a budget:
+    one asset, one task, one run's cap.
+    """
+    plan = plan_run(PROFILE_ASSET_GOAL, {"asset_id": ASSET_ID})
+
+    assert [(task.task_type, dict(task.payload)) for task in plan.tasks] == [
+        (PROFILE_ASSET_TASK_TYPE, {"asset_id": ASSET_ID})
+    ]
+    assert plan.reserved() == plan.budget
+    assert plan.budget.tokens == 0  # no model is called in this slice (#49)
+
+
+def test_profile_asset_rejects_a_payload_that_is_not_an_asset_id() -> None:
+    for payload in ({}, {"asset_id": "not-a-uuid"}, {"asset_id": ASSET_ID, "columns": ["email"]}):
+        try:
+            plan_run(PROFILE_ASSET_GOAL, payload)
+        except InvalidGoalPayload:
+            continue
+        raise AssertionError(f"payload should not have been accepted: {payload}")
 
 
 def test_every_registered_goals_plan_fits_the_budget_it_advertises() -> None:

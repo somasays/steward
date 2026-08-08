@@ -25,7 +25,7 @@ from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
-from steward_schemas import AssetLifecycle, AssetType, SourceCreate, SourceEngine
+from steward_schemas import AssetLifecycle, AssetType, SourceCreate, SourceEngine, TableProfile
 
 __all__ = [
     "WORKSPACE_ID",
@@ -34,6 +34,8 @@ __all__ = [
     "ColumnRecord",
     "DiscoveredAsset",
     "DiscoveredColumn",
+    "ProfileRecord",
+    "ProfileTarget",
     "SchemaFilter",
     "SourceKey",
     "SourceRecord",
@@ -164,6 +166,42 @@ class AssetRecord(CatalogModel):
     def fqn(self) -> str:
         """`database.schema.name` -- the shape `steward_schemas.Asset` documents."""
         return f"{self.database}.{self.schema_name}.{self.name}"
+
+
+class ProfileTarget(CatalogModel):
+    """What a profiler is pointed at: one relation and the columns to profile.
+
+    Built from stored `assets`/`columns` rows, never from a task payload -- the
+    names in it were read out of `pg_catalog` by a scan, which is what makes it
+    safe for them to reach `psycopg.sql.Identifier` (see `_profile_sql`). A
+    payload names an *asset id*; nothing a client sends becomes an identifier.
+
+    It carries `DiscoveredColumn`s rather than bare names because the profile it
+    produces reports each column's declared type alongside its statistics, and
+    the ordinal is what gives the profile a stable column order (I8).
+    """
+
+    schema_name: str
+    name: str
+    columns: tuple[DiscoveredColumn, ...] = ()
+
+
+class ProfileRecord(CatalogModel):
+    """A `profiles` row: one version of one asset's profile.
+
+    `profile` is the published `TableProfile` contract, so a stored row and the
+    thing a later slice puts in front of a model are the same shape (I3) -- and
+    every value inside it is a `MaskedSample`, so this row cannot hold a raw
+    customer value even if a future writer wanted it to (I6).
+    """
+
+    id: UUID
+    workspace_id: UUID
+    asset_id: UUID
+    version: int
+    digest: str
+    profile: TableProfile
+    created_at: datetime
 
 
 class ColumnRecord(CatalogModel):

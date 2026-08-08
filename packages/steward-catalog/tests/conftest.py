@@ -35,15 +35,52 @@ SCAN_BUDGET = RunBudget(steps=4, tokens=0, cost_usd=Decimal("0"), wall_clock=tim
 
 TRUNCATE_CATALOG = "TRUNCATE runs, tasks, checkpoints, audit_log, sources CASCADE"
 
+# The canaries H7 hunts for (GUARDRAILS.md Tier H, issue #49). They are planted
+# in the fixture data below and the harness asserts that none of them appears in
+# a profile row, an audit row, a log line, a span payload -- or anywhere else in
+# Steward's database. Each is a distinctive token that occurs nowhere else in
+# the repository, so a match is evidence of a leak rather than a coincidence.
+CANARY_EMAIL = "canary.7f3a91d2@steward-canary.test"
+CANARY_CARD = "4539578763621486"
+CANARY_SECRET = "STEWARD-CANARY-TOKEN-9c4e17b6d05f"
+
+CANARIES: tuple[str, ...] = (CANARY_EMAIL, CANARY_CARD, CANARY_SECRET)
+
 # The fixture estate. Two schemas so filtering has something to filter, a view
 # so `asset_type` has two values, and a nullable column so `nullable` does.
 FIXTURE_ESTATE: tuple[str, ...] = (
     "CREATE SCHEMA sales",
     "CREATE SCHEMA staging",
     "CREATE TABLE sales.orders (id bigint NOT NULL, customer text, total numeric(10,2))",
-    "CREATE TABLE sales.customers (id bigint NOT NULL, email text NOT NULL)",
+    "CREATE TABLE sales.customers (id bigint NOT NULL, email text NOT NULL, card text)",
     "CREATE VIEW sales.recent_orders AS SELECT id, total FROM sales.orders",
     "CREATE TABLE staging.raw_events (id bigint NOT NULL, body text)",
+)
+
+# Rows, because profiling has nothing to say about an empty table (issue #49).
+# Scanning is metadata-only and is unaffected by them. `customers` carries both
+# ordinary values and the canaries, so H7's assertions are made about a table
+# that was really profiled rather than one that happened to be skipped.
+#
+# The canaries are bound as parameters rather than interpolated: this is a test
+# fixture, but an f-string here would be string-built SQL and S3 (ruff S608)
+# does not have a "but it is only a test" clause -- suppressing it would be the
+# first pragma in this package (I5).
+FIXTURE_DATA: tuple[tuple[str, dict[str, str]], ...] = (
+    (
+        "INSERT INTO sales.orders (id, customer, total) VALUES "
+        "(1, 'ada', 10.50), (2, 'grace', 10.50), (3, NULL, 99.99)",
+        {},
+    ),
+    (
+        "INSERT INTO sales.customers (id, email, card) VALUES "
+        "(1, 'ada@example.com', NULL), (2, %(email)s, %(card)s)",
+        {"email": CANARY_EMAIL, "card": CANARY_CARD},
+    ),
+    (
+        "INSERT INTO staging.raw_events (id, body) VALUES (1, %(secret)s), (2, 'ordinary event')",
+        {"secret": CANARY_SECRET},
+    ),
 )
 
 GRANT_READER: tuple[str, ...] = (
@@ -54,6 +91,46 @@ GRANT_READER: tuple[str, ...] = (
     # write proof version-independent.
     "REVOKE ALL ON SCHEMA public FROM PUBLIC",
 )
+
+
+def build_estate(conn: psycopg.Connection[psycopg.rows.TupleRow]) -> None:
+    """Create the fixture estate, fill it, and grant the reader its access.
+
+    One function so the session fixture and the per-test teardown build the
+    same estate; a test that dropped a table would otherwise decide what the
+    next test sees.
+    """
+    for statement in FIXTURE_ESTATE:
+        conn.execute(statement)
+    for statement, params in FIXTURE_DATA:
+        conn.execute(statement, params or None)
+    for statement in GRANT_READER:
+        conn.execute(statement)
+
+
+@pytest.fixture(scope="session")
+def canaries() -> tuple[str, ...]:
+    """The planted secrets, as a fixture rather than an import.
+
+    Tests run under `--import-mode=importlib`, so a test module cannot import
+    this one; a fixture is how a conftest constant reaches a test here.
+    """
+    return CANARIES
+
+
+@pytest.fixture(scope="session")
+def canary_email() -> str:
+    return CANARY_EMAIL
+
+
+@pytest.fixture(scope="session")
+def canary_card() -> str:
+    return CANARY_CARD
+
+
+@pytest.fixture(scope="session")
+def canary_secret() -> str:
+    return CANARY_SECRET
 
 
 @pytest.fixture(scope="session")
@@ -83,8 +160,7 @@ def source_admin_dsn(pg_server: pgserver.PostgresServer) -> str:
     pg_server.psql("CREATE ROLE steward_reader LOGIN")
     uri: str = pg_server.get_uri(database=SOURCE_DATABASE)
     with psycopg.connect(uri, autocommit=True) as conn:
-        for statement in (*FIXTURE_ESTATE, *GRANT_READER):
-            conn.execute(statement)
+        build_estate(conn)
     return uri
 
 
@@ -133,8 +209,9 @@ def source_admin(source_admin_dsn: str) -> Iterator[psycopg.Connection[psycopg.r
     conn = psycopg.connect(source_admin_dsn, autocommit=True)
     try:
         yield conn
-        for statement in (*RESET_ESTATE, *FIXTURE_ESTATE, *GRANT_READER):
+        for statement in RESET_ESTATE:
             conn.execute(statement)
+        build_estate(conn)
     finally:
         conn.close()
 

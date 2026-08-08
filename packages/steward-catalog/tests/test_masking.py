@@ -1,0 +1,205 @@
+"""The masking layer, value by value (I6).
+
+These are unit tests over a pure function: no database, no source, no task.
+The end-to-end claim -- that a planted secret never leaves the masker by any
+route -- is H7's, in `test_masking_canary.py`.
+"""
+
+from __future__ import annotations
+
+import itertools
+
+import pytest
+from steward_catalog.masking import (
+    MASK_CHAR,
+    MIN_MASKED_ALNUM,
+    RawCell,
+    column_semantic_type,
+    mask,
+    mask_optional,
+)
+from steward_schemas import MaskedSample, SemanticType
+
+# (raw value, inferred type, mask) -- the table is the specification.
+CASES: tuple[tuple[str, SemanticType, str], ...] = (
+    ("john.doe@gmail.com", SemanticType.EMAIL, "j***@g***.com"),
+    ("ada@mail.example.co.uk", SemanticType.EMAIL, "***@m***.uk"),
+    ("a@b.co", SemanticType.EMAIL, "***@***.co"),
+    ("4111111111111111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
+    ("4111-1111-1111-1111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
+    ("378282246310005", SemanticType.CREDIT_CARD, "3***-****-***0-005"),
+    ("+1 (555) 010-0199", SemanticType.PHONE, "+* (***) ***-**99"),
+    ("f47ac10b-58cc-4372-a567-0e02b2c3d479", SemanticType.UUID, "********-****-****-****-************"),
+    ("192.168.1.42", SemanticType.IP_ADDRESS, "***.***.*.**"),
+    ("2026-08-08 11:30:00", SemanticType.TIMESTAMP, "****-**-** **:**:**"),
+    ("2026-08-08", SemanticType.TIMESTAMP, "****-**-**"),
+    ("https://example.com/orders", SemanticType.URL, "https://e******.***/******"),
+    ("-1234.50", SemanticType.NUMBER, "-1***.*0"),
+    # Below the floor: nothing is revealed, because the first and last
+    # character of a short value *are* the value (`MIN_MASKED_ALNUM`).
+    ("true", SemanticType.BOOLEAN, "****"),
+    ("", SemanticType.EMPTY, ""),
+    ("shipped", SemanticType.TEXT, "s*****d"),
+    ("x", SemanticType.TEXT, "*"),
+    ("M", SemanticType.TEXT, "*"),
+    ("O+", SemanticType.TEXT, "*+"),
+    ("42", SemanticType.NUMBER, "**"),
+    ("9.5", SemanticType.NUMBER, "*.*"),
+    ("7", SemanticType.NUMBER, "*"),
+)
+
+# Values whose first and last character give the whole thing away. Each one was
+# published verbatim before the floor landed (the architecture guardian's
+# finding on #49): a `gender`, `blood_type` or single-digit-score column would
+# have had its entire value domain written into an append-only profile row.
+SHORT_VALUES: tuple[str, ...] = (
+    "M",
+    "F",
+    "Y",
+    "N",
+    "O+",
+    "A-",
+    "42",
+    "9.5",
+    "7",
+    "no",
+    "ok",
+    "t",
+    "US",
+    "a@b.co",
+)
+
+
+@pytest.mark.parametrize(
+    ("raw", "semantic_type", "masked"), CASES, ids=[case[0] or "empty" for case in CASES]
+)
+def test_a_value_is_inferred_and_masked(raw: str, semantic_type: SemanticType, masked: str) -> None:
+    sample = mask(RawCell(raw))
+
+    assert sample.semantic_type is semantic_type
+    assert sample.masked == masked
+    assert sample.length == len(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "semantic_type", "masked"), CASES, ids=[case[0] or "empty" for case in CASES]
+)
+def test_no_mask_contains_the_value_it_masked(raw: str, semantic_type: SemanticType, masked: str) -> None:
+    """The property the table above is only evidence for, and it holds at every
+    length -- an empty string being the one value there is nothing to hide in."""
+    if raw:
+        assert raw not in mask(RawCell(raw)).masked
+
+
+@pytest.mark.parametrize("raw", SHORT_VALUES)
+def test_a_short_value_is_masked_rather_than_republished(raw: str) -> None:
+    """I6 does not have a lower length bound, and neither does the masker.
+
+    Asserted as two properties rather than a table of expected strings: the
+    value must not survive in its own mask, and at least `MIN_MASKED_ALNUM`
+    of its alphanumerics must be hidden -- "the mask differs from the value" is
+    too weak a bar, since `4*` differs from `42` and gives it away.
+    """
+    sample = mask(RawCell(raw))
+
+    assert raw not in sample.masked
+    alnums = [char for char in raw if char.isalnum()]
+    hidden = sum(1 for char in sample.masked if char == MASK_CHAR)
+    assert hidden >= min(len(alnums), MIN_MASKED_ALNUM)
+
+
+def test_no_short_value_survives_its_own_mask() -> None:
+    """The floor, asserted exhaustively rather than by example.
+
+    Every string of up to three characters over an alphabet of letters, digits
+    and the delimiters a mask preserves -- 3,615 values, which is cheap enough
+    to check for real. Each one must be absent from its own mask. Written this
+    way because the defect this replaced was found in exactly the region a
+    hand-written table does not reach: `M`, `42`, `9.5`, and values made of
+    nothing but delimiters.
+    """
+    alphabet = "abcDE4901+-._@"
+    survivors = [
+        (value, mask(RawCell(value)).masked)
+        for length in (1, 2, 3)
+        for combination in itertools.product(alphabet, repeat=length)
+        if (value := "".join(combination)) in mask(RawCell(value)).masked
+    ]
+
+    assert survivors == []
+
+
+def test_a_value_that_is_only_delimiters_is_masked_too() -> None:
+    """Delimiters survive a mask because they are the shape *around* a value.
+    When they are the whole value there is no shape to keep, only a leak."""
+    assert mask(RawCell("-")).masked == "*"
+    assert mask(RawCell("???")).masked == "***"
+
+
+def test_a_long_value_collapses_instead_of_shaping_character_by_character() -> None:
+    raw = "a very long free-text comment that nobody wants as asterisks"
+    sample = mask(RawCell(raw))
+
+    assert sample.masked == "a***s"
+    assert sample.length == len(raw)
+
+
+def test_a_recognised_format_keeps_its_shape_however_long_it_is() -> None:
+    """A UUID is 36 characters -- longer than the collapse threshold -- and
+    collapsing it would throw away the one thing worth publishing about it."""
+    assert mask(RawCell("f47ac10b-58cc-4372-a567-0e02b2c3d479")).masked == (
+        "********-****-****-****-************"
+    )
+
+
+def test_a_sixteen_digit_surrogate_key_is_not_a_credit_card() -> None:
+    """The Luhn check is what keeps warehouse ids out of the card bucket -- a
+    false positive here would drive a false classification in #50."""
+    assert mask(RawCell("1234567890123456")).semantic_type is SemanticType.NUMBER
+
+
+def test_masking_is_deterministic() -> None:
+    # I8: a profile is compared by value across runs, so the mask may not vary.
+    assert mask(RawCell("john.doe@gmail.com")) == mask(RawCell("john.doe@gmail.com"))
+
+
+def test_a_raw_cell_redacts_itself_wherever_it_is_printed() -> None:
+    """The path types cannot cover: an f-string, a `%s` log, a traceback."""
+    cell = RawCell("hunter2@example.com")
+
+    assert "hunter2" not in f"{cell}"
+    assert "hunter2" not in repr(cell)
+    assert "hunter2" not in "{}".format(cell)  # noqa: UP032 -- the shape a log call takes
+    assert "hunter2" not in str([cell])
+
+
+def test_a_null_is_not_a_sample() -> None:
+    assert mask_optional(None) is None
+    assert mask_optional(RawCell("x")) == mask(RawCell("x"))
+
+
+def sample(semantic_type: SemanticType) -> MaskedSample:
+    return MaskedSample(masked="*", semantic_type=semantic_type, length=1)
+
+
+def test_a_columns_type_is_what_its_values_agreed_on() -> None:
+    assert (
+        column_semantic_type([sample(SemanticType.EMAIL), sample(SemanticType.EMAIL)]) is SemanticType.EMAIL
+    )
+
+
+def test_a_column_with_nothing_to_look_at_is_unknown() -> None:
+    assert column_semantic_type([]) is SemanticType.UNKNOWN
+    assert column_semantic_type([sample(SemanticType.EMPTY)]) is SemanticType.UNKNOWN
+
+
+def test_a_column_whose_values_disagree_is_mixed() -> None:
+    assert column_semantic_type([sample(SemanticType.EMAIL), sample(SemanticType.NUMBER)]) is (
+        SemanticType.MIXED
+    )
+
+
+def test_empty_values_do_not_outvote_the_rest() -> None:
+    assert column_semantic_type([sample(SemanticType.EMPTY), sample(SemanticType.EMAIL)]) is (
+        SemanticType.EMAIL
+    )

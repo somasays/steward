@@ -11,9 +11,13 @@ It stays one task on the merits. A metadata scan is one round trip per schema,
 so per-table tasks would open N connections to the customer's database to fetch
 what one query already returns, and `plan_convergence` diffs the *whole*
 observed catalog against the stored one -- split it per table and a dropped
-table stops being detectable without re-reading everything anyway. Profiling
-(#49) is the case that genuinely wants fan-out: per-column work with per-column
-cost, which is what the reservation was built for.
+table stops being detectable without re-reading everything anyway.
+
+Profiling (#49) was expected to be the fan-out this unblocked and is not: a
+planner is a pure function of its params, so it cannot enumerate a source's
+assets to fan out *to*. `profile_asset` plans one task for one asset instead,
+and the asset is the unit that carries a budget -- see `profile_handler` and
+SPEC.md §3.1.
 
 The handler reads through two different connections and that separation is the
 point:

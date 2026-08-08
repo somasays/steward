@@ -32,7 +32,7 @@ WHERE attrelid = %(table)s::regclass AND attname = %(column)s
 """
 
 QUEUE_TABLES = {"runs", "tasks", "checkpoints", "audit_log"}
-CATALOG_TABLES = {"sources", "assets", "columns"}
+CATALOG_TABLES = {"sources", "assets", "columns", "profiles"}
 ALL_TABLES = QUEUE_TABLES | CATALOG_TABLES
 
 QUOTED_LITERAL = re.compile(r"'([^']*)'")
@@ -120,6 +120,19 @@ def test_the_catalog_revision_creates_its_tables_and_natural_keys(scratch_dsn: s
     assert {"sources_natural_key", "assets_natural_key", "columns_natural_key"} <= names(
         scratch_dsn, SELECT_INDEXES
     )
+
+
+def test_the_profiles_revision_versions_one_profile_per_asset(scratch_dsn: str) -> None:
+    """I8 for profiling: two writers cannot both create version N of an asset's
+    profile, so the history is a total order rather than a fork.
+
+    Asserted against the installed index for the same reason the CHECK
+    constraints above are read out of the catalog: what protects production is
+    what Postgres installed, not what the revision file says.
+    """
+    upgrade_to_head(scratch_dsn)
+    assert "profiles" in names(scratch_dsn, SELECT_TABLES)
+    assert "profiles_asset_version" in names(scratch_dsn, SELECT_INDEXES)
 
 
 def test_a_source_row_cannot_hold_a_dsn(scratch_dsn: str) -> None:

@@ -20,7 +20,19 @@ The shape, in the order a scan moves through it:
   table becomes `missing` and keeps its row.
 * `handler` -- `scan_source`, the single bounded task a scan run plans (#37).
 
-Importing this package registers that handler with `steward_queue`, the same
+Profiling (issue #49) is the second slice and the first that reads customer
+*data* rather than metadata, so it adds a layer the metadata half did not need:
+
+* `masking` -- `RawCell` in, `MaskedSample` out, and nothing else. The only
+  path from a sampled value to anything that persists, is returned, or is put
+  in front of a model (I6).
+* `profiler` -- the read side for data: statistics and a masked sample per
+  column, through the same read-only connection the inspector uses (I5).
+* `profiles` -- append-only versioned persistence, where a profile equal to the
+  stored one writes nothing at all (I8).
+* `profile_handler` -- `profile_asset`, one bounded task per asset.
+
+Importing this package registers both handlers with `steward_queue`, the same
 way importing `steward_orchestration` registers its goals -- no setup call a
 process could forget.
 """
@@ -39,15 +51,36 @@ from steward_catalog.inspector import (
     open_source_connection,
     postgres_inspector,
 )
+from steward_catalog.masking import RawCell, column_semantic_type, mask, mask_optional
 from steward_catalog.models import (
     WORKSPACE_ID,
     AssetRecord,
     ColumnRecord,
     DiscoveredAsset,
     DiscoveredColumn,
+    ProfileRecord,
+    ProfileTarget,
     SchemaFilter,
     SourceKey,
     SourceRecord,
+)
+from steward_catalog.profile_handler import (
+    PROFILE_ASSET_SAMPLE_PAYLOAD,
+    PROFILE_ASSET_TASK_TYPE,
+    ProfileAssetPayload,
+    build_profile_asset,
+)
+from steward_catalog.profiler import (
+    SourceProfiler,
+    SourceProfilerFactory,
+    postgres_profiler,
+)
+from steward_catalog.profiles import (
+    PROFILE_ENTITY,
+    RecordedProfile,
+    latest_profile,
+    profile_digest,
+    record_profile,
 )
 from steward_catalog.repository import (
     CATALOG_ENTITIES,
@@ -69,6 +102,9 @@ from steward_catalog.secrets import (
 
 __all__ = [
     "CATALOG_ENTITIES",
+    "PROFILE_ASSET_SAMPLE_PAYLOAD",
+    "PROFILE_ASSET_TASK_TYPE",
+    "PROFILE_ENTITY",
     "SCAN_SOURCE_SAMPLE_PAYLOAD",
     "SCAN_SOURCE_TASK_TYPE",
     "WORKSPACE_ID",
@@ -81,6 +117,11 @@ __all__ = [
     "EnvSecretResolver",
     "InvalidCursor",
     "MalformedSecretRef",
+    "ProfileAssetPayload",
+    "ProfileRecord",
+    "ProfileTarget",
+    "RawCell",
+    "RecordedProfile",
     "SchemaFilter",
     "ScanSourcePayload",
     "Secret",
@@ -88,19 +129,29 @@ __all__ = [
     "SecretResolver",
     "SourceInspector",
     "SourceInspectorFactory",
+    "SourceProfiler",
+    "SourceProfilerFactory",
     "SourceKey",
     "SourceRecord",
     "apply_plan",
+    "build_profile_asset",
     "build_scan_source",
+    "column_semantic_type",
     "decode_cursor",
     "encode_cursor",
     "get_asset",
     "get_source",
+    "latest_profile",
     "list_asset_columns",
     "list_assets",
     "load_state",
+    "mask",
+    "mask_optional",
     "open_source_connection",
     "plan_convergence",
     "postgres_inspector",
+    "postgres_profiler",
+    "profile_digest",
+    "record_profile",
     "register_source",
 ]
