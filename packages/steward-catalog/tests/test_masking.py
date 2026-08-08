@@ -7,6 +7,8 @@ route -- is H7's, in `test_masking_canary.py`.
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 from steward_catalog.masking import (
     MASK_CHAR,
@@ -104,6 +106,34 @@ def test_a_short_value_is_masked_rather_than_republished(raw: str) -> None:
     alnums = [char for char in raw if char.isalnum()]
     hidden = sum(1 for char in sample.masked if char == MASK_CHAR)
     assert hidden >= min(len(alnums), MIN_MASKED_ALNUM)
+
+
+def test_no_short_value_survives_its_own_mask() -> None:
+    """The floor, asserted exhaustively rather than by example.
+
+    Every string of up to three characters over an alphabet of letters, digits
+    and the delimiters a mask preserves -- 3,615 values, which is cheap enough
+    to check for real. Each one must be absent from its own mask. Written this
+    way because the defect this replaced was found in exactly the region a
+    hand-written table does not reach: `M`, `42`, `9.5`, and values made of
+    nothing but delimiters.
+    """
+    alphabet = "abcDE4901+-._@"
+    survivors = [
+        (value, mask(RawCell(value)).masked)
+        for length in (1, 2, 3)
+        for combination in itertools.product(alphabet, repeat=length)
+        if (value := "".join(combination)) in mask(RawCell(value)).masked
+    ]
+
+    assert survivors == []
+
+
+def test_a_value_that_is_only_delimiters_is_masked_too() -> None:
+    """Delimiters survive a mask because they are the shape *around* a value.
+    When they are the whole value there is no shape to keep, only a leak."""
+    assert mask(RawCell("-")).masked == "*"
+    assert mask(RawCell("???")).masked == "***"
 
 
 def test_a_long_value_collapses_instead_of_shaping_character_by_character() -> None:
