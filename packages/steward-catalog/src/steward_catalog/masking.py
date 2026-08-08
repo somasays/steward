@@ -176,9 +176,12 @@ MIN_CONCEALED_DENOMINATOR = 2
 A count alone is the wrong shape for a long value, and the gap was real rather
 than theoretical: `X-CONFIDENTIAL-CASE-2019://abc` published 21 of its 24
 alphanumerics and cleared an absolute floor of three, because the three
-characters after the separator were enough to satisfy it. So the requirement is
-`max(MIN_MASKED_ALNUM, half)` -- the count protects short values, where a
-fraction is nothing, and the fraction protects long ones, where a count is.
+characters after the separator were enough to satisfy it. The count protects
+short values, where a fraction is nothing; the fraction protects long ones,
+where a count is. `_required_concealment` composes them and is the only place
+that does -- this docstring deliberately does not restate the expression,
+because both earlier restatements were wrong the same way: they dropped the cap,
+and so demanded three concealed characters of a two-character value.
 
 An integer ratio rather than a float because this decides what gets published,
 and a rounding difference across platforms would make the guarantee itself

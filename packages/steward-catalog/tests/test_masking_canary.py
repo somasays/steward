@@ -1,8 +1,9 @@
 """H7 — the masking canary (GUARDRAILS.md §1 Tier H, I6, N7, issue #49).
 
 Secrets are planted in the fixture source's data (`conftest.FIXTURE_DATA`): an
-email, a payment card, an opaque token, and a value whose payload sits *after
-the last dot* -- each a string that occurs nowhere else in this repository. The
+email, a payment card, an opaque token, a value whose payload sits *after the
+last dot*, and one whose payload sits *before a `://`* -- each a string that
+occurs nowhere else in this repository. The
 real `profile_asset` handler is then executed the way production executes it --
 claimed off the queue by a real `Worker`, through the registered handler with
 the environment-backed secret resolver and the real Postgres profiler -- and the
@@ -26,13 +27,20 @@ Three things make the result mean something rather than merely be green:
   writes a canary into an audit row and asserts the sweep reports it, and the
   log half plants one through a lazy `%s` call -- an assertion that cannot fail
   is not evidence.
-* **A canary is evidence only for the shapes it takes.** That is not a caveat,
-  it is the lesson: the first three canaries all ended in `.test` or no dot at
-  all, and `_mask_email` published everything after the final dot verbatim, so
-  this harness watched a payload land in `profiles` and reported green through
-  a whole review cycle. `CANARY_AFTER_LAST_DOT` covers that shape now, and its
-  tail is swept for separately -- a mask leaking only the tail would leave the
-  full string absent and satisfy everything else here.
+* **A canary is evidence only for the shapes it takes, and only where it is
+  swept.** That is not a caveat, it is the lesson this file learned twice. The
+  first three canaries all ended in `.test` or had no dot, so when `_mask_email`
+  published everything after the final dot this harness watched the payload land
+  in `profiles` and reported green. `CANARY_AFTER_LAST_DOT` was added for that
+  region -- and `CANARY_BEFORE_SCHEME` for the URL scheme, the next leak, which
+  no canary was shaped for either.
+
+  Shape alone is not enough. A partial leak publishes the *payload*, not the
+  whole canary, so a sweep for the full string finds nothing: a regressed
+  `_mask_url` writes `X-CANARY-CASE-7d21e9f0://h***/****`, which does not
+  contain `CANARY_BEFORE_SCHEME`. So each of those two is swept for by its
+  payload as well -- `CANARY_TAIL` and `CANARY_HEAD` -- and those are the
+  assertions that would actually fail.
 
 What this cannot prove is stated in the PR and in GUARDRAILS' H7 row: it
 observes one masker over one fixture estate, and there are no prompts yet to
@@ -47,17 +55,19 @@ import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
 from psycopg import sql
 from steward_catalog import (
+    PROFILE_ASSET_TASK_TYPE,
     EnvSecretResolver,
     build_scan_source,
     postgres_inspector,
     register_source,
 )
-from steward_orchestration import PROFILE_ASSET_TASK_BUDGET, PROFILE_ASSET_TASK_TYPE
 from steward_queue import (
     SYSTEM_ACTOR,
     QueueConnection,
@@ -68,7 +78,7 @@ from steward_queue import (
     enqueue,
     write_audit,
 )
-from steward_schemas import SourceCreate, TaskSpec, TaskStatus
+from steward_schemas import RunBudget, SourceCreate, TaskSpec, TaskStatus
 from steward_telemetry import Span, SpanOutcome
 
 pytestmark = pytest.mark.invariants
@@ -79,6 +89,17 @@ SELECT_TABLES = "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORD
 SELECT_ASSET_IDS = "SELECT name, id FROM assets WHERE lifecycle = 'active'"
 SELECT_PROFILE = "SELECT profile FROM profiles WHERE asset_id = %(asset_id)s ORDER BY version DESC LIMIT 1"
 SELECT_TASK_STATES = "SELECT state, count(*) FROM tasks GROUP BY state"
+
+# Built here rather than imported from `steward_orchestration`. steward-catalog
+# does not declare that package as a dependency and must not: the boundary
+# contract in the root `pyproject.toml` says the catalog "must not learn about
+# goals", and a dev dependency would be a cycle, since orchestration already
+# declares a test-only dependency on this package. import-linter cannot see it
+# either way -- its `root_packages` are the `src/` trees, so a test-tree import
+# crosses the boundary invisibly. The task type itself comes from
+# `steward_catalog`, which exports it, and `test_goals.py` is where the two
+# packages' names are asserted equal.
+PROFILE_BUDGET = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0.000000"), wall_clock=timedelta(minutes=30))
 
 # `t::text` renders a whole row as one record literal, so this asks "does this
 # table contain the needle anywhere at all" without naming a column -- which is
@@ -205,7 +226,7 @@ def profiled(
     """
     monkeypatch.setenv(SOURCE_SECRET_ENV, source_dsn)
     targets = {name: scanned_source[name] for name in ("customers", "raw_events")}
-    run = create_run(conn, goal="profile_asset", budget=PROFILE_ASSET_TASK_BUDGET)
+    run = create_run(conn, goal="profile_asset", budget=PROFILE_BUDGET)
     for asset_id in targets.values():
         enqueue(
             conn,
@@ -214,7 +235,7 @@ def profiled(
                 run_id=run.id,
                 task_type=PROFILE_ASSET_TASK_TYPE,
                 payload={"asset_id": str(asset_id)},
-                budget=PROFILE_ASSET_TASK_BUDGET,
+                budget=PROFILE_BUDGET,
                 max_attempts=1,
             ),
         )
@@ -257,6 +278,22 @@ def test_the_canaries_were_actually_profiled(
     assert [span.task_type for span in profiled.tracer.spans] == [PROFILE_ASSET_TASK_TYPE] * len(
         profiled.targets
     )
+
+
+def test_nothing_before_a_canarys_scheme_separator_reaches_the_database(
+    conn: QueueConnection,
+    profiled: ProfileRun,
+    canary_head: str,
+) -> None:
+    """Escape #3 in canary form, swept the way it can actually be caught.
+
+    `_mask_url` published the scheme verbatim, and a regression doing so again
+    writes `X-CANARY-CASE-7d21e9f0://h***/****` -- which does not contain the
+    full canary, so the whole-string sweep returns nothing and the harness goes
+    green. The payload has to be swept on its own, exactly as the email tail is.
+    """
+    assert rows_containing(conn, canary_head) == {}
+    conn.rollback()
 
 
 def test_nothing_behind_a_canarys_last_dot_reaches_the_database(

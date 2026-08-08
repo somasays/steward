@@ -79,6 +79,16 @@ CANARY_TAIL = CANARY_AFTER_LAST_DOT.rpartition(".")[2]
 because a mask that published only the tail would leave the full string absent
 and every assertion green."""
 
+CANARY_HEAD = CANARY_BEFORE_SCHEME.partition("://")[0]
+"""The payload alone -- `X-CANARY-CASE-7d21e9f0` -- and the same necessity as
+`CANARY_TAIL`, which the first version of the scheme canary missed.
+
+A scheme-publishing regression writes `X-CANARY-CASE-7d21e9f0://h***/****`: the
+payload is right there, and the *full* canary is not a substring of it, so a
+sweep for the whole string returns nothing and H7 reports green. A canary that
+cannot detect the leak it was added for is worse than no canary, because the
+row in GUARDRAILS then claims a region is covered. Swept on its own below."""
+
 # The fixture estate. Two schemas so filtering has something to filter, a view
 # so `asset_type` has two values, and a nullable column so `nullable` does.
 FIXTURE_ESTATE: tuple[str, ...] = (
@@ -175,6 +185,12 @@ def canary_secret() -> str:
 def canary_tail() -> str:
     """The payload behind the last dot, swept for on its own."""
     return CANARY_TAIL
+
+
+@pytest.fixture(scope="session")
+def canary_head() -> str:
+    """The payload before the `://`, swept for on its own."""
+    return CANARY_HEAD
 
 
 @pytest.fixture(scope="session")
