@@ -72,11 +72,20 @@ class MaskedSample(SchemaModel):
     answer it. It is the one thing this model discloses beyond shape, and saying
     so in a field is better than a mask that leaks it by being length-preserving
     while claiming not to.
+
+    **It is `None` when a length would be the value.** A semantic type whose
+    domain is closed and tiny makes the size decisive rather than descriptive:
+    Postgres renders `boolean` as `true`/`false`, so `(BOOLEAN, 4)` and
+    `(BOOLEAN, 5)` name the two values exactly, and an `is_hiv_positive` column
+    would have published every sampled value and its distribution into an
+    append-only table (#49 review). The masker decides -- `steward_catalog`
+    holds the list of such types -- and a consumer that treats `length` as
+    always-present is the bug this optionality exists to surface.
     """
 
     masked: str
     semantic_type: SemanticType
-    length: int
+    length: int | None = None
 
 
 class ValueFrequency(SchemaModel):

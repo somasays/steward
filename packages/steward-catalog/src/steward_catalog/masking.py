@@ -44,7 +44,10 @@ design rule -- so the mask keeps delimiters and character classes and discards
 the payload. Uniformly: there is no exemption for numbers, booleans or dates.
 An account number is a number, a date of birth is a date, and an exemption is
 a hole the moment a customer's data disagrees with our intuition about which
-columns are sensitive. The cost is real and stated in SPEC.md §13 D10: a
+columns are sensitive. Where uniform masking is not *enough* -- a closed
+two-valued domain, where a length or a character-by-character shape names the
+value -- the answer is to publish less, not to make an exception
+(`CLOSED_DOMAIN_TYPES`). The cost is real and stated in SPEC.md §13 D10: a
 profile's `min_value`/`max_value` no longer support range reasoning, so M4's
 range rules will need a policy-gated unmasked path rather than this one.
 
@@ -146,6 +149,24 @@ Schemes without `://` are deliberately absent. `_URL` requires the separator, so
 `mailto:` and `data:` never reach this branch -- listing them would imply a
 safety this module does not provide for them, and a `data:` URI carries its
 payload inline. They are classified and masked as ordinary text.
+"""
+
+CLOSED_DOMAIN_TYPES = frozenset({SemanticType.BOOLEAN})
+"""Semantic types whose domain is closed and small enough that *any* faithful
+description of a value names it.
+
+A boolean renders as `true` or `false`, so publishing a length says which one:
+`(BOOLEAN, 4)` and `(BOOLEAN, 5)` are the two values, and shaping the mask
+character by character leaks the same thing a second way (`****` vs `*****`).
+An `is_hiv_positive` column would have published every sampled value *and* its
+distribution into an append-only table (#49 review) -- the last member of the
+family that began with the email TLD, and the one where the reveal was a field
+nobody thought of as a reveal.
+
+So a value of one of these types masks to a constant token and reports no
+length. What survives is the type, the distinct count and the frequencies --
+"this column is boolean and splits 90/10", without which way round. That is the
+honest remainder, and it is what a classifier (#50) works from anyway.
 """
 
 MIN_MASKED_ALNUM = 3
@@ -447,18 +468,12 @@ def _masked_text(text: str, semantic_type: SemanticType) -> str:
         return _mask_card(text)
     if semantic_type is SemanticType.URL:
         return _mask_url(text)
-    if semantic_type in (
-        SemanticType.UUID,
-        SemanticType.IP_ADDRESS,
-        SemanticType.TIMESTAMP,
-        SemanticType.BOOLEAN,
-    ):
-        # BOOLEAN joins these because the module claims no exemption and then
-        # had one: `true` masked to `****` only because it is four characters
-        # and the floor zeroed the request, while `false` -- five -- came out
-        # `f***e`. The suite contained no `false`, so the table encoded the
-        # case that happened to pass (#49 review). `semantic_type` and `length`
-        # already determine a boolean, so revealing its ends buys nothing.
+    if semantic_type in CLOSED_DOMAIN_TYPES:
+        # Constant width, so the mask itself does not encode which value it was
+        # (`****` vs `*****` is `true` vs `false`). `mask()` withholds the
+        # length for the same reason.
+        return MASK_RUN
+    if semantic_type in (SemanticType.UUID, SemanticType.IP_ADDRESS, SemanticType.TIMESTAMP):
         return _shape(text, keep_first=False, keep_last=0)
     if semantic_type is SemanticType.PHONE:
         # No suffix reveal. It used to keep the last two digits, on the reasoning
@@ -484,16 +499,23 @@ def mask(cell: RawCell) -> MaskedSample:
 
     The last two lines are the guarantee. Whatever a format's own mask produced,
     it is published only if it conceals enough of the value
-    (`_conceals_enough`); otherwise everything alphanumeric goes. So the
-    property holds for every branch that exists and every branch anyone adds --
-    a format can make a mask *more* legible, never less safe.
+    (`_conceals_enough`); otherwise everything alphanumeric goes. So the floor
+    holds for every branch that exists and every branch anyone adds, without
+    the branch knowing it exists.
+
+    What the gate bounds is *how much*, never *which*: it counts concealed
+    alphanumerics and has no opinion on which ones survive, so a branch is still
+    free to choose a bad half. That is why `KNOWN_SCHEMES` is a checked list
+    rather than a floor -- the gate is the backstop, and being deliberate about
+    what a branch publishes is still the branch's job.
     """
     text = cell._text
     semantic_type = infer_semantic_type(text)
     masked = _masked_text(text, semantic_type)
     if not _conceals_enough(text, masked):
         masked = _shape(text, keep_first=False, keep_last=0)
-    return MaskedSample(masked=masked, semantic_type=semantic_type, length=len(text))
+    length = None if semantic_type in CLOSED_DOMAIN_TYPES else len(text)
+    return MaskedSample(masked=masked, semantic_type=semantic_type, length=length)
 
 
 def mask_optional(cell: RawCell | None) -> MaskedSample | None:

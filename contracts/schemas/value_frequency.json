@@ -2,11 +2,19 @@
   "$defs": {
     "MaskedSample": {
       "additionalProperties": false,
-      "description": "One sampled value, after masking. The only form a sample is published in.\n\n`masked` is format-preserving (`j***@g***.***`, `4***-****-****-1234`), so\na downstream consumer can still see *shape* -- which is what classification\n(#50) and documentation (#51) work from (SPEC.md \u00a74, rule 2) -- without the\npayload.\n\n`length` is the original rendering's character count, kept because \"how long\nare the values in this column\" is a profiling question and the mask does not\nanswer it. It is the one thing this model discloses beyond shape, and saying\nso in a field is better than a mask that leaks it by being length-preserving\nwhile claiming not to.",
+      "description": "One sampled value, after masking. The only form a sample is published in.\n\n`masked` is format-preserving (`j***@g***.***`, `4***-****-****-1234`), so\na downstream consumer can still see *shape* -- which is what classification\n(#50) and documentation (#51) work from (SPEC.md \u00a74, rule 2) -- without the\npayload.\n\n`length` is the original rendering's character count, kept because \"how long\nare the values in this column\" is a profiling question and the mask does not\nanswer it. It is the one thing this model discloses beyond shape, and saying\nso in a field is better than a mask that leaks it by being length-preserving\nwhile claiming not to.\n\n**It is `None` when a length would be the value.** A semantic type whose\ndomain is closed and tiny makes the size decisive rather than descriptive:\nPostgres renders `boolean` as `true`/`false`, so `(BOOLEAN, 4)` and\n`(BOOLEAN, 5)` name the two values exactly, and an `is_hiv_positive` column\nwould have published every sampled value and its distribution into an\nappend-only table (#49 review). The masker decides -- `steward_catalog`\nholds the list of such types -- and a consumer that treats `length` as\nalways-present is the bug this optionality exists to surface.",
       "properties": {
         "length": {
-          "title": "Length",
-          "type": "integer"
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Length"
         },
         "masked": {
           "title": "Masked",
@@ -18,8 +26,7 @@
       },
       "required": [
         "masked",
-        "semantic_type",
-        "length"
+        "semantic_type"
       ],
       "title": "MaskedSample",
       "type": "object"

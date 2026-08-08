@@ -109,6 +109,57 @@ def test_top_values_are_ordered_by_frequency_then_value(profiler: SourceProfiler
     assert [frequency.count for frequency in total.top_values] == [2, 1]
 
 
+# Six distinct values competing for five sample slots, with a three-way tie
+# across the cut: `dates44`, `elder55` and `figgy66` all occur twice and only
+# two can be kept. `ORDER BY 2 DESC, 1 ASC` decides which; without the `1 ASC`
+# Postgres decides, and differently between plans. Seven characters each so
+# every mask is distinct (`a*****1`), which is what lets the assertion below
+# see the decision at all.
+TIED_COLUMN = (
+    "CREATE TABLE sales.tied (v text)",
+    "INSERT INTO sales.tied (v) VALUES "
+    "('apple11'),('apple11'),('apple11'),('apple11'),"
+    "('berry22'),('berry22'),('berry22'),"
+    "('cocoa33'),('cocoa33'),('cocoa33'),"
+    "('dates44'),('dates44'),"
+    "('elder55'),('elder55'),"
+    "('figgy66'),('figgy66')",
+    "GRANT SELECT ON sales.tied TO steward_reader",
+)
+
+
+def test_top_values_truncate_deterministically_when_a_tie_spans_the_cut(
+    profiler: SourceProfiler, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+) -> None:
+    """I8, at the one place a profile is not a pure aggregate.
+
+    `LIMIT` without a total order is the classic non-determinism, and the
+    fixture estate could not reach it: no column had more than four distinct
+    values, so `LIMIT 5` never truncated and the tie-break never decided
+    anything -- deleting `, 1 ASC` from `_TOP_VALUES` left the whole suite
+    green (#49 review). Here three values tie for two remaining slots, so the
+    tie-break picks the winners *and* orders the pair above them.
+    """
+    for statement in TIED_COLUMN:
+        source_admin.execute(statement)
+    target = ProfileTarget(schema_name="sales", name="tied", columns=(column("v"),))
+
+    first = profiler.profile(target)
+    second = profiler.profile(target)
+
+    [profile] = first.columns
+    assert [(f.value.masked, f.count) for f in profile.top_values] == [
+        ("a*****1", 4),
+        ("b*****2", 3),  # ties with cocoa33 on count; value order decides which is first
+        ("c*****3", 3),
+        ("d*****4", 2),  # three values tie for two slots; the two lowest win
+        ("e*****5", 2),
+    ]
+    assert "f*****6" not in [f.value.masked for f in profile.top_values]
+    assert profile.distinct_count == 6  # more distinct values than the sample carries
+    assert first == second
+
+
 def test_profiling_the_same_table_twice_returns_an_equal_profile(profiler: SourceProfiler) -> None:
     target = ProfileTarget(
         schema_name="sales", name="customers", columns=(column("email"), column("card", ordinal=2))

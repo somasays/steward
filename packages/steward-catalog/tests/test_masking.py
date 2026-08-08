@@ -43,12 +43,12 @@ CASES: tuple[tuple[str, SemanticType, str], ...] = (
     ("2026-08-08", SemanticType.TIMESTAMP, "****-**-**"),
     ("https://example.com/orders", SemanticType.URL, "https://e******.***/******"),
     ("-1234.50", SemanticType.NUMBER, "-1***.*0"),
-    # Booleans reveal nothing at any length. `true` used to pass only because
-    # four characters put it below the floor; `false` is five and came out
-    # `f***e`, and no `false` was in this table to say so (#49 review).
-    ("true", SemanticType.BOOLEAN, "****"),
-    ("false", SemanticType.BOOLEAN, "*****"),
-    ("t", SemanticType.BOOLEAN, "*"),
+    # Booleans mask to a constant token and publish no length: the domain is
+    # closed and two-valued, so `****` vs `*****` -- or `length` 4 vs 5 -- names
+    # the value outright (#49 review, `CLOSED_DOMAIN_TYPES`).
+    ("true", SemanticType.BOOLEAN, "***"),
+    ("false", SemanticType.BOOLEAN, "***"),
+    ("t", SemanticType.BOOLEAN, "***"),
     # Below the floor: nothing is revealed, because the first and last
     # character of a short value *are* the value (`MIN_MASKED_ALNUM`).
     ("", SemanticType.EMPTY, ""),
@@ -91,7 +91,7 @@ def test_a_value_is_inferred_and_masked(raw: str, semantic_type: SemanticType, m
 
     assert sample.semantic_type is semantic_type
     assert sample.masked == masked
-    assert sample.length == len(raw)
+    assert sample.length == (None if semantic_type is SemanticType.BOOLEAN else len(raw))
 
 
 @pytest.mark.parametrize(
@@ -274,6 +274,22 @@ def test_no_format_publishes_the_payload_in_the_segment_it_interpolates(template
 
     assert payload not in masked, f"{raw!r} -> {masked!r}"
     assert concealed(raw) >= _required_concealment(alnum_total(raw))
+
+
+def test_a_boolean_publishes_neither_its_value_nor_its_length() -> None:
+    """A closed two-valued domain makes any faithful description the value.
+
+    `true` is four characters and `false` is five, so a length -- or a mask
+    shaped character by character -- says which one, and an `is_hiv_positive`
+    column would have published every sampled value and its exact distribution
+    into an append-only table. What survives is the type and the frequencies.
+    """
+    yes, no = mask(RawCell("true")), mask(RawCell("false"))
+
+    assert yes.masked == no.masked  # indistinguishable
+    assert yes.length is None and no.length is None
+    assert yes == no
+    assert yes.semantic_type is SemanticType.BOOLEAN  # ...the type still survives
 
 
 def test_a_long_value_collapses_instead_of_shaping_character_by_character() -> None:

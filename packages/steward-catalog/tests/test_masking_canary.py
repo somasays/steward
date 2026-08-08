@@ -269,6 +269,37 @@ def profiled(
     return ProfileRun(targets=targets, tracer=tracer, logs=logs, stdout=console.out, stderr=console.err)
 
 
+SELECT_EVENTS_PROFILE = (
+    "SELECT profile FROM profiles WHERE asset_id = %(asset_id)s ORDER BY version DESC LIMIT 1"
+)
+
+
+def test_the_payload_canaries_were_actually_profiled(
+    conn: QueueConnection,
+    profiled: ProfileRun,
+    canary_head: str,
+    canary_tail: str,
+) -> None:
+    """The two payload-only sweeps need their own non-vacuity guard.
+
+    `test_the_canaries_were_actually_profiled` covers `customers.email`; the
+    head and tail canaries live in `staging.raw_events.body` and were relying on
+    it, which guards a different table. They pass today because that column has
+    four distinct values and `TOP_VALUE_LIMIT` is five -- lower the limit or
+    change sampling and both sweeps go vacuous while the task still reports
+    SUCCEEDED, which is the shape H7's own row warns about.
+    """
+    row = conn.execute(SELECT_EVENTS_PROFILE, {"asset_id": profiled.targets["raw_events"]}).fetchone()
+    conn.rollback()
+
+    assert row is not None, "the payload canaries' table was never profiled"
+    [body] = [column for column in row[0]["columns"] if column["name"] == "body"]
+    masked = [frequency["value"]["masked"] for frequency in body["top_values"]]
+    assert len(masked) >= 4, f"the canary rows were not sampled: {masked}"
+    assert all(canary_head not in value for value in masked)
+    assert all(canary_tail not in value for value in masked)
+
+
 def test_the_canaries_were_actually_profiled(
     conn: QueueConnection,
     profiled: ProfileRun,

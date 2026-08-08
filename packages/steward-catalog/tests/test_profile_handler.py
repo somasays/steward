@@ -85,8 +85,14 @@ def test_an_unresolvable_credential_fails_without_naming_one(
     assert result.status is TaskStatus.FAILED
     assert result.error is not None
     assert result.error.type == "urn:steward:source-credential-unavailable"
-    assert "hunter2" not in (result.error.detail or "")
-    assert MISSING_SECRET_REF in (result.error.detail or "")
+    detail = result.error.detail or ""
+    # The reference is safe to name; a DSN never is. Asserted as "no connection
+    # string shape survives" rather than by hunting a password literal -- the
+    # literal this copied from `test_scan_handler` cannot occur here, since this
+    # fixture's role has no password, so it was an assertion nothing could fail.
+    assert MISSING_SECRET_REF in detail
+    assert "://" not in detail
+    assert "@" not in detail
 
 
 def test_the_state_probe_reports_an_invalid_payload_rather_than_raising(
