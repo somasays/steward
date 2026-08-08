@@ -131,7 +131,7 @@ packages/
   steward-schemas/     # Pydantic models: API contracts, tool I/O, events (zero heavy deps)
   steward-queue/       # Postgres task queue: migrations, transactional enqueue, SKIP LOCKED claiming, worker loop
   steward-orchestration/ # Goal registry + deterministic planners: name, input schema, planner, allowed task types, budget
-  steward-catalog/     # Deterministic metadata catalog: secret resolution, read-only source inspection, convergent persistence
+  steward-catalog/     # Deterministic catalog: secret resolution, read-only source inspection, masked profiling, convergent persistence
   steward-agents/      # Agent runtime: owned contracts (tools, budgets, results); LangGraph contained here
   steward-retrieval/   # Hybrid search client: Qdrant + ES + fusion + rerank
   steward-llm/         # Thin LiteLLM client wrapper: typed completions; owns the endpoint allowlist and the startup refusal (I15)
@@ -181,7 +181,24 @@ caps sum to more than the goal's budget in any dimension. What the API
 advertises for a run is therefore what its tasks may spend between them, not
 per branch. `scan_source` stays single-task by choice (one round trip already
 enumerates a schema, and convergence diffs the whole catalog at once), not by
-necessity; profiling (#49) is the fan-out this unblocked.
+necessity.
+
+**Profiling (#49) shipped without fanning out, and the reason is worth
+recording** because this section predicted otherwise. Reservation makes an
+N-way plan *affordable*; it does not make one *knowable*. A planner is a pure
+function of its validated params and touches no connection, so a
+`profile_source(source_id)` goal cannot enumerate the source's assets at plan
+time — it would have to read the catalog, which is exactly what makes a planner
+impure and the determinism harness (`tests/test_goals.py`) meaningless. The
+other route, a handler enqueuing its own children, skips plan-time reservation
+altogether, which is the hole #48 exists to close. So `profile_asset(asset_id)`
+plans exactly one task and the *asset* is the unit that carries a budget. The
+second reason is #48's own scope: reservation counts each planned task once and
+spend on failed or retried attempts is debited nowhere ([D9](#13-key-design-decisions)),
+so a fan-out would multiply an unaccounted tail under one advertised cap. A
+per-source expansion belongs with the accounting that can bound it — a planner
+that may consult the catalog, or usage carried on the failure path — not with
+this slice.
 
 The mechanism is *not* the one this section previously promised (accumulated
 `runs.used_*` compared against `runs.budget_*` by the runtime, arriving with the
@@ -239,7 +256,7 @@ Actions with governance weight — publishing PII classifications, activating pr
 Two design rules apply across all agents:
 
 1. **Evidence or it didn't happen.** Documentarian, Classifier, and Librarian outputs must reference evidence (profile fields, sampled values, retrieved documents). Unsupported claims fail schema validation.
-2. **Sensitive values never reach the model raw.** Sampling tools apply format-preserving masking (`j***@g***.com`, `4***-****-****-1234`) before values enter a prompt; classification works from formats, names, and statistics, not raw payloads.
+2. **Sensitive values never reach the model raw.** Sampling tools apply format-preserving masking (`j***@g***.com`, `4***-****-****-1234`) before values enter a prompt; classification works from formats, names, and statistics, not raw payloads. **Landed with #49**, as a type rather than a convention: a value read out of a source is a `RawCell`, which is not a `str` and satisfies no parameter typed for data, and the only function that reads one returns a `MaskedSample` — which is what every value-carrying field of a profile is declared as. The rule is therefore checked by `mypy --strict` (G2) and watched end to end by H7 ([D10](#13-key-design-decisions)).
 
 ---
 
@@ -335,6 +352,20 @@ credential cannot be written to the database at all (N7). And there is no
 `last_seen_at`: a timestamp touched by every scan would make "a rescan with no
 upstream change leaves byte-identical state" false by construction. What was
 seen when is what `audit_log` records.
+
+`profiles` landed with issue #49 and carries two guarantees of its own.
+`(asset_id, version)` is unique, so two profilers racing on one asset cannot
+both write version 4 — the history is a total order rather than a fork — and
+the row carries the **digest** of the `TableProfile` it holds, which is what
+makes re-profiling converge: a computed profile whose digest equals the latest
+stored one is not written at all, so an append-only table does not grow a row
+per scheduled profile of a table nobody has touched (I8, the same property
+`plan_convergence` gives a rescan). The profile itself is JSONB, so what a
+profile *says* can grow — #50's classification evidence, #51's documentation
+hooks — without a migration, while the row around it stays fixed. There is no
+`UPDATE` or `DELETE` statement for the table anywhere in the codebase. Every
+value inside the JSONB is a `MaskedSample`: the type has no field a raw string
+can be assigned to, so this table cannot hold a customer value (I6).
 
 Notable choices: profiles and documents are **append-only versioned** (stewardship history is a feature — "what did this table look like in March?"); the task queue lives in Postgres rather than a broker (see [D2](#13-key-design-decisions)); `audit_log` is written from the same transactions as the mutations they record; `runs.trace_id` is `NOT NULL` and `runs.idempotency_key` is uniquely indexed, so an untraceable run and a duplicated `POST /v1/runs` are both unrepresentable rather than merely discouraged.
 
@@ -536,7 +567,7 @@ Enforcement is a runtime refusal rather than documentation, because the failure 
 Rejected: ***hosted default with a self-hosted option*** — the status quo, and the reason this issue exists: the safe configuration was the one you had to remember, and nothing failed when you forgot. ***Documentation plus review*** — the diff that breaches this does not look like a breach; it is one plausible URL in a YAML file. ***A lint over the committed config alone*** — it would pass while a cluster mounts a different config, so the check has to live where the config is loaded; S9 runs the same code over the committed file as a fast gate, but the boot-time refusal is the actual enforcement. ***An egress NetworkPolicy alone*** — necessary (it lands with the M6 chart) and not sufficient: it cannot distinguish an approved endpoint from a proxy to a hosted one, and it fails closed at the wrong altitude, as a timeout during a run rather than a refusal at startup.
 
 **D9 — A run's budget is divided among its tasks at planning time, not handed to each of them.**
-Every planned task used to carry the *run's* whole budget, so a plan of N tasks could spend N times the cap the API published for that run — the reason `scan_source` shipped as exactly one task (#20, #37) and the reason profiling could not fan out at all (#48, #49). A plan now states how it divides the pot: each `PlannedTask` declares its own `RunBudget`, `GoalRegistration.plan` sums those declarations dimension-wise, and an expansion reserving more than the goal's budget in *any* dimension raises `RunBudgetExceeded`. That happens before a run id, a run row or a task row exists, so a plan nobody can afford leaves nothing behind — the same property #19 gave an unknown goal and #37 gave an empty plan, reached the same way. A goal whose own `sample_payload` cannot be afforded fails at import, because registration already runs the sample through `plan()`.
+Every planned task used to carry the *run's* whole budget, so a plan of N tasks could spend N times the cap the API published for that run — the reason `scan_source` shipped as exactly one task (#20, #37) and the reason profiling could not fan out at all (#48, #49). (Profiling still does not fan out, and #48 is not why any more: a planner cannot enumerate a source's assets without reading the catalog, which would make it impure — §3.1 and D10.) A plan now states how it divides the pot: each `PlannedTask` declares its own `RunBudget`, `GoalRegistration.plan` sums those declarations dimension-wise, and an expansion reserving more than the goal's budget in *any* dimension raises `RunBudgetExceeded`. That happens before a run id, a run row or a task row exists, so a plan nobody can afford leaves nothing behind — the same property #19 gave an unknown goal and #37 gave an empty plan, reached the same way. A goal whose own `sample_payload` cannot be afforded fails at import, because registration already runs the sample through `plan()`.
 
 *Why declaration rather than division.* An **equal split** needs no planner to say anything, and breaks immediately: `steps=1` over three tasks is zero steps each, and every task fails instantly against a cap of nothing. It is also wrong in principle for the DAG this exists to enable — `discover_schema` and `profile_table` do not cost the same, and a scheme that pretends they do forces the run budget up to N times the most expensive branch. **Sequential reservation with a remainder** (fund tasks in order until the pot is empty) was rejected for making the outcome depend on plan order and for turning "this plan is too expensive" into "the last few branches got less", which is a truncation wearing a reservation's clothes. Declaration puts the number where the knowledge is, at the one registration site per goal, and makes the check order-independent arithmetic.
 
@@ -549,3 +580,13 @@ Every planned task used to carry the *run's* whole budget, so a plan of N tasks 
 *Where the bound stops.* Reservation counts each task **once**, so the run's budget bounds one pass of the plan. A task that fails and retries executes again under its own cap, and that spend is neither reserved nor recorded — the failure path carries no usage to record, so `runs.used_*` counts succeeded tasks only and is a lower bound on real consumption (bounded above by `max_attempts` × the reservation). Multiplying the reservation by `max_attempts` was rejected: it would triple every advertised budget to defend a claim the accounting cannot see, and retry spend exceeding the advertised cap is a property single-task runs already had rather than something fan-out introduces. Closing it properly means carrying usage on the failure path, which is a change to `tasks.fail`'s contract and belongs with the agent loop that will make the numbers non-trivial. One smaller conservatism in the same direction: two planned tasks with identical type and payload reserve twice but dedupe to one row at enqueue, so such a plan reserves more than it can spend.
 
 Rejected also: ***run-level enforcement at execution time*** — comparing accumulated `runs.used_*` against `runs.budget_*` as each task finishes, which is what SPEC §3.1 originally promised. It arrives too late to be a refusal (the tasks are enqueued and some have already run), it turns "this plan is unaffordable" into "the last tasks of this run fail for reasons the first ones caused", and it needs a lock on the run row on every terminal transition. It is also strictly weaker: reservation makes the overrun unrepresentable, so there is nothing left for the run-level check to catch except a handler lying about its usage — which is exactly what the per-task check above covers, one task earlier and with a failure that names the task that caused it.
+
+**D10 — Masking is a type, not a discipline; profiling reads `::text` through composed identifiers.**
+I6 says masking is the *only* path from a sampled value to a prompt. Until #49 there was nothing to mask — the catalog slice read metadata — and the invariant was review-enforced (GUARDRAILS §5). Profiling reads customer values, so it had to become a mechanism, and the mechanism is the type system rather than a rule: a value read out of a source is a `RawCell`, a frozen wrapper that is deliberately **not** a `str` (the same choice `Secret` makes for credentials, for the same reason — a `str` subclass is substitutable into every log call, f-string and JSON dump), and the one function that reads its characters returns a `MaskedSample`. Every value-carrying field of a profile — `min_value`, `max_value`, every entry of `top_values` — is declared as `MaskedSample`, so a raw value cannot be persisted, returned, or passed to the prompt builders #50 will add: not because a reviewer would catch it, but because `mypy --strict` rejects it (G2). `RawCell` also redacts itself in `repr`/`str`, which covers the accidental `%s` that types cannot. H7 covers the rest — logs, console, spans — end to end, with canaries planted in fixture data.
+
+*Masking is uniform, and that costs something real.* There is no exemption for numbers, booleans or dates: an account number is a number and a date of birth is a date, and an exemption is a hole the moment a customer's data disagrees with our intuition about which columns are sensitive. The consequence is that a profile's `min_value`/`max_value` no longer support range reasoning — `1***5` orders no better than nothing — so M4's range rules will need a policy-gated path to unmasked aggregates rather than this one. Accepted because the alternative starts as "numbers are safe" and ends as a leak, and because classification and documentation (#50, #51) are specified to work from shape, name and statistics anyway (§4, rule 2).
+
+*Every value is profiled through its `::text` rendering,* which is what lets one code path cover every column type a source can hold: `json` has no equality operator, so `count(DISTINCT json)` fails; several types have no `min`/`max` aggregate at all; and the masker would otherwise need a branch per driver type instead of one function over text. The cost is that `min`/`max` are lexicographic rather than numeric — visible in the profile, and moot for a masked value anyway.
+
+*Identifiers are composed, and that is not string-assembled SQL.* Profiling a column has to name a relation and a column, and no database binds an identifier as a parameter. The templates are static `psycopg.sql.SQL` constants; the only substitution is a `psycopg.sql.Identifier`, which psycopg renders with the server's own quoting rules, so `evil"; DROP TABLE customers; --` arrives as one quoted identifier and is asserted to (`tests/test_profiler.py`). Two constraints outside the module keep that safe rather than merely correct: the identifiers come from `assets`/`columns` rows a scan read out of `pg_catalog`, never from a request (a client names an *asset id*), and the connection is the read-only role's, so a statement that got past both still cannot write. This is what §13 D5's "parameterized templates" means for the Profiler.
+Rejected: ***`quote_ident` on the server*** — a round trip per identifier to reimplement what the driver already does correctly; ***a per-column task*** — see §3.1, a planner cannot enumerate what to fan out to; ***an allowlist regex over identifiers*** — it would reject legal names customers actually use (`"order date"`, non-ASCII) while adding a second, weaker guard next to quoting that is already total.
