@@ -21,8 +21,13 @@ from uuid import UUID
 from fastapi import APIRouter, Header, Response, status
 from steward_schemas import ProblemDetails, Run, Source, SourceCreate
 
-from steward_api.catalog import SOURCE_LOCATION_PREFIX, CatalogStore, SourceNotFound
-from steward_api.problem_details import conflict, not_found
+from steward_api.catalog import (
+    SOURCE_LOCATION_PREFIX,
+    CatalogStore,
+    IdempotencyKeyUnbindable,
+    SourceNotFound,
+)
+from steward_api.problem_details import conflict, idempotency_key_unbindable, not_found
 from steward_api.store import RUN_LOCATION_PREFIX, IdempotencyKeyReused
 
 IdempotencyKey = Annotated[str | None, Header(alias="Idempotency-Key")]
@@ -39,7 +44,13 @@ _NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
     404: {"model": ProblemDetails, "description": "Source not found"}
 }
 _CONFLICT_RESPONSE: dict[int | str, dict[str, Any]] = {
-    409: {"model": ProblemDetails, "description": "Idempotency key reused with a different request"}
+    409: {
+        "model": ProblemDetails,
+        "description": (
+            "Idempotency key reused with a different request, or answered by a run "
+            "already carrying a different key of its own"
+        ),
+    }
 }
 _INTERNAL_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
     500: {"model": ProblemDetails, "description": "Unexpected server error"}
@@ -87,6 +98,10 @@ def build_router(store: CatalogStore) -> APIRouter:
             raise not_found(str(exc), instance=f"{SOURCE_LOCATION_PREFIX}{source_id}") from exc
         except IdempotencyKeyReused as exc:
             raise conflict(str(exc), instance=f"{RUN_LOCATION_PREFIX}{exc.existing.id}") from exc
+        except IdempotencyKeyUnbindable as exc:
+            raise idempotency_key_unbindable(
+                str(exc), instance=f"{RUN_LOCATION_PREFIX}{exc.existing.id}"
+            ) from exc
         response.headers["Location"] = f"{RUN_LOCATION_PREFIX}{run.id}"
         return run
 

@@ -81,6 +81,26 @@ def conflict(detail: str, *, instance: str | None = None) -> ProblemDetailsError
     )
 
 
+def idempotency_key_unbindable(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `409 Conflict` for an idempotency key single-flight answered with a
+    run that already carries a different key of its own (issue #47).
+
+    A distinct `type` from `conflict()`'s: the request named the same work as
+    the run it got back -- this is not a key reused for a different request,
+    it is two legitimate requests for the same work whose keys cannot both be
+    remembered by a run that stores one.
+    """
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:idempotency-key-unbindable",
+            title="Idempotency key could not be bound to this run",
+            status=status.HTTP_409_CONFLICT,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
 def unknown_goal(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
     """A `422` problem for a `goal` no planner is registered for (issue #19).
 
