@@ -106,7 +106,6 @@ without it every 16-digit surrogate key in a warehouse would be a credit card,
 which is a false positive that would then drive a classification (#50)."""
 
 CARD_GROUP = 4
-CARD_REVEALED_SUFFIX = 4
 
 KNOWN_SCHEMES = frozenset(
     {
@@ -386,16 +385,31 @@ def _mask_email(text: str) -> str:
 
 
 def _mask_card(text: str) -> str:
-    """`4111111111111111` -> `4***-****-****-1234` (SPEC.md §4).
+    """`4111111111111111` -> `****-****-****-****` (SPEC.md §4, amended by #49).
 
-    The first digit (the issuer network) and the last four (what a human uses
-    to recognise their own card) survive; everything between is masked and the
-    digits are regrouped in fours, so the mask reads as a card whatever
-    separators the source used.
+    **Nothing is revealed, and the last-four exemption this used to carry was
+    the third instance of one mistake.** It published the issuer digit and the
+    last four -- "what a human uses to recognise their own card" -- on the
+    strength of `_is_card`, which is a Luhn checksum over the value itself.
+    A checksum is not membership in a closed set: it is a property the value
+    computes about itself, so it is exactly the positional inference the TLD and
+    the scheme were, wearing arithmetic instead of position.
+
+    What it published: an **IMEI is Luhn-valid by specification**, so every row
+    of a device-identifier column classified as a card and had its last four
+    digits written permanently into `profiles` (`490154203237518` ->
+    `4***-****-***7-518`), and roughly one in ten arbitrary 13-19 digit account
+    or order ids did the same. Last-four is the canonical partial account
+    identifier, and it sits in the row next to `length` and `distinct_count`.
+
+    The grouping survives because it is shape, not payload: a reader still sees
+    a card-shaped value, and `semantic_type` names it. This is the same trade
+    the phone suffix took (`_masked_text`) and for the same reason -- a reveal
+    justified by a value *looking* like something is an exemption, and D10 rules
+    those out.
     """
     digits = _DIGITS.sub("", text)
-    revealed = {0, *range(len(digits) - CARD_REVEALED_SUFFIX, len(digits))}
-    masked = "".join(char if index in revealed else MASK_CHAR for index, char in enumerate(digits))
+    masked = MASK_CHAR * len(digits)
     groups = [masked[start : start + CARD_GROUP] for start in range(0, len(masked), CARD_GROUP)]
     return "-".join(groups)
 

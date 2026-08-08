@@ -77,9 +77,14 @@ def test_a_columns_semantic_type_comes_from_its_values(profiler: SourceProfiler,
 
     [card] = profile.columns
     assert card.semantic_type is SemanticType.CREDIT_CARD
-    assert [frequency.value.masked for frequency in card.top_values] == ["4***-****-****-1486"]
+    # No digit of the card reaches the profile -- not even the last four, which
+    # this used to assert as expected behaviour. `_is_card` is a Luhn checksum
+    # over the value, so it fires on IMEIs and on roughly one in ten long
+    # numeric ids; a reveal riding on it published their tails too (#49 review).
+    assert [frequency.value.masked for frequency in card.top_values] == ["****-****-****-****"]
     assert card.null_count == 1
     assert canary_card not in card.top_values[0].value.masked
+    assert canary_card[-4:] not in card.top_values[0].value.masked
 
 
 def test_top_values_are_ordered_by_frequency_then_value(profiler: SourceProfiler) -> None:

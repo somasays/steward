@@ -25,9 +25,14 @@ CASES: tuple[tuple[str, SemanticType, str], ...] = (
     ("john.doe@gmail.com", SemanticType.EMAIL, "j***@g***.***"),
     ("ada@mail.example.co.uk", SemanticType.EMAIL, "***@m***.**"),
     ("a@b.co", SemanticType.EMAIL, "***@***.**"),
-    ("4111111111111111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
-    ("4111-1111-1111-1111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
-    ("378282246310005", SemanticType.CREDIT_CARD, "3***-****-***0-005"),
+    ("4111111111111111", SemanticType.CREDIT_CARD, "****-****-****-****"),
+    ("4111-1111-1111-1111", SemanticType.CREDIT_CARD, "****-****-****-****"),
+    ("378282246310005", SemanticType.CREDIT_CARD, "****-****-****-***"),
+    # An IMEI is Luhn-valid by specification, so every one classifies as a card.
+    # Nothing is revealed, which is the point: the classification is a guess the
+    # value makes about itself, and a reveal riding on it published the last four
+    # digits of every device identifier in a column.
+    ("490154203237518", SemanticType.CREDIT_CARD, "****-****-****-***"),
     ("+1 (555) 010-0199", SemanticType.PHONE, "+* (***) ***-****"),
     # `_PHONE` is a superset of every 9-11 digit identifier, so a suffix reveal
     # here would publish the last two digits of an SSN (`***-**-**89`).
@@ -176,9 +181,39 @@ FORMAT_TEMPLATES: tuple[str, ...] = (
     "https://{payload}/path",  # the authority slot
     "https://host/{payload}",  # the path slot
     "+1-555-{payload}",  # the phone tail
-    "4111-1111-1111-{payload}",  # the card tail
     "{payload}",  # no format at all
 )
+
+# The card branch needs its own sweep: a payload spliced into
+# `4111-1111-1111-{payload}` stops the value being digits-only and Luhn-valid,
+# so it never enters `_mask_card` at all -- the slot looked covered and was
+# inert, which is how the last-four reveal survived four review rounds. These
+# are real Luhn-valid identifiers of card length, including an IMEI (Luhn-valid
+# by specification) and a surrogate key that passes by luck.
+LUHN_VALID_IDENTIFIERS: tuple[str, ...] = (
+    "4111111111111111",
+    "4111-1111-1111-1111",
+    "378282246310005",
+    "490154203237518",
+    "1234567890123452",
+    "4539578763621486",
+)
+
+
+@pytest.mark.parametrize("raw", LUHN_VALID_IDENTIFIERS)
+def test_a_card_shaped_value_publishes_no_digit_of_itself(raw: str) -> None:
+    """The card branch reveals nothing, so a false positive costs nothing.
+
+    Asserted over the digits rather than the string: the mask regroups in fours,
+    so a substring check would miss a digit that survived into a different
+    group.
+    """
+    masked = mask(RawCell(raw)).masked
+
+    assert not any(char.isdigit() for char in masked), f"{raw!r} -> {masked!r}"
+    assert set(masked) <= {"*", "-"}
+    assert concealed(raw) == alnum_total(raw)
+
 
 # Payloads a real column holds and nobody would want republished. Two
 # characters minimum: a one-character payload landing in the last slot of a
@@ -252,10 +287,20 @@ def test_a_recognised_format_keeps_its_shape_however_long_it_is() -> None:
     )
 
 
-def test_a_sixteen_digit_surrogate_key_is_not_a_credit_card() -> None:
-    """The Luhn check is what keeps warehouse ids out of the card bucket -- a
-    false positive here would drive a false classification in #50."""
-    assert mask(RawCell("1234567890123456")).semantic_type is SemanticType.NUMBER
+def test_the_luhn_check_reduces_card_false_positives_but_cannot_remove_them() -> None:
+    """What the Luhn filter does and does not buy, stated honestly.
+
+    It keeps *most* warehouse ids out of the card bucket -- but a checksum is a
+    property the value computes about itself, not membership in a closed set, so
+    roughly one in ten long numeric ids passes it, and an IMEI passes by
+    specification. The earlier version of this test picked a Luhn-*invalid*
+    number and concluded warehouse ids were safe, which proved only that this
+    one was. The real defence is that the card branch reveals nothing.
+    """
+    assert mask(RawCell("1234567890123456")).semantic_type is SemanticType.NUMBER  # Luhn-invalid
+    passes_luhn = mask(RawCell("1234567890123452"))
+    assert passes_luhn.semantic_type is SemanticType.CREDIT_CARD  # a false positive we cannot avoid
+    assert passes_luhn.masked == "****-****-****-****"  # ...and it costs nothing, because nothing is revealed
 
 
 def test_masking_is_deterministic() -> None:
