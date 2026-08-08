@@ -84,16 +84,24 @@ def test_a_columns_semantic_type_comes_from_its_values(profiler: SourceProfiler,
 
 def test_top_values_are_ordered_by_frequency_then_value(profiler: SourceProfiler) -> None:
     """Determinism (I8): `LIMIT` without a total order would make two profiles
-    of the same table disagree about which values they sampled."""
+    of the same table disagree about which values they sampled.
+
+    Both values here mask to `**.**` -- they are four digits each, below the
+    floor at which a mask reveals anything -- so the frequencies are what
+    distinguishes them. That is the privacy trade working as designed, not a
+    lost assertion: the ordering is asserted on the counts, which is what the
+    query orders by.
+    """
     profile = profiler.profile(
         ProfileTarget(schema_name="sales", name="orders", columns=(column("total", "numeric"),))
     )
 
     [total] = profile.columns
     assert [(frequency.value.masked, frequency.count) for frequency in total.top_values] == [
-        ("1*.*0", 2),
-        ("9*.*9", 1),
+        ("**.**", 2),
+        ("**.**", 1),
     ]
+    assert [frequency.count for frequency in total.top_values] == [2, 1]
 
 
 def test_profiling_the_same_table_twice_returns_an_equal_profile(profiler: SourceProfiler) -> None:

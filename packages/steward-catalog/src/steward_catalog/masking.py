@@ -23,7 +23,12 @@ protection against code that deliberately reaches for the private attribute, or
 against a library writing to a file descriptor -- which is why H7 exists and
 runs canaries end to end (GUARDRAILS.md §1, Tier H).
 
-**Masks are format-preserving, not value-preserving.** Classification (#50) and
+**Masks are format-preserving, not value-preserving, and there is a floor.** A
+mask reveals a character or two so a human reviewer can read a profile, which is
+the whole value on a short one -- so below `MIN_MASKED_ALNUM` hidden characters
+a segment reveals none. The property the rest of the system may rely on is
+therefore "at least three characters of every non-empty value are unknown",
+not merely "the mask is not the value". Classification (#50) and
 documentation (#51) work from shape, name and statistics -- SPEC.md §4's second
 design rule -- so the mask keeps delimiters and character classes and discards
 the payload. Uniformly: there is no exemption for numbers, booleans or dates.
@@ -93,6 +98,20 @@ which is a false positive that would then drive a classification (#50)."""
 CARD_GROUP = 4
 CARD_REVEALED_SUFFIX = 4
 PHONE_REVEALED_SUFFIX = 2
+
+MIN_MASKED_ALNUM = 3
+"""How many alphanumerics must remain hidden for a mask to reveal any.
+
+The floor that keeps "format-preserving" from collapsing into "value-preserving"
+on short values. A mask reveals its first and last character to stay legible;
+on `M`, `42` or `9.5` that is the whole value, so below this floor a segment
+reveals nothing at all. Three rather than one because the guarantee worth
+stating is not "the mask differs from the value" -- `4*` differs from `42` and
+tells you everything -- but "at least three characters of it are unknown".
+
+A payment card is exempt by arithmetic rather than by choice: `CARD_DIGITS`
+starts at 13 and five digits are revealed, so eight always remain.
+"""
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -177,16 +196,34 @@ def _shape(text: str, *, keep_first: bool, keep_last: int) -> str:
     masked profile legible to a human reviewer, and revealing one character of
     a value is the smallest disclosure that does it. Types that gain nothing
     from it -- a UUID, an IP, a timestamp -- reveal none.
+
+    **The floor comes first.** A request to keep characters is honoured only
+    when `MIN_MASKED_ALNUM` of them would still be hidden afterwards; otherwise
+    nothing is revealed. Without it, "keep the first and the last" is the
+    identity function on any value with two alphanumerics or fewer -- `M`, `42`,
+    `O+`, `9.5` -- so a `gender`, `blood_type` or single-digit-score column
+    would have published its entire value domain verbatim, into an append-only
+    table, while satisfying every type in the system (a `MaskedSample` was
+    constructed; its payload merely equalled the input). Caught by the
+    architecture guardian on #49 before merge.
     """
     positions = [index for index, char in enumerate(text) if char.isalnum()]
+    wanted = (1 if keep_first else 0) + keep_last
+    if len(positions) - wanted < MIN_MASKED_ALNUM:
+        wanted = 0
     revealed = set()
-    if keep_first and positions:
+    if keep_first and wanted and positions:
         revealed.add(positions[0])
-    if keep_last:
+    if keep_last and wanted:
         revealed.update(positions[-keep_last:])
     return "".join(
         char if not char.isalnum() or index in revealed else MASK_CHAR for index, char in enumerate(text)
     )
+
+
+def _revealed_prefix(part: str) -> str:
+    """A segment's first character, or nothing when the floor forbids it."""
+    return part[0] if len(part) - 1 >= MIN_MASKED_ALNUM else ""
 
 
 def _collapsed(text: str) -> str:
@@ -195,10 +232,16 @@ def _collapsed(text: str) -> str:
 
 
 def _mask_email(text: str) -> str:
-    """`john.doe@gmail.com` -> `j***@g***.com` (SPEC.md §4)."""
+    """`john.doe@gmail.com` -> `j***@g***.com` (SPEC.md §4).
+
+    Each side is subject to the same floor `_shape` applies: a local part or a
+    domain name short enough that its first character would give it away keeps
+    nothing (`a@b.co` -> `***@***.co`). The TLD survives whatever its length --
+    it is a public taxonomy, not a payload.
+    """
     local, _, domain = text.partition("@")
     name, _, tld = domain.rpartition(".")
-    return f"{local[0]}{MASK_RUN}@{name[0]}{MASK_RUN}.{tld}"
+    return f"{_revealed_prefix(local)}{MASK_RUN}@{_revealed_prefix(name)}{MASK_RUN}.{tld}"
 
 
 def _mask_card(text: str) -> str:

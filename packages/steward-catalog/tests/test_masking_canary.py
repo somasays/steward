@@ -121,6 +121,23 @@ class RecordingTracer:
         yield span
 
 
+@dataclass
+class ProfileRun:
+    """What one canary-profiling run produced, in the three places it could leak.
+
+    Log records are rendered rather than kept raw: a handler that passed a
+    value as a lazy `%s` argument leaks it through `getMessage()` while its
+    format string looks perfectly clean, and that is the shape this hunts.
+    """
+
+    targets: dict[str, UUID]
+    tracer: RecordingTracer
+    logs: list[str]
+
+    def logged(self) -> str:
+        return "\n".join(self.logs)
+
+
 def steward_tables(conn: QueueConnection) -> list[str]:
     return [row[0] for row in conn.execute(SELECT_TABLES).fetchall()]
 
@@ -164,13 +181,19 @@ def profiled(
     scanned_source: dict[str, UUID],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-) -> tuple[dict[str, UUID], RecordingTracer]:
+) -> ProfileRun:
     """Profile the canary-bearing tables the way production does.
 
     Through the *registered* handler -- environment-backed secrets, the real
     profiler -- claimed off the queue by a real `Worker`, so the spans, the log
     records and the rows this harness inspects are the ones a deployment would
     produce.
+
+    The captured log records are carried on the result rather than read back
+    off `caplog` in the test: profiling happens during *setup*, and
+    `caplog.records` in a test body holds the call phase's records only -- so a
+    test that read it directly would assert over an empty list and pass on work
+    it never saw.
     """
     monkeypatch.setenv(SOURCE_SECRET_ENV, source_dsn)
     targets = {name: scanned_source[name] for name in ("customers", "raw_events")}
@@ -199,23 +222,23 @@ def profiled(
     )
     with caplog.at_level(logging.DEBUG):
         assert asyncio.run(worker.run_once()) == len(targets)
+        logs = [record.getMessage() for record in caplog.records]
     # A failed task would leave nothing profiled and make every assertion below
     # true for the wrong reason -- the shape GUARDRAILS.md §3 warns about.
     states = conn.execute(SELECT_TASK_STATES).fetchall()
     conn.rollback()
     assert states == [(TaskState.SUCCEEDED.value, len(targets))], states
-    return targets, tracer
+    return ProfileRun(targets=targets, tracer=tracer, logs=logs)
 
 
 def test_the_canaries_were_actually_profiled(
     conn: QueueConnection,
-    profiled: tuple[dict[str, UUID], RecordingTracer],
+    profiled: ProfileRun,
     canary_email: str,
 ) -> None:
     """The guard against a vacuous pass: a profile that never read the canary
     column would satisfy every assertion below for the wrong reason."""
-    targets, tracer = profiled
-    row = conn.execute(SELECT_PROFILE, {"asset_id": targets["customers"]}).fetchone()
+    row = conn.execute(SELECT_PROFILE, {"asset_id": profiled.targets["customers"]}).fetchone()
     conn.rollback()
 
     assert row is not None, "the canary table was never profiled"
@@ -223,12 +246,14 @@ def test_the_canaries_were_actually_profiled(
     masked = [frequency["value"]["masked"] for frequency in columns["email"]["top_values"]]
     assert "c***@s***.test" in masked  # the canary row, and only in masked form
     assert canary_email not in masked
-    assert [span.task_type for span in tracer.spans] == [PROFILE_ASSET_TASK_TYPE] * len(targets)
+    assert [span.task_type for span in profiled.tracer.spans] == [PROFILE_ASSET_TASK_TYPE] * len(
+        profiled.targets
+    )
 
 
 def test_no_canary_reaches_any_row_of_stewards_database(
     conn: QueueConnection,
-    profiled: tuple[dict[str, UUID], RecordingTracer],
+    profiled: ProfileRun,
     canaries: tuple[str, ...],
 ) -> None:
     """I6/N7 over the system of record, table by table -- including the ones
@@ -241,13 +266,18 @@ def test_no_canary_reaches_any_row_of_stewards_database(
 
 
 def test_no_canary_reaches_a_log_line_or_the_console(
-    profiled: tuple[dict[str, UUID], RecordingTracer],
+    profiled: ProfileRun,
     canaries: tuple[str, ...],
-    caplog: pytest.LogCaptureFixture,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    """The paths types cannot cover, which is the reason H7 exists at all."""
-    logged = "\n".join(record.getMessage() for record in caplog.records)
+    """The paths types cannot cover, which is the reason H7 exists at all.
+
+    The non-emptiness assertion is the point of the first line: `canary not in
+    ""` passes on a capture of nothing, so without it this test would be green
+    on work it never inspected (GUARDRAILS.md §3).
+    """
+    assert profiled.logs, "no log records were captured; these assertions would be vacuous"
+    logged = profiled.logged()
     captured = capfd.readouterr()
 
     for canary in canaries:
@@ -257,13 +287,12 @@ def test_no_canary_reaches_a_log_line_or_the_console(
 
 
 def test_no_canary_reaches_a_trace_payload(
-    profiled: tuple[dict[str, UUID], RecordingTracer],
+    profiled: ProfileRun,
     canaries: tuple[str, ...],
 ) -> None:
-    _, tracer = profiled
-    assert tracer.spans, "no spans were opened; this assertion would be vacuous"
+    assert profiled.tracer.spans, "no spans were opened; this assertion would be vacuous"
 
-    payloads = " ".join(span.payload() for span in tracer.spans)
+    payloads = " ".join(span.payload() for span in profiled.tracer.spans)
     for canary in canaries:
         assert canary not in payloads
 
@@ -288,3 +317,19 @@ def test_the_sweep_would_catch_a_planted_leak(conn: QueueConnection, canary_secr
 
     assert rows_containing(conn, canary_secret) == {"audit_log": 1}
     conn.rollback()
+
+
+def test_the_log_assertion_would_catch_a_planted_leak(
+    canary_secret: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The log half needs its own planted leak, for the same reason the database
+    half does: `assert canary not in ""` passes on a capture of nothing.
+
+    The leak is planted the way a real one would arrive -- a value passed as a
+    lazy `%s` argument, where the format string looks perfectly clean.
+    """
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger("steward_catalog.canary_probe").warning("profiled %s", canary_secret)
+        logs = [record.getMessage() for record in caplog.records]
+
+    assert any(canary_secret in line for line in logs)
