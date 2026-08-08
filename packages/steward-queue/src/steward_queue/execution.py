@@ -302,6 +302,12 @@ def _consume(finished: asyncio.Future[Executed]) -> None:
     its future, and a future that resolves to an exception nobody read prints
     a warning at garbage-collection time. The outcome is genuinely uninteresting
     by then -- the attempt has already been recorded -- so it is read and dropped.
+
+    Since #63 the thread cannot *set* an exception -- `_execute_in_thread`
+    calls `set_result` on both branches -- so what is left to read is the
+    cancellation of the wrapped future itself, which `cancelled()` guards.
+    Kept rather than deleted because the class of warning it suppresses is a
+    property of `wrap_future`, not of what this module currently raises.
     """
     if not finished.cancelled():
         finished.exception()

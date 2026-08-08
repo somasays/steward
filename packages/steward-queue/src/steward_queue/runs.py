@@ -28,6 +28,26 @@ from steward_queue.db import QueueConnection
 from steward_queue.keys import digest
 from steward_queue.models import SYSTEM_ACTOR, Actor, RunRecord, RunStatus
 
+__all__ = [
+    "bind_idempotency_key",
+    "claim_single_flight",
+    "create_run",
+    "get_run",
+    "record_usage",
+    "rollup_run_status",
+    "set_run_status",
+    "start_run",
+]
+"""What this module offers, and to whom.
+
+The first four and `set_run_status`/`start_run`/`rollup_run_status` are on the
+package façade. `record_usage` deliberately is not: it is the seam `tasks`
+crosses inside a task's own transaction, and the only path that reaches it runs
+the I12 reported-usage check first (`execution._overspent`). Naming it here
+rather than underscoring it says which it is -- an underscore said "do not call
+this" to `tasks`, which has to (#58).
+"""
+
 
 def _run_record(row: Sequence[Any]) -> RunRecord:
     return RunRecord(
