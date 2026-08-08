@@ -8,13 +8,21 @@ route -- is H7's, in `test_masking_canary.py`.
 from __future__ import annotations
 
 import pytest
-from steward_catalog.masking import RawCell, column_semantic_type, mask, mask_optional
+from steward_catalog.masking import (
+    MASK_CHAR,
+    MIN_MASKED_ALNUM,
+    RawCell,
+    column_semantic_type,
+    mask,
+    mask_optional,
+)
 from steward_schemas import MaskedSample, SemanticType
 
 # (raw value, inferred type, mask) -- the table is the specification.
 CASES: tuple[tuple[str, SemanticType, str], ...] = (
     ("john.doe@gmail.com", SemanticType.EMAIL, "j***@g***.com"),
-    ("ada@mail.example.co.uk", SemanticType.EMAIL, "a***@m***.uk"),
+    ("ada@mail.example.co.uk", SemanticType.EMAIL, "***@m***.uk"),
+    ("a@b.co", SemanticType.EMAIL, "***@***.co"),
     ("4111111111111111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
     ("4111-1111-1111-1111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
     ("378282246310005", SemanticType.CREDIT_CARD, "3***-****-***0-005"),
@@ -25,10 +33,38 @@ CASES: tuple[tuple[str, SemanticType, str], ...] = (
     ("2026-08-08", SemanticType.TIMESTAMP, "****-**-**"),
     ("https://example.com/orders", SemanticType.URL, "https://e******.***/******"),
     ("-1234.50", SemanticType.NUMBER, "-1***.*0"),
-    ("true", SemanticType.BOOLEAN, "t**e"),
+    # Below the floor: nothing is revealed, because the first and last
+    # character of a short value *are* the value (`MIN_MASKED_ALNUM`).
+    ("true", SemanticType.BOOLEAN, "****"),
     ("", SemanticType.EMPTY, ""),
     ("shipped", SemanticType.TEXT, "s*****d"),
-    ("x", SemanticType.TEXT, "x"),
+    ("x", SemanticType.TEXT, "*"),
+    ("M", SemanticType.TEXT, "*"),
+    ("O+", SemanticType.TEXT, "*+"),
+    ("42", SemanticType.NUMBER, "**"),
+    ("9.5", SemanticType.NUMBER, "*.*"),
+    ("7", SemanticType.NUMBER, "*"),
+)
+
+# Values whose first and last character give the whole thing away. Each one was
+# published verbatim before the floor landed (the architecture guardian's
+# finding on #49): a `gender`, `blood_type` or single-digit-score column would
+# have had its entire value domain written into an append-only profile row.
+SHORT_VALUES: tuple[str, ...] = (
+    "M",
+    "F",
+    "Y",
+    "N",
+    "O+",
+    "A-",
+    "42",
+    "9.5",
+    "7",
+    "no",
+    "ok",
+    "t",
+    "US",
+    "a@b.co",
 )
 
 
@@ -47,10 +83,27 @@ def test_a_value_is_inferred_and_masked(raw: str, semantic_type: SemanticType, m
     ("raw", "semantic_type", "masked"), CASES, ids=[case[0] or "empty" for case in CASES]
 )
 def test_no_mask_contains_the_value_it_masked(raw: str, semantic_type: SemanticType, masked: str) -> None:
-    """The property the table above is only evidence for: whatever the format,
-    a mask of a value longer than two characters is not that value."""
-    if len(raw) > 2:
+    """The property the table above is only evidence for, and it holds at every
+    length -- an empty string being the one value there is nothing to hide in."""
+    if raw:
         assert raw not in mask(RawCell(raw)).masked
+
+
+@pytest.mark.parametrize("raw", SHORT_VALUES)
+def test_a_short_value_is_masked_rather_than_republished(raw: str) -> None:
+    """I6 does not have a lower length bound, and neither does the masker.
+
+    Asserted as two properties rather than a table of expected strings: the
+    value must not survive in its own mask, and at least `MIN_MASKED_ALNUM`
+    of its alphanumerics must be hidden -- "the mask differs from the value" is
+    too weak a bar, since `4*` differs from `42` and gives it away.
+    """
+    sample = mask(RawCell(raw))
+
+    assert raw not in sample.masked
+    alnums = [char for char in raw if char.isalnum()]
+    hidden = sum(1 for char in sample.masked if char == MASK_CHAR)
+    assert hidden >= min(len(alnums), MIN_MASKED_ALNUM)
 
 
 def test_a_long_value_collapses_instead_of_shaping_character_by_character() -> None:

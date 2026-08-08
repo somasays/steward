@@ -36,9 +36,7 @@ SELECT_ASSET_ID = "SELECT id FROM assets WHERE schema_name = 'sales' AND name = 
 
 
 def profile_spec(spec_factory: Callable[[UUID], TaskSpec], payload: dict[str, Any]) -> TaskSpec:
-    return spec_factory(uuid4()).model_copy(
-        update={"task_type": PROFILE_ASSET_TASK_TYPE, "payload": payload}
-    )
+    return spec_factory(uuid4()).model_copy(update={"task_type": PROFILE_ASSET_TASK_TYPE, "payload": payload})
 
 
 def execute(conn: QueueConnection, spec: TaskSpec, resolver: Any) -> TaskResult:
