@@ -17,6 +17,7 @@ from steward_schemas import SECRET_REF_PATTERN, AssetLifecycle, AssetType, Sourc
 
 SELECT_TABLES = "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
 SELECT_INDEXES = "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+SELECT_INDEX_DEFS = "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'"
 
 SELECT_CHECK_CONSTRAINT = """
 SELECT pg_get_constraintdef(c.oid)
@@ -50,6 +51,23 @@ A_DSN_WITH_A_PASSWORD = "postgresql://steward:hunter2@db.example.com:5432/analyt
 def names(dsn: str, sql: str) -> set[str]:
     with psycopg.connect(dsn) as conn:
         return {row[0] for row in conn.execute(sql).fetchall()}
+
+
+def unique_indexes(dsn: str) -> set[str]:
+    """Indexes Postgres installed as UNIQUE, read out of their definitions.
+
+    A name proves nothing: `CREATE INDEX profiles_asset_version` and
+    `CREATE UNIQUE INDEX profiles_asset_version` are indistinguishable in
+    `pg_indexes.indexname`, so a test asserting the name stays green if a later
+    migration drops the uniqueness that the convergence and append-only claims
+    both rest on (#49 review).
+    """
+    with psycopg.connect(dsn) as conn:
+        return {
+            row[0]
+            for row in conn.execute(SELECT_INDEX_DEFS).fetchall()
+            if row[1].upper().startswith("CREATE UNIQUE INDEX")
+        }
 
 
 def allowed_values(dsn: str, table: str, column: str) -> set[str]:
@@ -117,9 +135,9 @@ def test_the_catalog_revision_creates_its_tables_and_natural_keys(scratch_dsn: s
     # existing row because the database will not hold a second one.
     upgrade_to_head(scratch_dsn)
     assert CATALOG_TABLES <= names(scratch_dsn, SELECT_TABLES)
-    assert {"sources_natural_key", "assets_natural_key", "columns_natural_key"} <= names(
-        scratch_dsn, SELECT_INDEXES
-    )
+    # Read as UNIQUE definitions rather than names, for the reason above: the
+    # convergence these keys give a rescan is the uniqueness, not the name.
+    assert {"sources_natural_key", "assets_natural_key", "columns_natural_key"} <= unique_indexes(scratch_dsn)
 
 
 def test_the_profiles_revision_versions_one_profile_per_asset(scratch_dsn: str) -> None:
@@ -132,7 +150,10 @@ def test_the_profiles_revision_versions_one_profile_per_asset(scratch_dsn: str) 
     """
     upgrade_to_head(scratch_dsn)
     assert "profiles" in names(scratch_dsn, SELECT_TABLES)
-    assert "profiles_asset_version" in names(scratch_dsn, SELECT_INDEXES)
+    # UNIQUE specifically: `record_profile` reads the latest version and inserts
+    # version+1, so this index is the whole of its concurrency safety. Two
+    # profilers racing on one asset must not both be able to commit version 4.
+    assert "profiles_asset_version" in unique_indexes(scratch_dsn)
 
 
 def test_a_source_row_cannot_hold_a_dsn(scratch_dsn: str) -> None:

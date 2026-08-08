@@ -162,9 +162,14 @@ class ProfileRun:
     targets: dict[str, UUID]
     tracer: RecordingTracer
     logs: list[str]
+    stdout: str
+    stderr: str
 
     def logged(self) -> str:
         return "\n".join(self.logs)
+
+    def console(self) -> str:
+        return f"{self.stdout}\n{self.stderr}"
 
 
 def steward_tables(conn: QueueConnection) -> list[str]:
@@ -210,6 +215,7 @@ def profiled(
     scanned_source: dict[str, UUID],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    capfd: pytest.CaptureFixture[str],
 ) -> ProfileRun:
     """Profile the canary-bearing tables the way production does.
 
@@ -218,11 +224,13 @@ def profiled(
     records and the rows this harness inspects are the ones a deployment would
     produce.
 
-    The captured log records are carried on the result rather than read back
-    off `caplog` in the test: profiling happens during *setup*, and
-    `caplog.records` in a test body holds the call phase's records only -- so a
-    test that read it directly would assert over an empty list and pass on work
-    it never saw.
+    The captured log records **and console output** are carried on the result
+    rather than read back off `caplog`/`capfd` in the test: profiling happens
+    during *setup*, and both fixtures report the call phase only in a test body
+    -- so a test reading them directly asserts over an empty string and passes
+    on work it never saw. That was true of the console half through three
+    review rounds while GUARDRAILS' H7 row claimed stdout/stderr as a swept
+    surface; `canary not in ""` is not a check.
     """
     monkeypatch.setenv(SOURCE_SECRET_ENV, source_dsn)
     targets = {name: scanned_source[name] for name in ("customers", "raw_events")}
@@ -252,12 +260,13 @@ def profiled(
     with caplog.at_level(logging.DEBUG):
         assert asyncio.run(worker.run_once()) == len(targets)
         logs = [record.getMessage() for record in caplog.records]
+    console = capfd.readouterr()
     # A failed task would leave nothing profiled and make every assertion below
     # true for the wrong reason -- the shape GUARDRAILS.md §3 warns about.
     states = conn.execute(SELECT_TASK_STATES).fetchall()
     conn.rollback()
     assert states == [(TaskState.SUCCEEDED.value, len(targets))], states
-    return ProfileRun(targets=targets, tracer=tracer, logs=logs)
+    return ProfileRun(targets=targets, tracer=tracer, logs=logs, stdout=console.out, stderr=console.err)
 
 
 def test_the_canaries_were_actually_profiled(
@@ -330,7 +339,6 @@ def test_no_canary_reaches_any_row_of_stewards_database(
 def test_no_canary_reaches_a_log_line_or_the_console(
     profiled: ProfileRun,
     canaries: tuple[str, ...],
-    capfd: pytest.CaptureFixture[str],
 ) -> None:
     """The paths types cannot cover, which is the reason H7 exists at all.
 
@@ -340,12 +348,11 @@ def test_no_canary_reaches_a_log_line_or_the_console(
     """
     assert profiled.logs, "no log records were captured; these assertions would be vacuous"
     logged = profiled.logged()
-    captured = capfd.readouterr()
+    console = profiled.console()
 
     for canary in canaries:
         assert canary not in logged
-        assert canary not in captured.out
-        assert canary not in captured.err
+        assert canary not in console
 
 
 def test_no_canary_reaches_a_trace_payload(
@@ -379,6 +386,21 @@ def test_the_sweep_would_catch_a_planted_leak(conn: QueueConnection, canary_secr
 
     assert rows_containing(conn, canary_secret) == {"audit_log": 1}
     conn.rollback()
+
+
+def test_the_console_assertion_would_catch_a_planted_leak(
+    canary_secret: str, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The console half needs its own planted leak too, and it cannot borrow the
+    log half's non-emptiness guard: a clean profiling path is legitimately
+    silent on stdout, so "something was captured" is not available as evidence
+    here. What is available is that a `print` of a canary is found -- which is
+    what a connector or dependency debugging itself would do.
+    """
+    print(f"profiled {canary_secret}")  # noqa: T201 -- the leak being planted
+    captured = capfd.readouterr()
+
+    assert canary_secret in f"{captured.out}\n{captured.err}"
 
 
 def test_the_log_assertion_would_catch_a_planted_leak(
