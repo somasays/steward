@@ -208,6 +208,13 @@ def _shape(text: str, *, keep_first: bool, keep_last: int) -> str:
     architecture guardian on #49 before merge.
     """
     positions = [index for index, char in enumerate(text) if char.isalnum()]
+    if not positions:
+        # Delimiters are normally passed through because they are the *shape*
+        # around a value. A value that is nothing but delimiters -- `-`, `??`,
+        # a `+` standing in for "unknown" -- has no shape to preserve and would
+        # otherwise be published verbatim, so here they are the value and are
+        # masked like one.
+        return MASK_CHAR * len(text)
     wanted = (1 if keep_first else 0) + keep_last
     if len(positions) - wanted < MIN_MASKED_ALNUM:
         wanted = 0
