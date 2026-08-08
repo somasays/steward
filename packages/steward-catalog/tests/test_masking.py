@@ -11,7 +11,6 @@ import itertools
 
 import pytest
 from steward_catalog.masking import (
-    MASK_CHAR,
     MIN_MASKED_ALNUM,
     RawCell,
     column_semantic_type,
@@ -22,9 +21,9 @@ from steward_schemas import MaskedSample, SemanticType
 
 # (raw value, inferred type, mask) -- the table is the specification.
 CASES: tuple[tuple[str, SemanticType, str], ...] = (
-    ("john.doe@gmail.com", SemanticType.EMAIL, "j***@g***.com"),
-    ("ada@mail.example.co.uk", SemanticType.EMAIL, "***@m***.uk"),
-    ("a@b.co", SemanticType.EMAIL, "***@***.co"),
+    ("john.doe@gmail.com", SemanticType.EMAIL, "j***@g***.***"),
+    ("ada@mail.example.co.uk", SemanticType.EMAIL, "***@m***.**"),
+    ("a@b.co", SemanticType.EMAIL, "***@***.**"),
     ("4111111111111111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
     ("4111-1111-1111-1111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
     ("378282246310005", SemanticType.CREDIT_CARD, "3***-****-***0-005"),
@@ -91,49 +90,89 @@ def test_no_mask_contains_the_value_it_masked(raw: str, semantic_type: SemanticT
         assert raw not in mask(RawCell(raw)).masked
 
 
+def concealed(raw: str) -> int:
+    """How many of `raw`'s alphanumerics its mask hides.
+
+    Measured on the value, never on the mask. Counting `MASK_CHAR`s in the
+    output is the mistake that let the email leak score as compliant:
+    `a@b.co` -> `a***@b***.co` has six asterisks and conceals two characters,
+    so a floor of three passed while the whole TLD was published.
+    """
+    alnums = sum(1 for char in raw if char.isalnum())
+    return alnums - sum(1 for char in mask(RawCell(raw)).masked if char.isalnum())
+
+
+def alnum_total(raw: str) -> int:
+    return sum(1 for char in raw if char.isalnum())
+
+
 @pytest.mark.parametrize("raw", SHORT_VALUES)
 def test_a_short_value_is_masked_rather_than_republished(raw: str) -> None:
     """I6 does not have a lower length bound, and neither does the masker.
 
-    Asserted as two properties rather than a table of expected strings: the
-    value must not survive in its own mask, and at least `MIN_MASKED_ALNUM`
-    of its alphanumerics must be hidden -- "the mask differs from the value" is
-    too weak a bar, since `4*` differs from `42` and gives it away.
+    Asserted as properties rather than a table of expected strings: the value
+    must not survive in its own mask, and `MIN_MASKED_ALNUM` of its
+    alphanumerics must be concealed -- "the mask differs from the value" is too
+    weak a bar, since `4*` differs from `42` and gives it away.
     """
-    sample = mask(RawCell(raw))
+    assert raw not in mask(RawCell(raw)).masked
+    assert concealed(raw) >= min(alnum_total(raw), MIN_MASKED_ALNUM)
 
-    assert raw not in sample.masked
-    alnums = [char for char in raw if char.isalnum()]
-    hidden = sum(1 for char in sample.masked if char == MASK_CHAR)
-    assert hidden >= min(len(alnums), MIN_MASKED_ALNUM)
+
+# Values whose sensitive content sits *after the last dot* -- the region
+# `_mask_email` used to interpolate verbatim on the theory that a TLD is a
+# public taxonomy. Each is a string a notes, reference or identifier column
+# produces by accident: no whitespace, one `@`, at least one dot.
+TLD_TAIL_VALUES: tuple[str, ...] = (
+    "case@2019.DIAGNOSIS-HIV-POSITIVE",
+    "id@sys.EMP-00417-TERMINATED",
+    "ref@2024.SETTLEMENT-CONFIDENTIAL",
+    "a@b.co",
+    "1@2.museum",
+    "x@y.z",
+)
+
+
+@pytest.mark.parametrize("raw", TLD_TAIL_VALUES)
+def test_nothing_after_the_last_dot_is_published_verbatim(raw: str) -> None:
+    """The leak the first version shipped: a value that merely *looks* like an
+    address had everything past its final dot copied into an append-only
+    profile row."""
+    masked = mask(RawCell(raw)).masked
+    tail = raw.rpartition(".")[2]
+
+    assert tail not in masked
+    assert concealed(raw) >= min(alnum_total(raw), MIN_MASKED_ALNUM)
+
+
+ALPHABET = "abZ40+-._@?:/ "
+"""The exhaustive sweep's alphabet: letters, digits, and every delimiter a mask
+is allowed to preserve -- including `?` and `:` and `/`, which are what the
+URL and delimiter-only branches turn on. Fourteen characters over lengths 1-3
+is 2,954 values."""
+
+EXHAUSTIVE_VALUES = len(ALPHABET) + len(ALPHABET) ** 2 + len(ALPHABET) ** 3
 
 
 def test_no_short_value_survives_its_own_mask() -> None:
     """The floor, asserted exhaustively rather than by example.
 
-    Every string of up to three characters over an alphabet of letters, digits
-    and the delimiters a mask preserves -- 3,615 values, which is cheap enough
-    to check for real. Each one must be absent from its own mask. Written this
-    way because the defect this replaced was found in exactly the region a
-    hand-written table does not reach: `M`, `42`, `9.5`, and values made of
-    nothing but delimiters.
+    Every string of up to three characters over `ALPHABET`. Each must be absent
+    from its own mask and must have its alphanumerics concealed to the floor.
+    Written this way because every defect in this module so far was found in
+    the region a hand-written table does not reach: `M`, `42`, `9.5`, values
+    made of nothing but delimiters, and `s://a`.
     """
-    alphabet = "abcDE4901+-._@"
-    survivors = [
-        (value, mask(RawCell(value)).masked)
-        for length in (1, 2, 3)
-        for combination in itertools.product(alphabet, repeat=length)
-        if (value := "".join(combination)) in mask(RawCell(value)).masked
-    ]
+    survivors = []
+    for length in (1, 2, 3):
+        for combination in itertools.product(ALPHABET, repeat=length):
+            value = "".join(combination)
+            masked = mask(RawCell(value)).masked
+            if value in masked or concealed(value) < min(alnum_total(value), MIN_MASKED_ALNUM):
+                survivors.append((value, masked))
 
     assert survivors == []
-
-
-def test_a_value_that_is_only_delimiters_is_masked_too() -> None:
-    """Delimiters survive a mask because they are the shape *around* a value.
-    When they are the whole value there is no shape to keep, only a leak."""
-    assert mask(RawCell("-")).masked == "*"
-    assert mask(RawCell("???")).masked == "***"
+    assert EXHAUSTIVE_VALUES == 2954  # the count the docstring claims
 
 
 def test_a_long_value_collapses_instead_of_shaping_character_by_character() -> None:

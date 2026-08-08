@@ -25,10 +25,18 @@ runs canaries end to end (GUARDRAILS.md §1, Tier H).
 
 **Masks are format-preserving, not value-preserving, and there is a floor.** A
 mask reveals a character or two so a human reviewer can read a profile, which is
-the whole value on a short one -- so below `MIN_MASKED_ALNUM` hidden characters
-a segment reveals none. The property the rest of the system may rely on is
-therefore "at least three characters of every non-empty value are unknown",
-not merely "the mask is not the value". Classification (#50) and
+the whole value on a short one. The property the rest of the system may rely on
+is exactly this, and no more:
+
+    a mask conceals at least `MIN_MASKED_ALNUM` of a value's alphanumeric
+    characters -- or all of them, when the value has fewer than that.
+
+Stated in alphanumerics because that is what is enforced and what is
+measurable: delimiters are preserved as shape, and `length` is published
+outright, so neither is concealed and a guarantee phrased over "characters"
+would be false the moment anyone checked. `_conceals_enough` is the check,
+`mask()` applies it to every branch's output, and `test_masking.py` asserts it
+exhaustively over short values. Classification (#50) and
 documentation (#51) work from shape, name and statistics -- SPEC.md §4's second
 design rule -- so the mask keeps delimiters and character classes and discards
 the payload. Uniformly: there is no exemption for numbers, booleans or dates.
@@ -100,17 +108,24 @@ CARD_REVEALED_SUFFIX = 4
 PHONE_REVEALED_SUFFIX = 2
 
 MIN_MASKED_ALNUM = 3
-"""How many alphanumerics must remain hidden for a mask to reveal any.
+"""How many of a value's alphanumerics a mask must conceal.
 
-The floor that keeps "format-preserving" from collapsing into "value-preserving"
-on short values. A mask reveals its first and last character to stay legible;
-on `M`, `42` or `9.5` that is the whole value, so below this floor a segment
-reveals nothing at all. Three rather than one because the guarantee worth
+The floor that keeps "format-preserving" from collapsing into "value-preserving".
+A mask reveals a character or two to stay legible, and on `M`, `42` or `9.5`
+that is the whole value. Three rather than one because the guarantee worth
 stating is not "the mask differs from the value" -- `4*` differs from `42` and
-tells you everything -- but "at least three characters of it are unknown".
+tells you everything -- but "three of its alphanumerics are concealed".
 
-A payment card is exempt by arithmetic rather than by choice: `CARD_DIGITS`
-starts at 13 and five digits are revealed, so eight always remain.
+**It is enforced at the exit of `mask()`, not inside each format's branch, and
+that is the whole point.** Every per-format mask below is best-effort
+legibility; `_conceals_enough` is the property. The first version enforced it
+branch by branch and three branches did not get it: `_mask_email` interpolated
+the TLD verbatim, so a notes column of `case@2019.DIAGNOSIS-HIV-POSITIVE`
+published the diagnosis into an append-only table; `_mask_url` revealed a
+scheme with no floor (`s://a` -> `s://*`); `_collapsed` had none at all. A
+per-branch floor is a rule every future format has to remember. This is a gate
+every format goes through, so a branch added in #50 or a new connector inherits
+it without knowing it exists.
 """
 
 
@@ -228,9 +243,38 @@ def _shape(text: str, *, keep_first: bool, keep_last: int) -> str:
     )
 
 
+def _alnum_count(text: str) -> int:
+    return sum(1 for char in text if char.isalnum())
+
+
+def _conceals_enough(text: str, masked: str) -> bool:
+    """Does `masked` hide enough of `text` to be published?
+
+    Concealment is measured on the *value*, not on the mask: how many of the
+    original's alphanumerics are missing from the mask. Counting asterisks
+    instead would measure the mask's shape -- `a@b.co` -> `a***@b***.co` has six
+    of them and conceals two characters, which is how the email leak scored as
+    compliant while publishing a TLD verbatim.
+
+    A mask only ever copies characters from its input or replaces them with
+    `MASK_CHAR`, so the difference of the two counts is the number concealed.
+    A value with fewer than `MIN_MASKED_ALNUM` alphanumerics must have all of
+    them hidden -- there is no bar above "everything" for `M` or `42`.
+    """
+    original = _alnum_count(text)
+    return original - _alnum_count(masked) >= min(original, MIN_MASKED_ALNUM)
+
+
 def _revealed_prefix(part: str) -> str:
-    """A segment's first character, or nothing when the floor forbids it."""
-    return part[0] if len(part) - 1 >= MIN_MASKED_ALNUM else ""
+    """A segment's first character, if revealing it is safe *and* worth it.
+
+    Alphanumeric only: the first character of `-internal-code` is a hyphen,
+    which says nothing about the value and would spend the segment's one
+    allowance on punctuation.
+    """
+    if not part or not part[0].isalnum():
+        return ""
+    return part[0] if _alnum_count(part) - 1 >= MIN_MASKED_ALNUM else ""
 
 
 def _collapsed(text: str) -> str:
@@ -239,16 +283,28 @@ def _collapsed(text: str) -> str:
 
 
 def _mask_email(text: str) -> str:
-    """`john.doe@gmail.com` -> `j***@g***.com` (SPEC.md §4).
+    """`john.doe@gmail.com` -> `j***@g***.***` (SPEC.md §4, amended by #49).
 
-    Each side is subject to the same floor `_shape` applies: a local part or a
-    domain name short enough that its first character would give it away keeps
-    nothing (`a@b.co` -> `***@***.co`). The TLD survives whatever its length --
-    it is a public taxonomy, not a payload.
+    **The TLD is masked like everything else, and the earlier version's
+    exemption for it was a leak.** "A TLD is a public taxonomy, not a payload"
+    is true of `com` and false of whatever sits after the last dot in a string
+    that merely *looks* like an address: `_EMAIL` asks for no whitespace, one
+    `@` and a dot, which a reference or notes column satisfies by accident.
+    `case@2019.DIAGNOSIS-HIV-POSITIVE` published the diagnosis verbatim into
+    `profiles` -- append-only, so permanently, and then into whatever #50 builds
+    from stored profiles. The canary could not see it because the canary's tail
+    is `.test`.
+
+    D10's own argument applies unchanged: an exemption is a hole the moment a
+    customer's data disagrees with our intuition about which columns are
+    sensitive. So the segment that used to be interpolated is now shaped like
+    any other, and what a reader loses is `.com` -- a detail `semantic_type`
+    already carries in a form that cannot smuggle a payload.
     """
     local, _, domain = text.partition("@")
     name, _, tld = domain.rpartition(".")
-    return f"{_revealed_prefix(local)}{MASK_RUN}@{_revealed_prefix(name)}{MASK_RUN}.{tld}"
+    shaped_tld = _shape(tld, keep_first=False, keep_last=0)
+    return f"{_revealed_prefix(local)}{MASK_RUN}@{_revealed_prefix(name)}{MASK_RUN}.{shaped_tld}"
 
 
 def _mask_card(text: str) -> str:
@@ -298,12 +354,19 @@ def mask(cell: RawCell) -> MaskedSample:
     Pure and total -- every string has a mask, so there is no input for which a
     caller has to decide what to do instead, which is how a "just this once"
     unmasked path gets added.
+
+    The last two lines are the guarantee. Whatever a format's own mask produced,
+    it is published only if it conceals enough of the value
+    (`_conceals_enough`); otherwise everything alphanumeric goes. So the
+    property holds for every branch that exists and every branch anyone adds --
+    a format can make a mask *more* legible, never less safe.
     """
     text = cell._text
     semantic_type = infer_semantic_type(text)
-    return MaskedSample(
-        masked=_masked_text(text, semantic_type), semantic_type=semantic_type, length=len(text)
-    )
+    masked = _masked_text(text, semantic_type)
+    if not _conceals_enough(text, masked):
+        masked = _shape(text, keep_first=False, keep_last=0)
+    return MaskedSample(masked=masked, semantic_type=semantic_type, length=len(text))
 
 
 def mask_optional(cell: RawCell | None) -> MaskedSample | None:

@@ -1,12 +1,12 @@
 """H7 — the masking canary (GUARDRAILS.md §1 Tier H, I6, N7, issue #49).
 
 Secrets are planted in the fixture source's data (`conftest.FIXTURE_DATA`): an
-email, a payment card and an opaque token, each a string that occurs nowhere
-else in this repository. The real `profile_asset` handler is then executed the
-way production executes it -- claimed off the queue by a real `Worker`, through
-the registered handler with the environment-backed secret resolver and the real
-Postgres profiler -- and the harness asserts that none of those three strings
-appears in:
+email, a payment card, an opaque token, and a value whose payload sits *after
+the last dot* -- each a string that occurs nowhere else in this repository. The
+real `profile_asset` handler is then executed the way production executes it --
+claimed off the queue by a real `Worker`, through the registered handler with
+the environment-backed secret resolver and the real Postgres profiler -- and the
+harness asserts that none of those strings appears in:
 
 * any row of **any table** in Steward's database (not just `profiles` and
   `audit_log`: the sweep is over `pg_tables`, so a table added in a later
@@ -17,14 +17,22 @@ appears in:
   through a `Worker` with a recording tracer rather than calling the handler
   directly: handlers do not open spans, the worker does.
 
-Two things make the result mean something rather than merely be green:
+Three things make the result mean something rather than merely be green:
 
 * **The canaries were really read.** The harness asserts the profile of the
   canary-bearing column exists and carries the *masked* form, so a run that
   silently profiled nothing fails here.
 * **The sweep can find a leak.** `test_the_sweep_would_catch_a_planted_leak`
-  writes a canary into an audit row and asserts the sweep reports it -- an
-  assertion that cannot pass is not evidence.
+  writes a canary into an audit row and asserts the sweep reports it, and the
+  log half plants one through a lazy `%s` call -- an assertion that cannot fail
+  is not evidence.
+* **A canary is evidence only for the shapes it takes.** That is not a caveat,
+  it is the lesson: the first three canaries all ended in `.test` or no dot at
+  all, and `_mask_email` published everything after the final dot verbatim, so
+  this harness watched a payload land in `profiles` and reported green through
+  a whole review cycle. `CANARY_AFTER_LAST_DOT` covers that shape now, and its
+  tail is swept for separately -- a mask leaking only the tail would leave the
+  full string absent and satisfy everything else here.
 
 What this cannot prove is stated in the PR and in GUARDRAILS' H7 row: it
 observes one masker over one fixture estate, and there are no prompts yet to
@@ -244,11 +252,28 @@ def test_the_canaries_were_actually_profiled(
     assert row is not None, "the canary table was never profiled"
     columns = {column["name"]: column for column in row[0]["columns"]}
     masked = [frequency["value"]["masked"] for frequency in columns["email"]["top_values"]]
-    assert "c***@s***.test" in masked  # the canary row, and only in masked form
+    assert "c***@s***.****" in masked  # the canary row, and only in masked form
     assert canary_email not in masked
     assert [span.task_type for span in profiled.tracer.spans] == [PROFILE_ASSET_TASK_TYPE] * len(
         profiled.targets
     )
+
+
+def test_nothing_behind_a_canarys_last_dot_reaches_the_database(
+    conn: QueueConnection,
+    profiled: ProfileRun,
+    canary_tail: str,
+) -> None:
+    """The class the other canaries could not see (#49 review).
+
+    `_mask_email` used to copy everything after the final dot verbatim, and
+    every canary here ended in `.test`, so the harness watched a payload land in
+    `profiles` and reported green. Swept for as the tail alone: a mask that
+    published only the tail would leave the full canary absent and satisfy every
+    other assertion in this file.
+    """
+    assert rows_containing(conn, canary_tail) == {}
+    conn.rollback()
 
 
 def test_no_canary_reaches_any_row_of_stewards_database(

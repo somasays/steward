@@ -67,7 +67,7 @@ def test_every_value_a_profile_carries_is_masked(profiler: SourceProfiler, canar
     rendered = [email.min_value.masked, email.max_value.masked]
     rendered += [frequency.value.masked for frequency in email.top_values]
     assert all(canary_email not in value for value in rendered)
-    assert "c***@s***.test" in rendered  # the canary row, masked
+    assert "c***@s***.****" in rendered  # the canary row, masked -- TLD included
 
 
 def test_a_columns_semantic_type_comes_from_its_values(profiler: SourceProfiler, canary_card: str) -> None:

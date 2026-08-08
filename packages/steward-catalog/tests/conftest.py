@@ -44,7 +44,24 @@ CANARY_EMAIL = "canary.7f3a91d2@steward-canary.test"
 CANARY_CARD = "4539578763621486"
 CANARY_SECRET = "STEWARD-CANARY-TOKEN-9c4e17b6d05f"
 
-CANARIES: tuple[str, ...] = (CANARY_EMAIL, CANARY_CARD, CANARY_SECRET)
+CANARY_AFTER_LAST_DOT = "case@2026.CANARY-DIAGNOSIS-4b81f7ac"
+"""A canary whose payload sits *after the last dot*.
+
+The other three are shaped like the values whoever wrote the masker was
+picturing, and that is exactly why they missed the leak this one exists for:
+`_mask_email` interpolated the TLD verbatim, and every canary above has `.test`
+or no dot at all as its tail, so the harness watched the leak happen and
+reported green. A canary is only evidence for the shapes it takes -- so this
+one takes the shape a notes or reference column produces by accident: no
+whitespace, one `@`, a dot, and something confidential behind it.
+"""
+
+CANARIES: tuple[str, ...] = (CANARY_EMAIL, CANARY_CARD, CANARY_SECRET, CANARY_AFTER_LAST_DOT)
+
+CANARY_TAIL = CANARY_AFTER_LAST_DOT.rpartition(".")[2]
+"""The payload alone -- `CANARY-DIAGNOSIS-4b81f7ac`. Swept for separately,
+because a mask that published only the tail would leave the full string absent
+and every assertion green."""
 
 # The fixture estate. Two schemas so filtering has something to filter, a view
 # so `asset_type` has two values, and a nullable column so `nullable` does.
@@ -78,8 +95,9 @@ FIXTURE_DATA: tuple[tuple[str, dict[str, str]], ...] = (
         {"email": CANARY_EMAIL, "card": CANARY_CARD},
     ),
     (
-        "INSERT INTO staging.raw_events (id, body) VALUES (1, %(secret)s), (2, 'ordinary event')",
-        {"secret": CANARY_SECRET},
+        "INSERT INTO staging.raw_events (id, body) VALUES "
+        "(1, %(secret)s), (2, 'ordinary event'), (3, %(tail)s)",
+        {"secret": CANARY_SECRET, "tail": CANARY_AFTER_LAST_DOT},
     ),
 )
 
@@ -131,6 +149,12 @@ def canary_card() -> str:
 @pytest.fixture(scope="session")
 def canary_secret() -> str:
     return CANARY_SECRET
+
+
+@pytest.fixture(scope="session")
+def canary_tail() -> str:
+    """The payload behind the last dot, swept for on its own."""
+    return CANARY_TAIL
 
 
 @pytest.fixture(scope="session")
