@@ -70,20 +70,15 @@ def unique_index_defs(dsn: str) -> dict[str, str]:
 
 
 def unique_indexes(dsn: str) -> set[str]:
-    """Indexes Postgres installed as UNIQUE, read out of their definitions.
+    """Names of the indexes Postgres installed as UNIQUE.
 
-    A name proves nothing: `CREATE INDEX profiles_asset_version` and
+    A name proves nothing on its own: `CREATE INDEX profiles_asset_version` and
     `CREATE UNIQUE INDEX profiles_asset_version` are indistinguishable in
     `pg_indexes.indexname`, so a test asserting the name stays green if a later
-    migration drops the uniqueness that the convergence and append-only claims
-    both rest on (#49 review).
+    migration drops the uniqueness the convergence and append-only claims both
+    rest on (#49 review).
     """
-    with psycopg.connect(dsn) as conn:
-        return {
-            row[0]
-            for row in conn.execute(SELECT_INDEX_DEFS).fetchall()
-            if row[1].upper().startswith("CREATE UNIQUE INDEX")
-        }
+    return set(unique_index_defs(dsn))
 
 
 def allowed_values(dsn: str, table: str, column: str) -> set[str]:

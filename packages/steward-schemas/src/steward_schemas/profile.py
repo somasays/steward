@@ -62,7 +62,7 @@ class SemanticType(StrEnum):
 class MaskedSample(SchemaModel):
     """One sampled value, after masking. The only form a sample is published in.
 
-    `masked` is format-preserving (`j***@g***.***`, `4***-****-****-1234`), so
+    `masked` is format-preserving (`j***@g***.***`, `****-****-****-****`), so
     a downstream consumer can still see *shape* -- which is what classification
     (#50) and documentation (#51) work from (SPEC.md §4, rule 2) -- without the
     payload.

@@ -558,17 +558,21 @@ def mask(cell: RawCell) -> MaskedSample:
     return MaskedSample(masked=masked, semantic_type=semantic_type, length=length)
 
 
-def suppressed(sample: MaskedSample) -> MaskedSample:
+def suppressed(sample: MaskedSample, column_type: SemanticType) -> MaskedSample:
     """`sample` with everything that distinguishes it from its peers removed.
 
-    The constant token and no length -- the same shape a closed-domain value
-    gets, applied by the publishing layer once it knows the column has too few
-    distinct values for any difference between masks to be anything but the
-    domain itself. `semantic_type` survives: it describes the column, and a
-    consumer that knows a column is boolean, or an email, learns nothing about
-    *which* rows are which.
+    The constant token, no length, and **the column's** semantic type rather
+    than the value's. That last one is not tidiness: a two-valued column need
+    not be type-homogeneous, and the per-value type was the third thing to
+    distinguish suppressed entries after the mask and the length. A `hiv_flag`
+    column of `''` and `'Y'` published `semantic_type="empty"` against 900 rows
+    and `"text"` against 100 -- exactly the "which way round" suppression is
+    supposed to remove, and `min_value`/`max_value` said it again (#49 review).
+
+    `ColumnProfile.semantic_type` carries the column's answer once, which is
+    where a consumer should read it.
     """
-    return MaskedSample(masked=MASK_RUN, semantic_type=sample.semantic_type, length=None)
+    return MaskedSample(masked=MASK_RUN, semantic_type=column_type, length=None)
 
 
 def low_cardinality(distinct_count: int) -> bool:

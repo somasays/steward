@@ -33,12 +33,14 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 import psycopg
+from psycopg import IsolationLevel
 from psycopg.rows import TupleRow
-from steward_schemas import ColumnProfile, MaskedSample, TableProfile, ValueFrequency
+from steward_schemas import ColumnProfile, MaskedSample, SemanticType, TableProfile, ValueFrequency
 
 from steward_catalog._profile_sql import STATS_PER_COLUMN, TOP_VALUE_LIMIT, stats_query, top_values_query
 from steward_catalog.inspector import open_source_connection
 from steward_catalog.masking import (
+    LOW_CARDINALITY_MAX,
     RawCell,
     column_semantic_type,
     low_cardinality,
@@ -114,6 +116,16 @@ class PostgresSourceProfiler:
     connection: psycopg.Connection[TupleRow]
 
     def profile(self, target: ProfileTarget) -> TableProfile:
+        try:
+            return self._profile(target)
+        finally:
+            # End the snapshot with the profile that needed it. Holding one for
+            # the profiler's whole lifetime would keep a transaction open on the
+            # customer's database across everything the caller does next, and
+            # block their DDL behind our read locks.
+            self.connection.rollback()
+
+    def _profile(self, target: ProfileTarget) -> TableProfile:
         names = tuple(column.name for column in target.columns)
         row = self.connection.execute(stats_query(target.schema_name, target.name, names)).fetchone()
         if row is None:  # pragma: no cover -- an aggregate always returns a row
@@ -143,16 +155,21 @@ class PostgresSourceProfiler:
         non_null, distinct = int(stats[0]), int(stats[1])
         top_values = self._top_values(target, column)
         minimum, maximum = mask_optional(_cell(stats[2])), mask_optional(_cell(stats[3]))
-        if low_cardinality(distinct):
+        # Computed before suppression: afterwards every sample carries the
+        # column's own type, so deriving it from the suppressed tuple would be
+        # circular -- and reading it from a blanked tuple would report UNKNOWN.
+        semantic = column_semantic_type(frequency.value for frequency in top_values)
+        if low_cardinality(distinct) or len(top_values) <= LOW_CARDINALITY_MAX:
             # Too few distinct values for any difference between the masks to be
             # anything but the domain: `yes`/`no`, `M`/`F`, `true`/`false` are
             # each recovered from a mask, a length or a preserved delimiter.
             # Suppressed here rather than in `mask()` because this is where the
             # column's cardinality is known (#49 review). The counts survive, so
             # a consumer still learns the split -- just not which way round.
-            minimum, maximum = _suppress_optional(minimum), _suppress_optional(maximum)
+            minimum = _suppress_optional(minimum, semantic)
+            maximum = _suppress_optional(maximum, semantic)
             top_values = tuple(
-                ValueFrequency(value=suppressed(frequency.value), count=frequency.count)
+                ValueFrequency(value=suppressed(frequency.value, semantic), count=frequency.count)
                 for frequency in top_values
             )
         return ColumnProfile(
@@ -165,7 +182,7 @@ class PostgresSourceProfiler:
             min_value=minimum,
             max_value=maximum,
             top_values=top_values,
-            semantic_type=column_semantic_type(frequency.value for frequency in top_values),
+            semantic_type=semantic,
         )
 
     def _top_values(self, target: ProfileTarget, column: DiscoveredColumn) -> tuple[ValueFrequency, ...]:
@@ -176,8 +193,8 @@ class PostgresSourceProfiler:
         return tuple(ValueFrequency(value=_masked(value), count=int(count)) for value, count in rows)
 
 
-def _suppress_optional(sample: MaskedSample | None) -> MaskedSample | None:
-    return None if sample is None else suppressed(sample)
+def _suppress_optional(sample: MaskedSample | None, column_type: SemanticType) -> MaskedSample | None:
+    return None if sample is None else suppressed(sample, column_type)
 
 
 def _masked(value: object) -> MaskedSample:
@@ -195,9 +212,28 @@ def postgres_profiler(secret: Secret, budget: timedelta) -> Iterator[SourceProfi
     A context manager for the reason `postgres_inspector` is one: the
     connection is a resource on someone else's server, and a handler that
     raised halfway would otherwise leave it open until their socket timed out.
+
+    **`REPEATABLE READ`, and autocommit off, which the metadata read does not
+    need.** A profile is many statements -- one stats pass plus one grouped
+    query per column -- and under autocommit each gets its own snapshot. The
+    suppression decision is then read from *different data* than the sample it
+    suppresses: a three-valued column whose third value drains between the two
+    statements reads `distinct = 3`, skips suppression, and publishes a
+    now-binary sample with its values distinguishable (#49 review). One
+    snapshot makes the statistics and the samples describe the same table, which
+    is also what "re-profiling converges" (I8) presumes.
+
+    The snapshot is scoped to one `profile()` call, not to the profiler's
+    lifetime: the cost is an open transaction on the customer's database for the
+    length of a profile, and holding one any longer would keep our read locks
+    across whatever the caller does next -- enough to block their DDL. It is
+    bounded by the same budget-derived `statement_timeout` and by the task's
+    deadline.
     """
     connection = open_source_connection(secret, budget)
     try:
+        connection.autocommit = False
+        connection.isolation_level = IsolationLevel.REPEATABLE_READ
         yield PostgresSourceProfiler(connection)
     finally:
         connection.close()

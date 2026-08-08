@@ -139,6 +139,12 @@ BINARY_DOMAINS: tuple[tuple[str, str, str], ...] = (
     ("state", "active", "inactive"),
     ("blood", "O+", "A-"),
     ("flag", "true", "false"),
+    # Type-heterogeneous, which the five above are not: an empty string infers
+    # EMPTY and `Y` infers TEXT, so the per-entry `semantic_type` told the two
+    # apart even with mask and length blanked -- the third distinguishing field,
+    # after the mask and the length (#49 review).
+    ("flagged", "", "Y"),
+    ("mixed", "1", "no"),
 )
 
 
@@ -176,13 +182,16 @@ def test_a_two_valued_column_publishes_nothing_that_tells_its_values_apart(
 
     [column_profile] = profile.columns
     assert column_profile.distinct_count == 2
-    masks = {frequency.value.masked for frequency in column_profile.top_values}
-    lengths = {frequency.value.length for frequency in column_profile.top_values}
-    assert masks == {"***"}, f"{name}: masks distinguish the two values: {masks}"
-    assert lengths == {None}, f"{name}: lengths distinguish the two values: {lengths}"
+    # Every published field of every sample, not just the mask: each of mask,
+    # length and semantic_type has been a way to tell suppressed values apart.
+    published = {
+        (frequency.value.masked, frequency.value.semantic_type, frequency.value.length)
+        for frequency in column_profile.top_values
+    }
+    assert len(published) == 1, f"{name}: the two values are distinguishable: {published}"
     assert [frequency.count for frequency in column_profile.top_values] == [3, 1]  # the split survives
+    assert column_profile.min_value == column_profile.max_value  # ...and so do min/max
     assert column_profile.min_value is not None and column_profile.min_value.masked == "***"
-    assert column_profile.max_value is not None and column_profile.max_value.length is None
 
 
 def test_top_values_truncate_deterministically_when_a_tie_spans_the_cut(
