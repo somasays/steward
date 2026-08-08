@@ -15,7 +15,7 @@ from steward_schemas import CONTRACTS
 
 def test_contracts_registry_is_nonempty() -> None:
     assert CONTRACTS
-    assert len(CONTRACTS) == 13
+    assert len(CONTRACTS) == 17
 
 
 @pytest.mark.parametrize("name", sorted(CONTRACTS))
