@@ -105,7 +105,44 @@ which is a false positive that would then drive a classification (#50)."""
 
 CARD_GROUP = 4
 CARD_REVEALED_SUFFIX = 4
-PHONE_REVEALED_SUFFIX = 2
+
+KNOWN_SCHEMES = frozenset(
+    {
+        "http",
+        "https",
+        "ftp",
+        "ftps",
+        "sftp",
+        "ssh",
+        "file",
+        "s3",
+        "gs",
+        "abfss",
+        "hdfs",
+        "ws",
+        "wss",
+        "git",
+        "postgres",
+        "postgresql",
+        "mysql",
+        "mongodb",
+        "redis",
+        "kafka",
+        "jdbc",
+        "mailto",
+        "data",
+    }
+)
+"""URL schemes a mask may publish verbatim -- a closed taxonomy, checked.
+
+The point is the *checking*. `_URL` matches anything with a letter, some
+punctuation and `://`, so "the part before the separator is a scheme" is a
+guess about position, and an identifier column that happens to contain `://`
+had its identifier published whole. A member of this set carries no customer
+data by construction; a non-member is shaped like any other segment. Adding a
+scheme here is a deliberate act, which is the property the previous version
+lacked.
+"""
 
 MIN_MASKED_ALNUM = 3
 """How many of a value's alphanumerics a mask must conceal.
@@ -126,6 +163,24 @@ scheme with no floor (`s://a` -> `s://*`); `_collapsed` had none at all. A
 per-branch floor is a rule every future format has to remember. This is a gate
 every format goes through, so a branch added in #50 or a new connector inherits
 it without knowing it exists.
+"""
+
+MIN_CONCEALED_NUMERATOR = 1
+MIN_CONCEALED_DENOMINATOR = 2
+"""The proportional half of the floor: at least half of a value's alphanumerics.
+
+A count alone is the wrong shape for a long value, and the gap was real rather
+than theoretical: `X-CONFIDENTIAL-CASE-2019://abc` published 21 of its 24
+alphanumerics and cleared an absolute floor of three, because the three
+characters after the separator were enough to satisfy it. So the requirement is
+`max(MIN_MASKED_ALNUM, half)` -- the count protects short values, where a
+fraction is nothing, and the fraction protects long ones, where a count is.
+
+An integer ratio rather than a float because this decides what gets published,
+and a rounding difference across platforms would make the guarantee itself
+platform-dependent. Half is where every mask in this module already sat -- the
+narrowest margin is a six-alphanumeric number concealing four -- so it costs
+nothing today and bounds what a branch added later may reveal.
 """
 
 
@@ -247,6 +302,25 @@ def _alnum_count(text: str) -> int:
     return sum(1 for char in text if char.isalnum())
 
 
+def _required_concealment(alnums: int) -> int:
+    """How many of a value's alphanumerics its mask must hide.
+
+    Two terms, because one of them alone is the wrong shape:
+
+    * an **absolute floor** (`MIN_MASKED_ALNUM`), which is what protects `M`,
+      `42`, a PIN or a CVV -- a fraction of a two-character value is nothing;
+    * a **proportion** (`MIN_CONCEALED_FRACTION`), which is what protects a long
+      one. A count alone made "a branch cannot make a mask less safe" false in
+      the only direction that matters: `X-CONFIDENTIAL-CASE-2019://abc`
+      published 21 of its 24 alphanumerics and cleared a floor of three.
+
+    Capped at the value's own length, since "conceal more than there is" is not
+    a requirement a mask can meet.
+    """
+    proportional = -(-alnums * MIN_CONCEALED_NUMERATOR // MIN_CONCEALED_DENOMINATOR)
+    return min(alnums, max(MIN_MASKED_ALNUM, proportional))
+
+
 def _conceals_enough(text: str, masked: str) -> bool:
     """Does `masked` hide enough of `text` to be published?
 
@@ -258,11 +332,9 @@ def _conceals_enough(text: str, masked: str) -> bool:
 
     A mask only ever copies characters from its input or replaces them with
     `MASK_CHAR`, so the difference of the two counts is the number concealed.
-    A value with fewer than `MIN_MASKED_ALNUM` alphanumerics must have all of
-    them hidden -- there is no bar above "everything" for `M` or `42`.
     """
     original = _alnum_count(text)
-    return original - _alnum_count(masked) >= min(original, MIN_MASKED_ALNUM)
+    return original - _alnum_count(masked) >= _required_concealment(original)
 
 
 def _revealed_prefix(part: str) -> str:
@@ -323,9 +395,24 @@ def _mask_card(text: str) -> str:
 
 
 def _mask_url(text: str) -> str:
-    """Scheme kept, everything after it shaped: `https://e******.***/******`."""
+    """`https://example.com/orders` -> `https://e******.***/******`.
+
+    **The scheme survives only if it is a scheme we recognise**, and that
+    membership is *checked* rather than inferred from position. `_URL` asks for
+    a letter, some of `[a-zA-Z0-9+.-]` and `://` -- which an identifier column
+    satisfies by accident, and the earlier version then published it whole:
+    `X-CONFIDENTIAL-CASE-2019://abc` came out untouched, because the exit gate
+    was satisfied by concealing the three characters *after* the separator.
+
+    That is the TLD leak in a second costume, and it is the same lesson: a
+    segment is safe to publish when it belongs to a known, closed taxonomy, not
+    when it sits where such a segment usually sits. So `KNOWN_SCHEMES` is a
+    list, anything outside it is shaped, and the gate in `mask()` is the floor
+    underneath rather than the argument.
+    """
     scheme, separator, rest = text.partition("://")
-    return f"{scheme}{separator}{_shape(rest, keep_first=True, keep_last=0)}"
+    shown = scheme if scheme.lower() in KNOWN_SCHEMES else _shape(scheme, keep_first=False, keep_last=0)
+    return f"{shown}{separator}{_shape(rest, keep_first=True, keep_last=0)}"
 
 
 def _masked_text(text: str, semantic_type: SemanticType) -> str:
@@ -340,7 +427,13 @@ def _masked_text(text: str, semantic_type: SemanticType) -> str:
     if semantic_type in (SemanticType.UUID, SemanticType.IP_ADDRESS, SemanticType.TIMESTAMP):
         return _shape(text, keep_first=False, keep_last=0)
     if semantic_type is SemanticType.PHONE:
-        return _shape(text, keep_first=False, keep_last=PHONE_REVEALED_SUFFIX)
+        # No suffix reveal. It used to keep the last two digits, on the reasoning
+        # that a phone number's tail is how a human recognises their own -- but
+        # `_PHONE` is a superset of every 9-to-11 digit identifier, so
+        # `123-45-6789` (an SSN) came out as `***-**-**89`. That is a reveal
+        # justified by a value *looking* like a phone number, which is the
+        # exemption D10 rules out; the floor was met, so nothing caught it.
+        return _shape(text, keep_first=False, keep_last=0)
     # Only the unstructured tail collapses. A recognised format keeps its shape
     # at any length -- a UUID is 36 characters and shaping it is the whole point.
     if len(text) > COLLAPSE_ABOVE:

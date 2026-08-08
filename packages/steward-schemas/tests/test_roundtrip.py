@@ -107,7 +107,7 @@ def build_column() -> Column:
 
 
 def build_masked_sample() -> MaskedSample:
-    return MaskedSample(masked="j***@g***.com", semantic_type=SemanticType.EMAIL, length=17)
+    return MaskedSample(masked="j***@g***.***", semantic_type=SemanticType.EMAIL, length=17)
 
 
 def build_value_frequency() -> ValueFrequency:

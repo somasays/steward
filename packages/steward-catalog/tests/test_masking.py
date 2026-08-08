@@ -27,7 +27,10 @@ CASES: tuple[tuple[str, SemanticType, str], ...] = (
     ("4111111111111111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
     ("4111-1111-1111-1111", SemanticType.CREDIT_CARD, "4***-****-****-1111"),
     ("378282246310005", SemanticType.CREDIT_CARD, "3***-****-***0-005"),
-    ("+1 (555) 010-0199", SemanticType.PHONE, "+* (***) ***-**99"),
+    ("+1 (555) 010-0199", SemanticType.PHONE, "+* (***) ***-****"),
+    # `_PHONE` is a superset of every 9-11 digit identifier, so a suffix reveal
+    # here would publish the last two digits of an SSN (`***-**-**89`).
+    ("123-45-6789", SemanticType.PHONE, "***-**-****"),
     ("f47ac10b-58cc-4372-a567-0e02b2c3d479", SemanticType.UUID, "********-****-****-****-************"),
     ("192.168.1.42", SemanticType.IP_ADDRESS, "***.***.*.**"),
     ("2026-08-08 11:30:00", SemanticType.TIMESTAMP, "****-**-** **:**:**"),
@@ -149,7 +152,47 @@ ALPHABET = "abZ40+-._@?:/ "
 """The exhaustive sweep's alphabet: letters, digits, and every delimiter a mask
 is allowed to preserve -- including `?` and `:` and `/`, which are what the
 URL and delimiter-only branches turn on. Fourteen characters over lengths 1-3
-is 2,954 values."""
+is 2,954 values.
+
+`*` is excluded deliberately and the exclusion is load-bearing: a string of
+asterisks is a fixed point of `mask()` (`"*"` masks to `"*"`), so it would be
+reported as surviving its own mask. It carries no information to conceal --
+there is nothing behind an asterisk -- but the sweep cannot tell those apart,
+so the alphabet leaves it out rather than the assertion carving an exception.
+"""
+
+# Templates, because the flat sweep above structurally cannot reach the branches
+# that actually broke: an email needs 5 characters minimum, a URL 5, a card 13,
+# so a sweep over lengths 1-3 exercises `_shape` and `EMPTY` and nothing else --
+# and *both* post-floor leaks on this branch (the verbatim TLD, the verbatim
+# scheme) lived in branches it could not construct. Each template puts a
+# payload in the segment that branch interpolates.
+FORMAT_TEMPLATES: tuple[str, ...] = (
+    "user@host.{payload}",  # the TLD slot
+    "{payload}@host.com",  # the local slot
+    "user@{payload}.com",  # the domain slot
+    "{payload}://host/path",  # the scheme slot
+    "https://{payload}/path",  # the authority slot
+    "https://host/{payload}",  # the path slot
+    "+1-555-{payload}",  # the phone tail
+    "4111-1111-1111-{payload}",  # the card tail
+    "{payload}",  # no format at all
+)
+
+# Payloads a real column holds and nobody would want republished. Two
+# characters minimum: a one-character payload landing in the last slot of a
+# value is indistinguishable from the end-character reveal every mask is allowed
+# (`4111-1111-1111-Z` -> `4***-****-****-Z`), which is bounded by the floor
+# rather than by this assertion. Asserting on it would be asserting that the
+# allowance does not exist.
+PAYLOADS: tuple[str, ...] = (
+    "DIAGNOSIS-HIV-POSITIVE",
+    "EMP-00417-TERMINATED",
+    "SETTLEMENT-CONFIDENTIAL",
+    "hunter2",
+    "0199",
+    "ab",
+)
 
 EXHAUSTIVE_VALUES = len(ALPHABET) + len(ALPHABET) ** 2 + len(ALPHABET) ** 3
 
@@ -173,6 +216,23 @@ def test_no_short_value_survives_its_own_mask() -> None:
 
     assert survivors == []
     assert EXHAUSTIVE_VALUES == 2954  # the count the docstring claims
+
+
+@pytest.mark.parametrize("template", FORMAT_TEMPLATES)
+@pytest.mark.parametrize("payload", PAYLOADS)
+def test_no_format_publishes_the_payload_in_the_segment_it_interpolates(template: str, payload: str) -> None:
+    """The sweep the flat one cannot do: one payload per interpolated segment.
+
+    Both leaks this branch shipped were a segment published verbatim because of
+    where it sat -- the TLD, then the URL scheme. Neither was reachable from
+    strings of three characters. This drives a payload through every slot each
+    branch treats specially and asserts it does not come back out.
+    """
+    raw = template.format(payload=payload)
+    masked = mask(RawCell(raw)).masked
+
+    assert payload not in masked, f"{raw!r} -> {masked!r}"
+    assert concealed(raw) >= min(alnum_total(raw), MIN_MASKED_ALNUM)
 
 
 def test_a_long_value_collapses_instead_of_shaping_character_by_character() -> None:
