@@ -160,3 +160,79 @@ def plan_scan_source(params: ScanSourceParams) -> tuple[PlannedTask, ...]:
             payload={"source_id": str(params.source_id)},
         ),
     )
+
+
+PROFILE_ASSET_GOAL = "profile_asset"
+
+PROFILE_ASSET_TASK_TYPE = "profile_asset"
+"""The task type `profile_asset` plans; `steward_catalog` registers its handler
+under the same name. Same seam as `NOOP_TASK_TYPE`, checked the same way."""
+
+# What a `profile_asset` run may spend (I12). `tokens` and `cost_usd` are zero
+# because profiling is deterministic SQL and calls no model (#49) -- if a later
+# slice makes it call one, the budget has to be raised deliberately rather than
+# discovered to be slack. `wall_clock` is larger than a scan's because the work
+# is: a statistics pass over every row of a relation plus one grouped query per
+# column, where a scan reads catalog metadata only. It is also the source
+# connection's connect and statement timeout (`steward_catalog.profiler`), which
+# reads it off the *task* spec, so a table that stops answering mid-aggregate
+# cannot outlive the cap.
+PROFILE_ASSET_BUDGET = RunBudget(
+    steps=1,
+    tokens=0,
+    cost_usd=Decimal("0.000000"),
+    wall_clock=timedelta(minutes=30),
+)
+
+PROFILE_ASSET_TASK_BUDGET = PROFILE_ASSET_BUDGET
+"""What the one task a `profile_asset` run plans may spend: the run's whole
+budget, the degenerate reservation again (#48)."""
+
+
+class ProfileAssetParams(GoalParams):
+    """`profile_asset`'s parameters: which catalogued asset to profile.
+
+    An asset id, and deliberately nothing else. A relation name would be a
+    string a client chooses arriving at code that composes SQL identifiers; an
+    id resolves through `assets`, whose names a scan read out of the source's
+    own catalog (I5, `steward_catalog._profile_sql`).
+    """
+
+    asset_id: UUID
+
+
+@goal(
+    PROFILE_ASSET_GOAL,
+    params_model=ProfileAssetParams,
+    allowed_task_types=[PROFILE_ASSET_TASK_TYPE],
+    budget=PROFILE_ASSET_BUDGET,
+    sample_payload={"asset_id": "00000000-0000-0000-0000-000000000000"},
+)
+def plan_profile_asset(params: ProfileAssetParams) -> tuple[PlannedTask, ...]:
+    """Expand `profile_asset` into exactly one bounded task -- one asset's worth.
+
+    **Why this is not the fan-out SPEC.md §3.1 sketches.** The natural shape is
+    `profile_source(source_id)` expanding to one task per table, and #48 made
+    such a plan representable by having each `PlannedTask` declare its own
+    budget. What #48 did not do -- and cannot, by design -- is let a planner
+    *find out* what the tasks are: planners are pure functions of their
+    validated params and touch no connection (ARCHITECTURE.md §4), so a
+    per-asset expansion would have to read the catalog at plan time, which
+    makes the planner impure and the determinism harness meaningless. The other
+    route, a handler that enqueues its own children, skips the plan-time
+    reservation altogether -- which is the hole #48 exists to close.
+
+    So the asset is the unit that carries a budget, and a client asks for the
+    assets it wants profiled. That also keeps this slice inside what #48
+    actually enforces: reservation counts each planned task once, and spend on
+    a failed or retried attempt is debited nowhere (SPEC.md §13 D9), so an
+    N-way fan-out would multiply an unaccounted tail under one advertised cap.
+    A per-source expansion belongs with the accounting that can bound it.
+    """
+    return (
+        PlannedTask(
+            task_type=PROFILE_ASSET_TASK_TYPE,
+            budget=PROFILE_ASSET_TASK_BUDGET,
+            payload={"asset_id": str(params.asset_id)},
+        ),
+    )
