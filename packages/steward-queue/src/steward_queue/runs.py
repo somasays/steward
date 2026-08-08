@@ -42,10 +42,12 @@ __all__ = [
 
 The first four and `set_run_status`/`start_run`/`rollup_run_status` are on the
 package façade. `record_usage` deliberately is not: it is the seam `tasks`
-crosses inside a task's own transaction, and the only path that reaches it runs
-the I12 reported-usage check first (`execution._overspent`). Naming it here
-rather than underscoring it says which it is -- an underscore said "do not call
-this" to `tasks`, which has to (#58).
+crosses inside a task's own transaction. Its only caller is `tasks.complete`,
+and the worker's path to that -- the only production path -- runs the I12
+reported-usage check first (`execution._overspent`); `complete` itself is on
+the façade, so that check is a property of the worker's route, not of every
+possible caller. Naming it here rather than underscoring it says which it
+is -- an underscore said "do not call this" to `tasks`, which has to (#58).
 """
 
 

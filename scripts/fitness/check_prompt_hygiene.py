@@ -72,18 +72,32 @@ def run() -> CheckResult:
                 continue
             # Skip docstring nodes: they legitimately contain instruction-like prose.
             docstring_linenos = set()
+            # Exempt from the *length* rule only -- instruction-shaped text is still a
+            # prompt wherever it sits. Same shape as the SQL-module exemption above.
+            attribute_docstrings: set = set()
             for node in ast.walk(tree):
+                body = getattr(node, "body", None)
                 if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    body = getattr(node, "body", [])
                     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
                         docstring_linenos.add(body[0].value.lineno)
+                # PEP 258 attribute docstrings: a bare string directly after an
+                # assignment, at module or class level. Documentation, not a prompt --
+                # missing these made S4 flag `__all__`'s own docstring (issue #21's
+                # family: a check narrower than the rule it enforces).
+                if isinstance(node, (ast.Module, ast.ClassDef)) and body:
+                    for prev, cur in zip(body, body[1:]):
+                        if (isinstance(prev, (ast.Assign, ast.AnnAssign))
+                                and isinstance(cur, ast.Expr)
+                                and isinstance(cur.value, ast.Constant)
+                                and isinstance(cur.value.value, str)):
+                            attribute_docstrings.add(cur.value.lineno)
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
                     continue
                 if node.lineno in docstring_linenos:
                     continue
                 text = node.value
-                exempt = sql_module and SQL_STATEMENT_RE.match(text)
+                exempt = (sql_module and SQL_STATEMENT_RE.match(text)) or node.lineno in attribute_docstrings
                 long_prose = len(text) >= LONG_LITERAL and not exempt
                 prompt_shaped = long_prose or (
                     len(text) >= INSTRUCTION_MIN and INSTRUCTION_RE.search(text))
