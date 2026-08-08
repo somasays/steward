@@ -205,7 +205,9 @@ DRAIN_THE_THIRD_VALUE = "DELETE FROM sales.draining WHERE v = 'pending'"
 
 
 def test_a_profile_reads_one_snapshot_even_while_the_table_changes(
-    source_secret: Secret, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+    source_secret: Secret,
+    source_admin: psycopg.Connection[psycopg.rows.TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The statistics and the samples must describe the same table (I8).
 
@@ -227,7 +229,7 @@ def test_a_profile_reads_one_snapshot_even_while_the_table_changes(
     target = ProfileTarget(schema_name="sales", name="draining", columns=(column("v"),))
 
     with postgres_profiler(source_secret, BUDGET) as reader:
-        profile = _profile_with_drain(reader, target, source_admin)
+        profile = _profile_with_drain(reader, target, source_admin, monkeypatch)
 
     [column_profile] = profile.columns
     assert column_profile.distinct_count == 3
@@ -239,6 +241,7 @@ def _profile_with_drain(
     reader: SourceProfiler,
     target: ProfileTarget,
     admin: psycopg.Connection[psycopg.rows.TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> TableProfile:
     """Run a profile with a committed DELETE landing between its two statements.
 
@@ -246,20 +249,23 @@ def _profile_with_drain(
     is placed *inside* one profile rather than between two, which is where the
     race lives.
     """
-    original = type(reader)._top_values
+    original = PostgresSourceProfiler._top_values
 
-    def draining(self: PostgresSourceProfiler, *args: object, **kwargs: object) -> object:
+    def draining(self: PostgresSourceProfiler, target_: ProfileTarget, column_: DiscoveredColumn):  # type: ignore[no-untyped-def]
         admin.execute(DRAIN_THE_THIRD_VALUE)
-        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+        return original(self, target_, column_)
 
-    type(reader)._top_values = draining  # type: ignore[assignment,method-assign]
-    try:
-        return reader.profile(target)
-    finally:
-        type(reader)._top_values = original  # type: ignore[method-assign]
+    # `monkeypatch` rather than a hand-restored assignment: an interruption
+    # between the assignment and the `try` would leave the class patched for the
+    # rest of the session, and which test then failed would depend on ordering.
+    monkeypatch.setattr(PostgresSourceProfiler, "_top_values", draining)
+    return reader.profile(target)
 
 
 SHOW_STATEMENT_TIMEOUT = "SHOW statement_timeout"
+
+SLEEP_PAST_THE_FLOOR = "SELECT pg_sleep(1)"
+"""Longer than the floor an exhausted budget leaves, so the timeout fires."""
 
 MEASURABLE_DELAY = 0.05
 """Long enough that the budget shrinks by whole milliseconds between columns."""
@@ -272,7 +278,9 @@ TWO_COLUMN_TABLE = (
 
 
 def test_each_statement_is_charged_only_what_is_left_of_the_budget(
-    source_secret: Secret, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+    source_secret: Secret,
+    source_admin: psycopg.Connection[psycopg.rows.TupleRow],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """I12 on a resource held on someone else's database.
 
@@ -283,10 +291,15 @@ def test_each_statement_is_charged_only_what_is_left_of_the_budget(
     the advertised cap -- long after the worker recorded the task
     `budget_exceeded` (#49 review).
 
-    Asserted on what the server reports inside the transaction: the timeout is
-    below the whole budget and never grows. Remove either `_bound_next_statement`
-    call and the session keeps the connection-level value, which is the whole
-    budget, and the first assertion fails.
+    Asserted on what the server reports inside the transaction. Which assertion
+    catches which regression is worth naming, because they are not the same:
+    removing *all* the binds leaves the connection-level value -- the whole
+    budget -- and the `< budget_ms` assertion fails; removing only the
+    per-column bind leaves the stats pass's `set_config`, which persists for the
+    transaction, so both observations read the same value and it is
+    `observed[1] < observed[0]` that fails. A test asserting only the first
+    would pass on a profile that bound one statement and let the rest run at the
+    full cap.
     """
     for statement in TWO_COLUMN_TABLE:
         source_admin.execute(statement)
@@ -294,9 +307,9 @@ def test_each_statement_is_charged_only_what_is_left_of_the_budget(
     observed: list[int] = []
 
     with postgres_profiler(source_secret, BUDGET) as reader:
-        original = type(reader)._top_values
+        original = PostgresSourceProfiler._top_values
 
-        def observing(self: PostgresSourceProfiler, *args: object, **kwargs: object) -> object:
+        def observing(self: PostgresSourceProfiler, target_: ProfileTarget, column_: DiscoveredColumn):  # type: ignore[no-untyped-def]
             # Sleep first, so the budget measurably shrinks between the two
             # columns, then record what the server has *after* this column's
             # own bind. Without the delay both observations are the same
@@ -304,16 +317,13 @@ def test_each_statement_is_charged_only_what_is_left_of_the_budget(
             # that bound only its first statement -- `SET LOCAL` persists for
             # the transaction, so one early call looks identical to N.
             time.sleep(MEASURABLE_DELAY)
-            result = original(self, *args, **kwargs)  # type: ignore[arg-type]
+            result = original(self, target_, column_)
             [(value,)] = self.connection.execute(SHOW_STATEMENT_TIMEOUT).fetchall()
             observed.append(_timeout_ms(value))
             return result
 
-        type(reader)._top_values = observing  # type: ignore[assignment,method-assign]
-        try:
-            reader.profile(target)
-        finally:
-            type(reader)._top_values = original  # type: ignore[method-assign]
+        monkeypatch.setattr(PostgresSourceProfiler, "_top_values", observing)
+        reader.profile(target)
 
     budget_ms = int(BUDGET.total_seconds() * 1000)
     assert len(observed) == 2, "both per-column statements should have been bounded"
@@ -323,20 +333,45 @@ def test_each_statement_is_charged_only_what_is_left_of_the_budget(
     assert observed[1] < observed[0], f"the later statement was not charged the elapsed time: {observed}"
 
 
+TIMEOUT_UNITS_MS: tuple[tuple[str, int], ...] = (
+    ("ms", 1),
+    ("min", 60_000),
+    ("h", 3_600_000),
+    ("d", 86_400_000),
+    ("s", 1_000),
+)
+"""Every unit `SHOW statement_timeout` can render, longest suffix first.
+
+Probed against a real server: `0`, `1ms`, `29943ms`, `29s`, `30s`, `90s`,
+`1min`, `30min`, `1h`. The minute and hour forms are unreachable from this
+file's 30-second `BUDGET` but not from production's -- `PROFILE_ASSET_BUDGET`
+is 30 minutes, which renders `30min` -- so a helper that handled only `ms`/`s`
+would break the moment this test was aligned with the real budget (#49 review).
+`ms` before `min` and `s` last, because `endswith` would otherwise match the
+wrong suffix.
+"""
+
+
 def _timeout_ms(shown: str) -> int:
-    """Postgres renders `statement_timeout` as `30s`, `29500ms` or `0`."""
-    if shown.endswith("ms"):
-        return int(shown[:-2])
-    if shown.endswith("s"):
-        return int(float(shown[:-1]) * 1000)
-    return int(shown) * 1000
+    """`SHOW statement_timeout`'s rendering as whole milliseconds."""
+    for suffix, scale in TIMEOUT_UNITS_MS:
+        if shown.endswith(suffix):
+            return int(float(shown[: -len(suffix)]) * scale)
+    return int(shown)  # bare `0`, the only unitless rendering
 
 
 def test_an_exhausted_budget_leaves_no_time_for_another_statement(
     source_secret: Secret, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
 ) -> None:
-    """The floor, at the boundary: a profile that has already overrun must not
-    start another statement on an unbounded clock."""
+    """The boundary: a profile that has already overrun must not start another
+    statement on an unbounded clock.
+
+    Asserted against the server rather than against the clamp alone. The clamp
+    (`remaining()` never going negative) and the floor
+    (`statement_timeout_ms`'s minimum) are each covered elsewhere; what this
+    adds is that their *composition* reaches Postgres as a timeout that fires,
+    which is the sentence the name makes.
+    """
     for statement in TWO_COLUMN_TABLE:
         source_admin.execute(statement)
 
@@ -346,6 +381,11 @@ def test_an_exhausted_budget_leaves_no_time_for_another_statement(
             reader.connection, BUDGET, time.monotonic() - BUDGET.total_seconds() - 1
         )
         assert spent.remaining() == timedelta(0)
+
+        spent._bound_next_statement()
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            spent.connection.execute(SLEEP_PAST_THE_FLOOR).fetchall()
+        spent.connection.rollback()
 
 
 def test_top_values_truncate_deterministically_when_a_tie_spans_the_cut(
