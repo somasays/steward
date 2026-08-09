@@ -44,6 +44,7 @@ from steward_llm.endpoints import (
 
 __all__ = [
     "APPROVED_ENDPOINTS_ENV",
+    "COMMITTED_CONFIG",
     "CONFIG_PATH_ENV",
     "MODE_ENV",
     "PRODUCTION_ALIASES",
