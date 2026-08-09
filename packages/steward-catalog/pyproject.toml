@@ -1,7 +1,7 @@
 [project]
 name = "steward-catalog"
 version = "0.1.0"
-description = "Deterministic metadata catalog: secret-resolved read-only source inspection, convergent persistence, scan handler (I1/I5/I7/I8)."
+description = "Deterministic catalog: secret-resolved read-only source inspection, masked profiling, convergent persistence, scan and profile handlers (I1/I5/I6/I7/I8)."
 requires-python = ">=3.12"
 dependencies = [
     "steward-schemas",
@@ -16,6 +16,7 @@ dependencies = [
 [tool.uv.sources]
 steward-schemas = { workspace = true }
 steward-queue = { workspace = true }
+steward-telemetry = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -23,6 +24,13 @@ dev = [
     # visibility), so the harnesses run against a real server; pgserver ships
     # the binaries, no Docker (GUARDRAILS.md Tier H).
     "pgserver>=0.1.4",
+    # H7 builds a recording `Tracer` to assert no canary reaches a span
+    # payload, so the test tree needs the tracing contract. Declared rather
+    # than leaned on transitively through steward-queue: import-linter's
+    # `root_packages` are the `src/` trees, so an undeclared edge in a test
+    # tree is invisible to S1 and survives until the transitive path moves.
+    # Same rule orchestration's own dev group follows for its test-only deps.
+    "steward-telemetry",
 ]
 
 [build-system]

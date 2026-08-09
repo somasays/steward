@@ -12,7 +12,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from steward_schemas import (
     CONTRACTS,
     AgentSpec,
@@ -22,17 +22,22 @@ from steward_schemas import (
     AssetPage,
     AssetType,
     Column,
+    ColumnProfile,
+    MaskedSample,
     ProblemDetails,
     Run,
     RunBudget,
     RunCreate,
     RunStatus,
+    SemanticType,
     Source,
     SourceCreate,
     SourceEngine,
+    TableProfile,
     TaskResult,
     TaskSpec,
     TaskStatus,
+    ValueFrequency,
 )
 
 WORKSPACE_ID = UUID("11111111-1111-1111-1111-111111111111")
@@ -99,6 +104,33 @@ def build_column() -> Column:
         created_at=NOW,
         updated_at=NOW,
     )
+
+
+def build_masked_sample() -> MaskedSample:
+    return MaskedSample(masked="j***@g***.***", semantic_type=SemanticType.EMAIL, length=17)
+
+
+def build_value_frequency() -> ValueFrequency:
+    return ValueFrequency(value=build_masked_sample(), count=12)
+
+
+def build_column_profile() -> ColumnProfile:
+    return ColumnProfile(
+        name="email",
+        data_type="text",
+        null_count=3,
+        null_ratio=Decimal("0.030000"),
+        distinct_count=97,
+        distinct_ratio=Decimal("0.970000"),
+        min_value=build_masked_sample(),
+        max_value=build_masked_sample(),
+        top_values=(build_value_frequency(),),
+        semantic_type=SemanticType.EMAIL,
+    )
+
+
+def build_table_profile() -> TableProfile:
+    return TableProfile(row_count=100, columns=(build_column_profile(),))
 
 
 def build_source_create() -> SourceCreate:
@@ -197,6 +229,10 @@ SAMPLES: dict[str, BaseModel] = {
     "asset_detail": build_asset_detail(),
     "asset_page": build_asset_page(),
     "column": build_column(),
+    "masked_sample": build_masked_sample(),
+    "value_frequency": build_value_frequency(),
+    "column_profile": build_column_profile(),
+    "table_profile": build_table_profile(),
     "task_spec": build_task_spec(),
     "task_result": build_task_result_succeeded(),
     "run_budget": build_run_budget(),
@@ -213,7 +249,40 @@ EXTRA_SAMPLES: dict[str, BaseModel] = {
     "asset_page_last": AssetPage(items=()),
     "task_result_failed": build_task_result_failed(),
     "problem_details_minimal": ProblemDetails(title="Internal error", status=500),
+    "column_profile_unsampled": ColumnProfile(
+        name="notes",
+        data_type="text",
+        null_count=0,
+        null_ratio=Decimal("0.000000"),
+        distinct_count=0,
+        distinct_ratio=Decimal("0.000000"),
+    ),
+    "table_profile_empty": TableProfile(row_count=0),
 }
+
+
+def test_a_profile_cannot_carry_an_unmasked_value() -> None:
+    """I6 at the contract: the sample fields take `MaskedSample`, not `str`.
+
+    `mypy --strict` is the real enforcement (G2) -- this asserts the runtime
+    agrees, so the guarantee does not depend on the type checker having been
+    run over the code that built the profile.
+    """
+    raw = "ada@example.com"
+    for field, value in (("min_value", raw), ("max_value", raw), ("top_values", (raw,))):
+        try:
+            ColumnProfile(
+                name="email",
+                data_type="text",
+                null_count=0,
+                null_ratio=Decimal("0"),
+                distinct_count=1,
+                distinct_ratio=Decimal("1"),
+                **{field: value},
+            )
+        except ValidationError:
+            continue
+        raise AssertionError(f"{field} accepted a raw string")
 
 
 def test_samples_cover_every_registered_contract() -> None:

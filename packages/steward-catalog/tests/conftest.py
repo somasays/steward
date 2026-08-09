@@ -35,15 +35,106 @@ SCAN_BUDGET = RunBudget(steps=4, tokens=0, cost_usd=Decimal("0"), wall_clock=tim
 
 TRUNCATE_CATALOG = "TRUNCATE runs, tasks, checkpoints, audit_log, sources CASCADE"
 
+# The canaries H7 hunts for (GUARDRAILS.md Tier H, issue #49). They are planted
+# in the fixture data below and the harness asserts that none of them appears in
+# a profile row, an audit row, a log line, a span payload -- or anywhere else in
+# Steward's database. Each is a distinctive token that occurs nowhere else in
+# the repository, so a match is evidence of a leak rather than a coincidence.
+CANARY_EMAIL = "canary.7f3a91d2@steward-canary.test"
+CANARY_CARD = "4539578763621486"
+CANARY_SECRET = "STEWARD-CANARY-TOKEN-9c4e17b6d05f"
+
+CANARY_AFTER_LAST_DOT = "case@2026.CANARY-DIAGNOSIS-4b81f7ac"
+"""A canary whose payload sits *after the last dot*.
+
+The other three are shaped like the values whoever wrote the masker was
+picturing, and that is exactly why they missed the leak this one exists for:
+`_mask_email` interpolated the TLD verbatim, and every canary above has `.test`
+or no dot at all as its tail, so the harness watched the leak happen and
+reported green. A canary is only evidence for the shapes it takes -- so this
+one takes the shape a notes or reference column produces by accident: no
+whitespace, one `@`, a dot, and something confidential behind it.
+"""
+
+CANARY_BEFORE_SCHEME = "X-CANARY-CASE-7d21e9f0://host/path"
+"""A canary whose payload sits *before* the `://`.
+
+The third escape of #49 in canary form: `_mask_url` published the scheme
+verbatim because of where it sat, and no canary was URL-shaped, so H7 could not
+see it -- exactly as no canary had a meaningful TLD when `_mask_email` published
+that. The unit sweep in `test_masking.py` is the primary cover for both; this
+is here so the *harness* stops being blind to the shape as well.
+"""
+
+CANARIES: tuple[str, ...] = (
+    CANARY_EMAIL,
+    CANARY_CARD,
+    CANARY_SECRET,
+    CANARY_AFTER_LAST_DOT,
+    CANARY_BEFORE_SCHEME,
+)
+
+CANARY_TAIL = CANARY_AFTER_LAST_DOT.rpartition(".")[2]
+"""The payload alone -- `CANARY-DIAGNOSIS-4b81f7ac`. Swept for separately,
+because a mask that published only the tail would leave the full string absent
+and every assertion green."""
+
+CANARY_HEAD = CANARY_BEFORE_SCHEME.partition("://")[0]
+"""The payload alone -- `X-CANARY-CASE-7d21e9f0` -- and the same necessity as
+`CANARY_TAIL`, which the first version of the scheme canary missed.
+
+A scheme-publishing regression writes `X-CANARY-CASE-7d21e9f0://h***/****`: the
+payload is right there, and the *full* canary is not a substring of it, so a
+sweep for the whole string returns nothing and H7 reports green. A canary that
+cannot detect the leak it was added for is worse than no canary, because the
+row in GUARDRAILS then claims a region is covered. Swept on its own below."""
+
 # The fixture estate. Two schemas so filtering has something to filter, a view
 # so `asset_type` has two values, and a nullable column so `nullable` does.
 FIXTURE_ESTATE: tuple[str, ...] = (
     "CREATE SCHEMA sales",
     "CREATE SCHEMA staging",
     "CREATE TABLE sales.orders (id bigint NOT NULL, customer text, total numeric(10,2))",
-    "CREATE TABLE sales.customers (id bigint NOT NULL, email text NOT NULL)",
+    "CREATE TABLE sales.customers (id bigint NOT NULL, email text NOT NULL, card text)",
     "CREATE VIEW sales.recent_orders AS SELECT id, total FROM sales.orders",
     "CREATE TABLE staging.raw_events (id bigint NOT NULL, body text)",
+)
+
+# Rows, because profiling has nothing to say about an empty table (issue #49).
+# Scanning is metadata-only and is unaffected by them. `customers` carries both
+# ordinary values and the canaries, so H7's assertions are made about a table
+# that was really profiled rather than one that happened to be skipped.
+#
+# The canaries are bound as parameters rather than interpolated: this is a test
+# fixture, but an f-string here would be string-built SQL and S3 (ruff S608)
+# does not have a "but it is only a test" clause -- suppressing it would be the
+# first pragma in this package (I5).
+FIXTURE_DATA: tuple[tuple[str, dict[str, str]], ...] = (
+    # Three or more distinct values per column, deliberately: a column with two
+    # or fewer is suppressed wholesale (`masking.LOW_CARDINALITY_MAX`), so a
+    # narrower fixture would test the suppression rather than the masking these
+    # tests are about. The canary columns need to reach the masker to be
+    # evidence at all.
+    (
+        "INSERT INTO sales.orders (id, customer, total) VALUES "
+        "(1, 'ada', 10.50), (2, 'grace', 10.50), (3, NULL, 99.99), (4, 'hopper', 12.75)",
+        {},
+    ),
+    (
+        "INSERT INTO sales.customers (id, email, card) VALUES "
+        "(1, 'ada@example.com', '4111111111111111'), (2, %(email)s, %(card)s), "
+        "(3, 'grace@example.org', '5555555555554444'), (4, 'hopper@example.net', NULL)",
+        {"email": CANARY_EMAIL, "card": CANARY_CARD},
+    ),
+    (
+        "INSERT INTO staging.raw_events (id, body) VALUES "
+        "(1, %(secret)s), (2, 'ordinary event'), (3, %(tail)s), (4, %(scheme)s)",
+        {
+            "secret": CANARY_SECRET,
+            "tail": CANARY_AFTER_LAST_DOT,
+            "scheme": CANARY_BEFORE_SCHEME,
+        },
+    ),
 )
 
 GRANT_READER: tuple[str, ...] = (
@@ -54,6 +145,58 @@ GRANT_READER: tuple[str, ...] = (
     # write proof version-independent.
     "REVOKE ALL ON SCHEMA public FROM PUBLIC",
 )
+
+
+def build_estate(conn: psycopg.Connection[psycopg.rows.TupleRow]) -> None:
+    """Create the fixture estate, fill it, and grant the reader its access.
+
+    One function so the session fixture and the per-test teardown build the
+    same estate; a test that dropped a table would otherwise decide what the
+    next test sees.
+    """
+    for statement in FIXTURE_ESTATE:
+        conn.execute(statement)
+    for statement, params in FIXTURE_DATA:
+        conn.execute(statement, params or None)
+    for statement in GRANT_READER:
+        conn.execute(statement)
+
+
+@pytest.fixture(scope="session")
+def canaries() -> tuple[str, ...]:
+    """The planted secrets, as a fixture rather than an import.
+
+    Tests run under `--import-mode=importlib`, so a test module cannot import
+    this one; a fixture is how a conftest constant reaches a test here.
+    """
+    return CANARIES
+
+
+@pytest.fixture(scope="session")
+def canary_email() -> str:
+    return CANARY_EMAIL
+
+
+@pytest.fixture(scope="session")
+def canary_card() -> str:
+    return CANARY_CARD
+
+
+@pytest.fixture(scope="session")
+def canary_secret() -> str:
+    return CANARY_SECRET
+
+
+@pytest.fixture(scope="session")
+def canary_tail() -> str:
+    """The payload behind the last dot, swept for on its own."""
+    return CANARY_TAIL
+
+
+@pytest.fixture(scope="session")
+def canary_head() -> str:
+    """The payload before the `://`, swept for on its own."""
+    return CANARY_HEAD
 
 
 @pytest.fixture(scope="session")
@@ -83,8 +226,7 @@ def source_admin_dsn(pg_server: pgserver.PostgresServer) -> str:
     pg_server.psql("CREATE ROLE steward_reader LOGIN")
     uri: str = pg_server.get_uri(database=SOURCE_DATABASE)
     with psycopg.connect(uri, autocommit=True) as conn:
-        for statement in (*FIXTURE_ESTATE, *GRANT_READER):
-            conn.execute(statement)
+        build_estate(conn)
     return uri
 
 
@@ -133,8 +275,9 @@ def source_admin(source_admin_dsn: str) -> Iterator[psycopg.Connection[psycopg.r
     conn = psycopg.connect(source_admin_dsn, autocommit=True)
     try:
         yield conn
-        for statement in (*RESET_ESTATE, *FIXTURE_ESTATE, *GRANT_READER):
+        for statement in RESET_ESTATE:
             conn.execute(statement)
+        build_estate(conn)
     finally:
         conn.close()
 

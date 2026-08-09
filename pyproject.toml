@@ -120,8 +120,11 @@ source_modules = ["steward_catalog"]
 # steward_telemetry is absent from this list because these contracts are
 # transitive: steward-queue depends on it (the worker's task span), so every
 # importer of the queue reaches it and forbidding it here would be unenforceable
-# theatre. steward-catalog imports it directly nowhere, and the day it needs to,
-# the edge is already declared on the package it would go through.
+# theatre. The package's `src/` imports it nowhere; its *test* tree does, to
+# build the recording tracer H7 asserts span payloads with, and that edge is
+# declared in the package's own dev group -- import-linter cannot see test
+# trees, so a dependency that lives only there has to be written down by hand
+# (#49 review).
 forbidden_modules = ["steward_agents", "steward_llm", "steward_orchestration", "steward_retrieval", "steward_sdk"]
 
 # steward-orchestration is a leaf below: the goal registry knows task *type

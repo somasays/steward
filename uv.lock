@@ -1464,6 +1464,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "pgserver" },
+    { name = "steward-telemetry" },
 ]
 
 [package.metadata]
@@ -1474,7 +1475,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pgserver", specifier = ">=0.1.4" }]
+dev = [
+    { name = "pgserver", specifier = ">=0.1.4" },
+    { name = "steward-telemetry", editable = "packages/steward-telemetry" },
+]
 
 [[package]]
 name = "steward-llm"
