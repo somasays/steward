@@ -59,7 +59,7 @@ from collections.abc import Sequence
 from datetime import timedelta
 
 import psycopg
-from steward_schemas import ProblemDetails, TaskResult
+from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskStatus
 from steward_telemetry import NoopTracer, Span, SpanOutcome, Tracer
 
 from steward_queue import tasks
@@ -266,6 +266,13 @@ class Worker:
         """
         if isinstance(outcome, ProblemDetails):
             self._fail(conn, task, outcome)
+        elif outcome.status is not TaskStatus.SUCCEEDED:
+            self._fail(
+                conn,
+                task,
+                outcome.error or problem(HANDLER_FAILED, outcome.status.value),
+                usage=outcome.usage,
+            )
         else:
             self._succeed(conn, outcome)
 
@@ -274,13 +281,21 @@ class Worker:
         tasks.complete(conn, result, claimed_by=self._worker_id, actor=self._actor)
         conn.commit()
 
-    def _fail(self, conn: QueueConnection, task: ClaimedTask, error: ProblemDetails) -> None:
+    def _fail(
+        self,
+        conn: QueueConnection,
+        task: ClaimedTask,
+        error: ProblemDetails,
+        *,
+        usage: RunBudget | None = None,
+    ) -> None:
         conn.rollback()  # discard the failed attempt's partial writes before recording it
         set_statement_timeout(conn, self._lease)
         tasks.fail(
             conn,
             task.spec.task_id,
             error,
+            usage=usage,
             base_delay=self._retry_base_delay,
             factor=self._retry_factor,
             max_delay=self._retry_max_delay,

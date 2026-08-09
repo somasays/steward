@@ -326,7 +326,12 @@ async def reports_failure(ctx: TaskContext) -> TaskResult:
     return TaskResult(
         task_id=ctx.spec.task_id,
         status=TaskStatus.FAILED,
-        usage=NO_USAGE,
+        usage=RunBudget(
+            steps=int(ctx.spec.payload.get("used_steps", 0)),
+            tokens=int(ctx.spec.payload.get("used_tokens", 0)),
+            cost_usd=Decimal(str(ctx.spec.payload.get("used_cost_usd", "0"))),
+            wall_clock=timedelta(0),
+        ),
         error=ProblemDetails(type="urn:steward:test", title="declined", status=422),
     )
 
@@ -507,6 +512,25 @@ class TestFailurePaths:
         task = get_task(conn, spec.task_id)
         assert task is not None and task.state is TaskState.DEAD
         assert "task.dead" in audit_actions(conn, spec.task_id)
+
+    async def test_typed_failure_usage_is_debited_on_every_retry(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        spec = queued(
+            task_type=REPORTS_FAILURE,
+            payload={"used_steps": 1, "used_tokens": 7, "used_cost_usd": "0.02"},
+            max_attempts=2,
+        )
+        worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
+
+        assert await worker.run_once() == 1
+        assert await worker.run_once() == 1
+
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        assert run.usage.steps == 2
+        assert run.usage.tokens == 14
+        assert run.usage.cost_usd == Decimal("0.04")
 
     async def test_a_handler_that_outruns_its_wall_clock_budget_is_terminated(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]

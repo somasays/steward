@@ -32,7 +32,7 @@ from typing import Any
 from uuid import UUID
 
 from psycopg.types.json import Jsonb
-from steward_schemas import ProblemDetails, TaskResult, TaskSpec
+from steward_schemas import ProblemDetails, RunBudget, TaskResult, TaskSpec, TaskStatus
 
 from steward_queue import _sql
 from steward_queue._rows import budget_from, budget_params, require_row
@@ -266,6 +266,7 @@ def fail(
     task_id: UUID,
     error: ProblemDetails,
     *,
+    usage: RunBudget | None = None,
     retryable: bool = True,
     base_delay: timedelta = DEFAULT_BASE_DELAY,
     factor: float = DEFAULT_FACTOR,
@@ -313,6 +314,13 @@ def fail(
         )
         after = {"state": landed.value, "attempts": attempts}
     run_id: UUID = require_row(outcome.fetchone(), "task transition returned no row")[0]
+    if usage is not None:
+        record_usage(
+            conn,
+            run_id,
+            TaskResult(task_id=task_id, status=TaskStatus.FAILED, usage=usage, error=error),
+            actor=actor,
+        )
     write_audit(
         conn,
         actor=actor,
