@@ -138,9 +138,9 @@ def test_every_service_entry_point_refuses_an_off_allowlist_gateway(tmp_path: Pa
 
 
 def test_the_committed_config_is_not_refused_by_any_entry_point(tmp_path: Path) -> None:
-    """The control: without it, an entry point that refused unconditionally — or
-    one that died of an unset DSN before ever looking — would satisfy the test
-    above."""
+    """The control: without it, an entry point that refused every config it was
+    given — or one whose refusal was hard-coded rather than read — would satisfy
+    the test above."""
     entry_points = service_entry_points()
     assert entry_points, "enumerated no service entry points — this harness would prove nothing"
 
