@@ -89,67 +89,124 @@ slices the result row by this, so the two must agree -- which is why the
 unordered branch emits `NULL::text` twice rather than fewer columns."""
 
 ORDERED_COLUMNS = """
-SELECT a.attname
-FROM pg_catalog.pg_attribute AS a
-JOIN pg_catalog.pg_class AS c ON c.oid = a.attrelid
-JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-JOIN pg_catalog.pg_type AS t ON t.oid = a.atttypid
-WHERE n.nspname = %(schema_name)s
-  AND c.relname = %(name)s
-  AND a.attnum > 0
-  AND NOT a.attisdropped
-  AND EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_proc AS p
-      WHERE p.proname = 'min' AND p.prokind = 'a'
-        AND (
-            p.proargtypes[0] = COALESCE(NULLIF(t.typbasetype, 0), a.atttypid)
-            OR EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_cast AS implicit
-                WHERE implicit.castsource = COALESCE(NULLIF(t.typbasetype, 0), a.atttypid)
-                  AND implicit.casttarget = p.proargtypes[0]
-                  AND implicit.castcontext IN ('i', 'b')
-            )
-            OR (p.proargtypes[0] = 'anyarray'::regtype AND t.typcategory = 'A')
-            OR (p.proargtypes[0] = 'anyenum'::regtype AND t.typcategory = 'E')
-        )
-  )
+WITH col AS (
+    SELECT a.attname,
+           COALESCE(NULLIF(t.typbasetype, 0), a.atttypid) AS effective
+    FROM pg_catalog.pg_attribute AS a
+    JOIN pg_catalog.pg_class AS c ON c.oid = a.attrelid
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_type AS t ON t.oid = a.atttypid
+    WHERE n.nspname = %(schema_name)s
+      AND c.relname = %(name)s
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+)
+SELECT col.attname
+FROM col
+JOIN pg_catalog.pg_type AS et ON et.oid = col.effective
+WHERE (
+    SELECT count(DISTINCT p.proname)
+    FROM pg_catalog.pg_proc AS p
+    WHERE p.proname IN ('min', 'max')
+      AND p.prokind = 'a'
+      AND p.pronargs = 1
+      AND pg_catalog.pg_function_is_visible(p.oid)
+      AND (
+          p.proargtypes[0] = col.effective
+          OR EXISTS (
+              SELECT 1
+              FROM pg_catalog.pg_cast AS implicit
+              WHERE implicit.castsource = col.effective
+                AND implicit.casttarget = p.proargtypes[0]
+                AND implicit.castcontext IN ('i', 'b')
+          )
+          OR (
+              p.proargtypes[0] = 'anyarray'::regtype
+              AND et.typcategory = 'A'
+              AND EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_type AS elem
+                  JOIN pg_catalog.pg_opclass AS oc
+                    ON oc.opcintype = CASE
+                           WHEN elem.typtype = 'e' THEN 'anyenum'::regtype
+                           ELSE COALESCE(NULLIF(elem.typbasetype, 0), elem.oid)
+                       END
+                  JOIN pg_catalog.pg_am AS am ON am.oid = oc.opcmethod
+                  WHERE elem.oid = et.typelem
+                    AND am.amname = 'btree'
+                    AND oc.opcdefault
+              )
+          )
+          OR (p.proargtypes[0] = 'anyenum'::regtype AND et.typcategory = 'E')
+      )
+) = 2
 """
-"""Which of a relation's columns have a `min`/`max` aggregate at all.
+"""Which of a relation's columns can have `min`/`max` run over them.
 
 **Asked of the server, not guessed from a type name**, and that distinction is
 the whole point: an allowlist of "numeric and temporal types" drifts the moment
 a source uses a domain, an enum, an array or an extension type, and the failure
-mode of guessing *wrong* is a query that errors and fails the whole profile.
+mode of guessing *wrong* is a query that errors and fails the whole profile --
+every column of it, since the extrema ride in one `stats_query`.
 
 It is also not the question it first looks like. The obvious oracle -- does the
 type have a default btree operator class -- is **wrong in six ways**, measured:
 `uuid`, `bytea`, `jsonb` and `boolean` are all orderable and have no `min`
 aggregate, while `varchar` and arrays have `min` and no matching opclass entry.
-Ordering and aggregation are different facts about a type, and only the second
-one is what this query needs.
+Ordering and aggregation are different facts about a type.
 
-So it asks `pg_proc` directly, the way Postgres resolves the call itself:
-an exact argument-type match, an implicit or binary-coercible cast to one
-(`varchar` -> `text`), or one of the two polymorphic signatures (`anyarray`,
-`anyenum`). Domains resolve through `typbasetype`. A type this misses simply
-publishes no extrema, so being wrong costs a fact rather than inventing one --
-and `tests/test_profiler.py` asserts the prediction against what `min()` really
-does, over every type class, so the two cannot drift silently.
+So it asks `pg_proc` the way Postgres resolves the call itself: an exact
+argument-type match, an implicit or binary-coercible cast to one (`varchar` ->
+`text`), or one of the two polymorphic signatures. Domains resolve through
+`typbasetype`.
+
+Three things that "does an aggregate exist" alone gets wrong, each of which
+fails in the direction that errors the profile:
+
+* **An array resolves and still cannot run.** `min(anyarray)` matches *every*
+  array type, and executes only where the element type has a comparison
+  function -- `min(json[])` over two distinct values is
+  `could not identify a comparison function for type json`. So the opclass
+  question, disproved above as the *sole* oracle, is the missing second half
+  here: the `anyarray` branch requires a default btree opclass on the element
+  type (resolved through the element's own base type for a domain, and through
+  `anyenum` for an enum element, which is where `pg_opclass` files `enum_ops`).
+  This is `uuid[]`, `boolean[]` and `jsonb[]` orderable while `json[]`,
+  `point[]` and `box[]` are not -- the opposite of how their element types
+  answer the aggregate question.
+* **`pg_proc` is the cluster, not the session.** A `min` aggregate in a schema
+  outside the connection's `search_path` satisfies the prediction and then
+  `function min(...) does not exist` at run time, so `pg_function_is_visible`
+  is required -- sound because `_ordered_columns` runs on the same connection
+  as the statistics.
+* **Both aggregates are needed, not one.** `_TYPED_EXTREMA` runs `min` *and*
+  `max`, so the count over distinct `proname` must reach 2. `pronargs = 1`
+  keeps a two-argument function of the same name out of it.
+
+What it still under-predicts: an array whose element is a **composite** type.
+Postgres compares those through `record_ops`, which `pg_opclass` files under
+the `record` pseudo-type rather than under the composite, so the conjunct above
+does not find it and the column publishes no extrema. That is the direction
+this design chooses to be wrong in -- one fact lost, never a failed profile --
+and `tests/test_profiler.py` asserts it by name rather than letting it hide
+inside an inequality. That test runs `min` *and* `max` over a probe holding two
+distinct non-null values in every column, so a type that resolves and fails to
+execute is caught; an earlier version left the probe empty and could only ever
+re-ask the prediction's own question.
 """
 
 
 SET_LOCAL_STATEMENT_TIMEOUT = "SELECT set_config('statement_timeout', %(milliseconds)s, true)"
 """Charge the next statement only what is left of the budget.
 
-A profile is one statement per column plus one, all inside a single
-`REPEATABLE READ` transaction, so a per-statement timeout of the whole budget
-bounds nothing that matters: the transaction -- and the `ACCESS SHARE` lock and
-`xmin` pin it holds on a *customer's* relation -- would live for N+1 times the
-cap (#49 review). Charging each statement the remaining time makes the
-transaction's total the budget, and a profile that has already overrun fails on
-its next statement rather than starting another.
+A profile is one statement per column plus two -- the `ORDERED_COLUMNS` lookup
+and the statistics pass -- all inside a single `REPEATABLE READ` transaction, so
+a per-statement timeout of the whole budget bounds nothing that matters: the
+transaction -- and the `ACCESS SHARE` lock and `xmin` pin it holds on a
+*customer's* relation -- would live for N+2 times the cap (#49 review, #70).
+Charging each statement the remaining time makes the transaction's total the
+budget, and a profile that has already overrun fails on its next statement
+rather than starting another.
 
 `set_config(..., is_local => true)` rather than `SET LOCAL`: it is the same
 thing, reverts when the transaction ends, and takes the value as a **bound

@@ -593,14 +593,24 @@ def test_a_relation_with_no_columns_to_profile_still_reports_its_row_count(
     assert profile.columns == ()
 
 
-# Every type class a source might hold, including the six that disprove the
-# obvious design. `ORDERED_COLUMNS` asks whether a `min` aggregate resolves;
-# the tempting question -- does the type have a btree operator class -- gets
-# `uuid`, `bytea`, `jsonb` and `boolean` wrong in one direction (orderable, no
-# aggregate) and `varchar` and arrays wrong in the other.
+# Every type class a source might hold, including the ones that disprove the
+# obvious designs. `ORDERED_COLUMNS` asks whether `min`/`max` aggregates resolve
+# *and* can run; the tempting question -- does the type have a btree operator
+# class -- gets `uuid`, `bytea`, `jsonb` and `boolean` wrong in one direction
+# (orderable, no aggregate) and `varchar` and arrays wrong in the other. For an
+# array the opclass is not a replacement for the aggregate question but the
+# missing second half of it: `min(anyarray)` resolves for *every* array type and
+# executes only where the element type has a comparison function, which is
+# precisely what a default btree opclass on the element provides. So this table
+# carries arrays on both sides of that line -- `uuid[]`/`boolean[]`/`jsonb[]`
+# execute (no `min` aggregate on the element, but an opclass), `json[]`,
+# `point[]` and `box[]` do not.
 TYPE_PROBE = (
     "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+    "CREATE TYPE pair AS (a integer, b integer)",
     "CREATE DOMAIN positive_int AS integer CHECK (VALUE > 0)",
+    "CREATE DOMAIN int_array AS integer[]",
+    "CREATE DOMAIN json_doc AS json",
     "CREATE TABLE sales.probe ("
     "  c_int integer, c_bigint bigint, c_smallint smallint, c_numeric numeric(10,2),"
     "  c_real real, c_float double precision, c_money money,"
@@ -610,30 +620,115 @@ TYPE_PROBE = (
     "  c_interval interval, c_json json, c_jsonb jsonb, c_xml xml, c_point point,"
     "  c_inet inet, c_cidr cidr, c_macaddr macaddr, c_array integer[],"
     "  c_textarray text[], c_domain positive_int, c_oid oid, c_bit bit(3),"
-    "  c_tsvector tsvector, c_enum mood)",
+    "  c_tsvector tsvector, c_enum mood,"
+    "  c_jsonarray json[], c_pointarray point[], c_boxarray box[], c_uuidarray uuid[],"
+    "  c_jsonbarray jsonb[], c_boolarray boolean[], c_enumarray mood[],"
+    "  c_domainarray int_array, c_domarr positive_int[], c_domjsonarray json_doc[],"
+    "  c_pairarray pair[])",
+    # Two rows, two distinct non-null values in every column but `c_xml`. This
+    # is what makes the test a test: `min(anyarray)` *resolves* for every array
+    # type and only fails to find a comparison function once it has two values
+    # to compare, so an empty probe asks the same question `ORDERED_COLUMNS`
+    # asks (does it resolve) and the prediction is compared with itself.
+    "INSERT INTO sales.probe VALUES ("
+    "  2, 2, 2, 2.5, 2.5, 2.5, '2.00',"
+    "  'a', 'a', 'a', 'a',"
+    "  false, '11111111-1111-1111-1111-111111111111', '\\x01',"
+    "  '2020-01-01', '2020-01-01 00:00', '2020-01-01 00:00+00', '00:00', '00:00+00',"
+    "  '1 hour', '{\"a\":1}', '{\"a\":1}', NULL, '(1,1)',"
+    "  '10.0.0.1', '10.0.0.0/8', '08:00:2b:01:02:03', '{1}',"
+    "  '{a}', 1, 1, B'001', to_tsvector('a'), 'sad',"
+    "  ARRAY['{\"a\":1}'::json], ARRAY['(1,1)'::point], ARRAY['((0,0),(1,1))'::box],"
+    "  ARRAY['11111111-1111-1111-1111-111111111111'::uuid], ARRAY['{\"a\":1}'::jsonb],"
+    "  ARRAY[false], ARRAY['sad'::mood], '{1}', '{1}', ARRAY['{\"a\":1}'::json_doc],"
+    "  ARRAY[(1,1)::pair])",
+    "INSERT INTO sales.probe VALUES ("
+    "  100, 100, 100, 100.5, 100.5, 100.5, '100.00',"
+    "  'b', 'b', 'b', 'b',"
+    "  true, '22222222-2222-2222-2222-222222222222', '\\x02',"
+    "  '2021-01-01', '2021-01-01 00:00', '2021-01-01 00:00+00', '01:00', '01:00+00',"
+    "  '10 days', '{\"b\":2}', '{\"b\":2}', NULL, '(2,2)',"
+    "  '10.0.0.2', '10.1.0.0/16', '08:00:2b:01:02:04', '{2}',"
+    "  '{b}', 2, 2, B'010', to_tsvector('b'), 'happy',"
+    "  ARRAY['{\"b\":2}'::json], ARRAY['(2,2)'::point], ARRAY['((0,0),(2,2))'::box],"
+    "  ARRAY['22222222-2222-2222-2222-222222222222'::uuid], ARRAY['{\"b\":2}'::jsonb],"
+    "  ARRAY[true], ARRAY['happy'::mood], '{2}', '{2}', ARRAY['{\"b\":2}'::json_doc],"
+    "  ARRAY[(2,2)::pair])",
     "GRANT SELECT ON sales.probe TO steward_reader",
 )
 
+UNVALUED_PROBE_COLUMN = "c_xml"
+"""The one probe column that holds no value.
+
+`pgserver`'s Postgres is built without libxml, so an `xml` literal is rejected
+outright. It costs nothing here: `xml` has no `min` aggregate, so it fails at
+*resolution* and how many rows exist never enters into it. Named rather than
+skipped silently, because "this column has no values" is exactly the condition
+that made the earlier version of this test vacuous.
+"""
+
+# `pair[]`: an array whose element is a composite type. Postgres compares those
+# through `record_ops`, an opclass `pg_opclass` files under the `record`
+# pseudo-type rather than under `pair`, so the element-opclass conjunct does not
+# find it and the column is predicted *unordered* while `min()` runs fine. That
+# is the safe direction -- a fact not published, never a query that errors --
+# and it is asserted by name here so the residual stays visible instead of being
+# absorbed into a `<=`.
+UNDER_PREDICTED_BY_DESIGN = frozenset({"c_pairarray"})
+
 PROBE_COLUMN_NAMES = (
-    "SELECT attname FROM pg_attribute WHERE attrelid = 'sales.probe'::regclass AND attnum > 0"
+    "SELECT attname FROM pg_attribute WHERE attrelid = 'sales.probe'::regclass "
+    "AND attnum > 0 AND NOT attisdropped"
 )
 
+PROBE_COLUMN_VALUES = sql.SQL("SELECT count({col}), count(DISTINCT ({col})::text) FROM sales.probe")
 
-def test_the_orderability_prediction_matches_what_min_actually_does(
+
+def _aggregate_runs(
+    connection: psycopg.Connection[psycopg.rows.TupleRow], aggregate: str, column: str
+) -> bool:
+    """Whether `aggregate(column)` actually executes on this connection.
+
+    Inside a savepoint, so a failure does not abort the profiler's transaction
+    and the next column is asked on the same session -- same role, same
+    `search_path`, same snapshot as the prediction. That matters: an aggregate
+    the prediction can see and the executing role cannot is one of the ways
+    these two answers come apart.
+    """
+    try:
+        with connection.transaction():
+            connection.execute(
+                sql.SQL("SELECT {agg}({col})::text FROM sales.probe").format(
+                    agg=sql.Identifier(aggregate), col=sql.Identifier(column)
+                )
+            ).fetchall()
+    except psycopg.Error:
+        return False
+    return True
+
+
+def test_the_orderability_prediction_matches_what_min_and_max_actually_do(
     source_secret: Secret, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
 ) -> None:
     """`ORDERED_COLUMNS` must agree with the server, type class by type class.
 
-    This is the check that keeps the prediction honest. It is a catalog query
-    standing in for "does `min(col)` resolve", and the two can drift -- a new
-    Postgres release adds an aggregate, an extension adds a type, someone
-    simplifies the polymorphic branches away. So the test asks both and compares:
-    the prediction against actually running `min()` on every column of a table
-    that holds every type class this codebase can name, including the six that
-    make the obvious implementation wrong.
+    This is the check that keeps the prediction honest, and it only is one if
+    the probe holds **data**. `min(anyarray)` resolves for every array type and
+    fails at *execution* -- "could not identify a comparison function for type
+    json" -- the moment there are two values to compare. An empty probe asks the
+    catalog the same question `ORDERED_COLUMNS` asks it, so prediction and
+    oracle were interrogating one fact and the test could not fail: `json[]`,
+    `point[]` and `box[]` were predicted ordered, and a real column of either
+    errored the *whole asset profile*, because the extrema ride in the single
+    stats query. Hence the two rows and the guard below.
 
-    Failing *this* is the good outcome. A drift in the safe direction costs a
-    fact; a drift in the other errors the whole profile.
+    Both aggregates are asked, not just `min`, because `_TYPED_EXTREMA` runs
+    both; and both are asked on the profiler's own connection, because the
+    prediction is only sound for the session that will run the statistics.
+
+    The two directions of disagreement are not the same failure, so they are
+    asserted separately. Predicting ordered where the aggregate cannot run
+    errors the whole profile; predicting unordered where it can costs one fact.
     """
     for statement in TYPE_PROBE:
         source_admin.execute(statement)
@@ -641,23 +736,184 @@ def test_the_orderability_prediction_matches_what_min_actually_does(
     with postgres_profiler(source_secret, BUDGET) as reader:
         assert isinstance(reader, PostgresSourceProfiler)
         predicted = reader._ordered_columns(ProfileTarget(schema_name="sales", name="probe", columns=()))
+        names = [str(name) for (name,) in reader.connection.execute(PROBE_COLUMN_NAMES).fetchall()]
+        # The probe must actually hold values, or `min(anyarray)` never gets far
+        # enough to look for a comparison function and this test asserts nothing.
+        for name in names:
+            counted = reader.connection.execute(
+                PROBE_COLUMN_VALUES.format(col=sql.Identifier(name))
+            ).fetchone()
+            expected = (0, 0) if name == UNVALUED_PROBE_COLUMN else (2, 2)
+            assert counted == expected, f"{name} holds {counted}, cannot exercise execution"
+        actual = {
+            name
+            for name in names
+            if _aggregate_runs(reader.connection, "min", name)
+            and _aggregate_runs(reader.connection, "max", name)
+        }
         reader.connection.rollback()
 
-    actual = set()
-    for (name,) in source_admin.execute(PROBE_COLUMN_NAMES).fetchall():
-        try:
-            source_admin.execute(
-                sql.SQL("SELECT min({col})::text FROM sales.probe").format(col=sql.Identifier(name))
-            ).fetchall()
-        except psycopg.Error:
-            source_admin.execute("ROLLBACK")
-        else:
-            actual.add(name)
-
-    assert predicted == actual, (
-        f"prediction and reality disagree on: {predicted.symmetric_difference(actual)}"
+    assert predicted <= actual, (
+        "predicted ordered but the aggregate cannot run -- this errors the whole "
+        f"asset profile: {sorted(predicted - actual)}"
+    )
+    assert actual - predicted == UNDER_PREDICTED_BY_DESIGN, (
+        f"unordered predictions that could have published a fact: {sorted(actual - predicted)}"
     )
     # ...and the probe covers both answers, so agreeing is not agreeing on an
     # empty set or on "everything is orderable".
-    assert {"c_int", "c_text", "c_varchar", "c_array", "c_enum", "c_domain"} <= actual
-    assert {"c_uuid", "c_json", "c_jsonb", "c_bool", "c_bytea", "c_point"}.isdisjoint(actual)
+    assert {"c_int", "c_text", "c_varchar", "c_array", "c_enum", "c_domain"} <= predicted
+    assert {"c_uuidarray", "c_boolarray", "c_jsonbarray", "c_enumarray", "c_domainarray"} <= predicted
+    assert {"c_uuid", "c_json", "c_jsonb", "c_bool", "c_bytea", "c_point"}.isdisjoint(predicted)
+    assert {"c_jsonarray", "c_pointarray", "c_boxarray", "c_domjsonarray"}.isdisjoint(predicted)
+
+
+ARRAY_TABLE = (
+    "CREATE TABLE sales.arrays (tags json[], fence point[], labels text[])",
+    "INSERT INTO sales.arrays (tags, fence, labels) VALUES "
+    "(ARRAY['{\"a\":1}'::json], ARRAY['(1,1)'::point], ARRAY['alpha']),"
+    "(ARRAY['{\"b\":2}'::json], ARRAY['(2,2)'::point], ARRAY['bravo']),"
+    "(ARRAY['{\"c\":3}'::json], ARRAY['(3,3)'::point], ARRAY['cadet'])",
+    "GRANT SELECT ON sales.arrays TO steward_reader",
+)
+
+
+def test_an_array_of_an_incomparable_element_type_still_profiles(
+    profiler: SourceProfiler, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+) -> None:
+    """The whole-asset failure the orderability prediction has to avoid.
+
+    `min(anyarray)` resolves for `json[]` and `point[]` and then errors on the
+    second distinct value -- and the extrema ride in the *single* stats query,
+    so that error is not one missing fact but the whole profile: the handler
+    records `urn:steward:asset-unprofilable` for the asset. A `tags json[]` or
+    `geofence point[]` column profiles fine on a lexical `min((col)::text)`, so
+    predicting these ordered would turn working profiles into hard failures --
+    and data-dependently, green until a second distinct value lands.
+
+    `text[]` is here as the control: its element has a comparison function, so
+    it keeps typed extrema and the fix is not "arrays publish nothing".
+    """
+    for statement in ARRAY_TABLE:
+        source_admin.execute(statement)
+
+    profile = profiler.profile(
+        ProfileTarget(
+            schema_name="sales",
+            name="arrays",
+            columns=(
+                column("tags", "json[]", 1),
+                column("fence", "point[]", 2),
+                column("labels", "text[]", 3),
+            ),
+        )
+    )
+
+    by_name = {column_profile.name: column_profile for column_profile in profile.columns}
+    assert profile.row_count == 3
+    for name in ("tags", "fence"):
+        assert by_name[name].min_value is None and by_name[name].max_value is None
+        assert by_name[name].distinct_count == 3  # the rest of the profile survives
+    assert by_name["labels"].min_value is not None and by_name["labels"].max_value is not None
+
+
+SHADOW_SCHEMA = (
+    "CREATE SCHEMA shadow",
+    "CREATE FUNCTION shadow.pick(json, json) RETURNS json LANGUAGE sql IMMUTABLE AS 'SELECT $1'",
+    "CREATE AGGREGATE shadow.min(json) (sfunc = shadow.pick, stype = json)",
+    "CREATE AGGREGATE shadow.max(json) (sfunc = shadow.pick, stype = json)",
+    "CREATE TABLE sales.shadowed (payload json)",
+    "INSERT INTO sales.shadowed (payload) VALUES ('{\"a\":1}'), ('{\"b\":2}')",
+    "GRANT SELECT ON sales.shadowed TO steward_reader",
+)
+
+DROP_SHADOW_SCHEMA = "DROP SCHEMA shadow CASCADE"
+
+
+def test_an_aggregate_the_reader_cannot_see_does_not_count_as_orderable(
+    profiler: SourceProfiler, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+) -> None:
+    """An aggregate exists, and `min(payload)` still does not resolve.
+
+    `pg_proc` is the whole cluster, not the connection's `search_path`, so a
+    `min`/`max` pair defined in a schema the reader does not search satisfies a
+    prediction the reader's own statement cannot execute. Nothing exotic is
+    needed to arrange it -- a customer with a `stats` or `compat` schema on
+    their own search path, which Steward's role does not share, is enough.
+
+    The failure is the one that matters: the prediction says ordered, the stats
+    query says `function min(json) does not exist`, and the asset is
+    unprofilable. `pg_function_is_visible` is what keeps the question the
+    reader's own.
+    """
+    for statement in SHADOW_SCHEMA:
+        source_admin.execute(statement)
+    try:
+        profile = profiler.profile(
+            ProfileTarget(schema_name="sales", name="shadowed", columns=(column("payload", "json"),))
+        )
+    finally:
+        source_admin.execute(DROP_SHADOW_SCHEMA)
+
+    [payload] = profile.columns
+    assert payload.min_value is None and payload.max_value is None
+    assert payload.distinct_count == 2
+
+
+HALF_AN_AGGREGATE = (
+    # In `public`, and the reader is granted USAGE on it for the duration --
+    # `public` is on the default `search_path` but the fixture revokes it from
+    # PUBLIC, and an aggregate the reader cannot see is excluded by the
+    # visibility conjunct instead, which is a different test passing.
+    "GRANT USAGE ON SCHEMA public TO steward_reader",
+    "CREATE FUNCTION public.pick(json, json) RETURNS json LANGUAGE sql IMMUTABLE AS 'SELECT $1'",
+    "CREATE AGGREGATE public.min(json) (sfunc = public.pick, stype = json)",
+    "CREATE TABLE sales.halved (payload json)",
+    "INSERT INTO sales.halved (payload) VALUES ('{\"a\":1}'), ('{\"b\":2}')",
+    "GRANT SELECT ON sales.halved TO steward_reader",
+)
+
+DROP_HALF_AN_AGGREGATE = (
+    "DROP AGGREGATE public.min(json)",
+    "DROP FUNCTION public.pick(json, json)",
+    "REVOKE USAGE ON SCHEMA public FROM steward_reader",
+)
+
+READER_SEES_THE_AGGREGATE = (
+    "SELECT pg_function_is_visible(p.oid) FROM pg_proc AS p "
+    "WHERE p.proname = 'min' AND p.proargtypes[0] = 'json'::regtype"
+)
+
+
+def test_a_type_with_only_a_min_aggregate_is_not_orderable(
+    profiler: SourceProfiler,
+    source_admin: psycopg.Connection[psycopg.rows.TupleRow],
+    source_dsn: str,
+) -> None:
+    """`_TYPED_EXTREMA` runs both aggregates, so the prediction must need both.
+
+    A visible `min(json)` and no `max(json)` -- a customer defining the
+    convenience aggregate they wanted is all it takes -- makes an oracle that
+    asks about `min` alone predict ordered, and then the stats query dies on
+    `function max(json) does not exist`, taking every column of the asset with
+    it. Asking for both names is the whole fix.
+
+    The visibility of the planted aggregate is asserted *as the reader* before
+    the profile runs: without that, the reader's missing USAGE on `public`
+    excludes it and this passes for the visibility conjunct's reason rather
+    than this one.
+    """
+    for statement in HALF_AN_AGGREGATE:
+        source_admin.execute(statement)
+    try:
+        with psycopg.connect(source_dsn) as reader:
+            assert reader.execute(READER_SEES_THE_AGGREGATE).fetchall() == [(True,)]
+        profile = profiler.profile(
+            ProfileTarget(schema_name="sales", name="halved", columns=(column("payload", "json"),))
+        )
+    finally:
+        for statement in DROP_HALF_AN_AGGREGATE:
+            source_admin.execute(statement)
+
+    [payload] = profile.columns
+    assert payload.min_value is None and payload.max_value is None
