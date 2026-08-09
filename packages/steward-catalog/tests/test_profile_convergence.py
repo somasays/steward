@@ -32,7 +32,7 @@ from steward_catalog import (
     register_source,
 )
 from steward_catalog.repository import CATALOG_ENTITIES
-from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext
+from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import SourceCreate, TaskSpec, TaskStatus
 
 pytestmark = pytest.mark.invariants
@@ -64,7 +64,7 @@ def snapshot(conn: QueueConnection) -> dict[str, list[tuple[Any, ...]]]:
 def profile(conn: QueueConnection, spec: TaskSpec, resolver: EnvSecretResolver) -> Any:
     """Run the real handler in the caller's transaction, as a worker would."""
     handler = build_profile_asset(resolver=resolver, profiler=postgres_profiler)
-    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1)))
+    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
     conn.commit()
     return result
 
@@ -86,7 +86,8 @@ def catalogued(
     source, _ = register_source(conn, source_create, actor=SYSTEM_ACTOR)
     conn.commit()
     handler = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1)))
+    ctx = TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1, usage=UsageLedger())
+    result = asyncio.run(handler(ctx))
     conn.commit()
     assert result.status is TaskStatus.SUCCEEDED, result.error
     return source.id
@@ -197,7 +198,8 @@ def test_a_missing_asset_is_refused_before_a_connection_is_opened(
     Profiling it would fail in the driver; failing here names the real cause."""
     source_admin.execute("DROP TABLE sales.customers CASCADE")
     scan = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    asyncio.run(scan(TaskContext(connection=conn, spec=spec_factory(catalogued), attempts=1)))
+    ctx = TaskContext(connection=conn, spec=spec_factory(catalogued), attempts=1, usage=UsageLedger())
+    asyncio.run(scan(ctx))
     conn.commit()
 
     result = profile(conn, profile_spec(spec_factory, customers_id), resolver)

@@ -125,6 +125,7 @@ from steward_queue import tasks
 from steward_queue.db import QueueConnection, connect
 from steward_queue.models import ClaimedTask
 from steward_queue.registry import HandlerRegistration, TaskContext
+from steward_queue.usage import UsageLedger
 
 __all__ = [
     "BUDGET_EXCEEDED",
@@ -173,7 +174,9 @@ handler needs, which is the shape #45 was reported as.
 
 BUDGET_EXCEEDED = "budget_exceeded"
 
-type RecordOutcome = Callable[[QueueConnection, ClaimedTask, TaskResult | ProblemDetails], None]
+type RecordOutcome = Callable[
+    [QueueConnection, ClaimedTask, TaskResult | ProblemDetails, RunBudget], None
+]
 """Write an attempt's terminal state on the connection it is handed.
 
 The handler thread records through this on its *own* connection, so the
@@ -183,6 +186,12 @@ an attempt itself. Where the outcome is written is therefore an argument, and
 the queue bookkeeping behind it -- retry policy, actor, lease -- stays in
 `worker` instead of being reimplemented here.
 """
+
+# The fourth argument is what this attempt's `UsageLedger` says it spent, and it
+# is the charge *only* when the outcome is a `ProblemDetails` -- a failure with
+# no result behind it. A `TaskResult` reports its own usage and is charged that,
+# so exactly one number reaches the run per attempt and a handler that both
+# debits and reports is not billed twice (SPEC.md §13 D12).
 
 
 def problem(title: str, detail: str) -> ProblemDetails:
@@ -358,6 +367,7 @@ def spawn(
     registration: HandlerRegistration,
     handoff: Handoff,
     record: RecordOutcome,
+    usage: UsageLedger,
 ) -> asyncio.Future[Executed]:
     """Start the handler on a thread of its own; return its awaitable result.
 
@@ -365,11 +375,16 @@ def spawn(
     handler the loop has abandoned goes on occupying its thread, and in a
     pool that thread is one the worker also needs for its own bookkeeping
     calls. Daemon, so an abandoned handler cannot keep the process alive.
+
+    `usage` is created by the caller rather than here because the caller is the
+    one that still needs it after this thread is beyond reach: abandoning a
+    handler at its cap means never seeing its result, and the ledger is then the
+    only surviving account of what it spent.
     """
     future: concurrent.futures.Future[Executed] = concurrent.futures.Future()
     threading.Thread(
         target=_execute_in_thread,
-        args=(dsn, task, registration, handoff, record, future),
+        args=(dsn, task, registration, handoff, record, usage, future),
         name=f"steward-task-{task.spec.task_id}",
         daemon=True,
     ).start()
@@ -401,6 +416,7 @@ def _execute_in_thread(
     registration: HandlerRegistration,
     handoff: Handoff,
     record: RecordOutcome,
+    usage: UsageLedger,
     future: concurrent.futures.Future[Executed],
 ) -> None:
     """Thread entry point. Never raises, and never fails the worker.
@@ -421,7 +437,7 @@ def _execute_in_thread(
     in this module's docstring.
     """
     try:
-        future.set_result(_run_handler(dsn, task, registration, handoff, record))
+        future.set_result(_run_handler(dsn, task, registration, handoff, record, usage))
     except BaseException as exc:
         detail = f"{type(exc).__name__}: {exc}"
         failure = Executed(error=problem(EXECUTION_FAILED, detail), lost_claim=False, recorded=False)
@@ -434,6 +450,7 @@ def _run_handler(
     registration: HandlerRegistration,
     handoff: Handoff,
     record: RecordOutcome,
+    usage: UsageLedger,
 ) -> Executed:
     """The whole execution, on this thread, through a connection of its own.
 
@@ -460,7 +477,9 @@ def _run_handler(
     conn = connect(dsn, statement_timeout=budget)
     try:
         handoff.publish(conn.info.backend_pid)
-        ctx = TaskContext(connection=conn, spec=task.spec, attempts=task.attempts)
+        ctx = TaskContext(
+            connection=conn, spec=task.spec, attempts=task.attempts, usage=usage
+        )
         started = time.monotonic()
         try:
             result = asyncio.run(_bounded(registration.fn(ctx), budget))
@@ -470,7 +489,7 @@ def _run_handler(
             )
         else:
             outcome = _settled(result, task.spec.budget)
-        return _record_in_thread(conn, task, handoff, record, outcome)
+        return _record_in_thread(conn, task, handoff, record, outcome, usage.total())
     finally:
         # Whatever was not committed above never happened. Suppressed
         # because an abandoned handler's session has already been ended by
@@ -524,6 +543,7 @@ def _record_in_thread(
     handoff: Handoff,
     record: RecordOutcome,
     outcome: TaskResult | ProblemDetails,
+    spent: RunBudget,
 ) -> Executed:
     """Write this attempt's terminal state -- if the loop has not already.
 
@@ -546,7 +566,7 @@ def _record_in_thread(
     if not handoff.take():
         return Executed(error=error, lost_claim=False, recorded=False)
     try:
-        record(conn, task, outcome)
+        record(conn, task, outcome, spent)
     except tasks.TaskNotClaimable:
         return Executed(error=error, lost_claim=True, recorded=False)
     return Executed(error=error, lost_claim=False, recorded=True)

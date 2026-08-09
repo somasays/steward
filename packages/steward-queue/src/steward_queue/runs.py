@@ -335,15 +335,25 @@ def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, act
     did this run reach its cap" needs a row per increment, not one row about
     the task that caused it.
 
-    `runs.used_*` is therefore the dimension-wise **sum** across the run's
-    succeeded tasks, and it stays inside `runs.budget_*` because of two checks
-    that happen elsewhere (issue #48, SPEC.md §13 D9): the plan's per-task caps
-    were reserved against the run's budget before any of these tasks existed,
-    and a task whose reported usage exceeds its own cap never reaches here --
-    it is a `budget_exceeded` failure instead (`execution._overspent`). Summing
-    is the right operation for steps, tokens and cost; for `wall_clock` it
-    means aggregate task time rather than the run's elapsed duration, which is
-    the conservative reading (`RunBudget.wall_clock`).
+    `runs.used_*` is the dimension-wise **sum across every attempt**, failed
+    ones included (#69, SPEC.md §13 D12). It used to cover succeeded tasks
+    only, and the argument for it staying inside `runs.budget_*` used to be
+    that an overspending result was discarded rather than rolled up. That
+    argument is gone, and deliberately: discarding the evidence of an overrun
+    is not a bound, it is an undercount that made the cap look respected.
+
+    What bounds a single attempt now is in-loop enforcement -- the agent loop
+    refuses the step that *would* cross its cap, so the overrun is never spent
+    (I12). `execution._overspent` remains as the outer fence for a handler that
+    reports more than it was allowed, and its usage is still not rolled up: the
+    figure is not to be trusted, and trusting it is the one thing that would
+    let a lying handler write the run's totals.
+
+    Across attempts the totals can legitimately exceed the run's budget, since
+    retries are recorded but not reserved (D9). Summing is the right operation
+    for steps, tokens and cost; for `wall_clock` it means aggregate task time
+    rather than the run's elapsed duration, which is the conservative reading
+    (`RunBudget.wall_clock`).
     """
     row = conn.execute(
         _sql.ADD_RUN_USAGE,

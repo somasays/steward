@@ -21,7 +21,7 @@ from steward_catalog import (
     postgres_inspector,
     register_source,
 )
-from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext
+from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import AssetType, SourceCreate, SourceEngine, TaskSpec, TaskStatus
 
 COUNT_SOURCES = "SELECT count(*) FROM sources"
@@ -38,7 +38,7 @@ def register(conn: QueueConnection, create: SourceCreate) -> tuple[UUID, bool]:
 
 def run_scan(conn: QueueConnection, spec: TaskSpec, resolver: EnvSecretResolver) -> None:
     handler = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1)))
+    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
     conn.commit()
     assert result.status is TaskStatus.SUCCEEDED, result.error
 

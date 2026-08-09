@@ -31,7 +31,7 @@ from steward_catalog import (
     register_source,
 )
 from steward_catalog.repository import CATALOG_ENTITIES
-from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext
+from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import SourceCreate, TaskSpec, TaskStatus
 
 pytestmark = pytest.mark.invariants
@@ -73,7 +73,7 @@ def snapshot(conn: QueueConnection) -> dict[str, list[tuple[Any, ...]]]:
 def scan(conn: QueueConnection, spec: TaskSpec, resolver: EnvSecretResolver) -> Any:
     """Run the real handler in the caller's transaction, as a worker would."""
     handler = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1)))
+    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
     conn.commit()
     return result
 
