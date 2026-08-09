@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -28,6 +28,8 @@ from steward_queue import (
     Worker,
     claim,
     connect,
+    create_run,
+    enqueue,
     get_run,
     get_task,
     requeue_stale,
@@ -52,6 +54,42 @@ EXPIRED_LEASE = timedelta(seconds=-1)
 NO_USAGE = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(0))
 SPENT_PER_CALL = RunBudget(steps=1, tokens=9, cost_usd=Decimal("0.03"), wall_clock=timedelta(0))
 """What the ledger-debiting handlers below claim to have spent per call."""
+
+ONE_ATTEMPT = RunBudget(steps=2, tokens=50, cost_usd=Decimal("0.50"), wall_clock=timedelta(seconds=30))
+"""The caps one attempt of a failure-path task is given."""
+
+
+def affordable(
+    conn: QueueConnection,
+    *,
+    task_type: str,
+    payload: dict[str, object],
+    max_attempts: int,
+    attempts_affordable: int,
+) -> TaskSpec:
+    """A task in a run whose budget funds exactly `attempts_affordable` attempts.
+
+    Retries are recorded but not reserved, so how many the run can fund is now a
+    property of its budget rather than of `max_attempts` alone -- these tests
+    have to state both, and the two are deliberately different so "ran out of
+    attempts" and "ran out of budget" cannot be confused for each other.
+    """
+    run = create_run(
+        conn,
+        goal="test",
+        budget=RunBudget.total([ONE_ATTEMPT] * attempts_affordable),
+    )
+    spec = TaskSpec(
+        task_id=uuid4(),
+        run_id=run.id,
+        task_type=task_type,
+        payload=payload,
+        budget=ONE_ATTEMPT,
+        max_attempts=max_attempts,
+    )
+    enqueue(conn, spec)
+    conn.commit()
+    return spec
 
 EXPLODES = "test.explodes_on_demand"
 SPENDS_THEN_RAISES = "test.spends_then_raises"
@@ -543,12 +581,14 @@ class TestFailurePaths:
         assert "task.dead" in audit_actions(conn, spec.task_id)
 
     async def test_typed_failure_usage_is_debited_on_every_retry(
-        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+        self, dsn: str, conn: QueueConnection
     ) -> None:
-        spec = queued(
+        spec = affordable(
+            conn,
             task_type=REPORTS_FAILURE,
             payload={"used_steps": 1, "used_tokens": 7, "used_cost_usd": "0.02"},
             max_attempts=2,
+            attempts_affordable=2,
         )
         worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
 
@@ -560,6 +600,7 @@ class TestFailurePaths:
         assert run.usage.steps == 2
         assert run.usage.tokens == 14
         assert run.usage.cost_usd == Decimal("0.04")
+        assert run.usage.over(run.budget) == ()
 
     async def test_a_handler_that_raises_after_spending_still_charges_the_run(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
@@ -576,11 +617,17 @@ class TestFailurePaths:
         assert run.usage.cost_usd == SPENT_PER_CALL.cost_usd
 
     async def test_every_retry_of_a_raising_handler_is_charged(
-        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+        self, dsn: str, conn: QueueConnection
     ) -> None:
         """Each attempt spends again, so each attempt is charged again -- the
         ledger counts one attempt, and a retry starts a fresh one."""
-        spec = queued(task_type=SPENDS_THEN_RAISES, payload={"boom": True}, max_attempts=2)
+        spec = affordable(
+            conn,
+            task_type=SPENDS_THEN_RAISES,
+            payload={"boom": True},
+            max_attempts=2,
+            attempts_affordable=2,
+        )
         worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
 
         assert await worker.run_once() == 1
@@ -589,6 +636,40 @@ class TestFailurePaths:
         run = get_run(conn, spec.run_id)
         assert run is not None
         assert run.usage.tokens == 2 * SPENT_PER_CALL.tokens
+        assert run.usage.over(run.budget) == ()
+
+    async def test_a_retry_the_run_cannot_afford_is_refused_not_scheduled(
+        self, dsn: str, conn: QueueConnection
+    ) -> None:
+        """The property #69 actually asks for: recorded spend never exceeds the
+        cap. Recording retry spend without this check would only document a run
+        walking past its budget one attempt at a time."""
+        spec = affordable(
+            conn,
+            task_type=SPENDS_THEN_RAISES,
+            payload={"boom": True},
+            max_attempts=3,
+            attempts_affordable=1,
+        )
+        worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
+
+        assert await worker.run_once() == 1
+        # Attempts remain (1 of 3 used) but the run cannot fund another.
+        assert await worker.run_once() == 0
+
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.DEAD
+        recorded = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        assert recorded is not None
+        last_error = recorded[0]
+        assert last_error["title"] == BUDGET_EXCEEDED
+        # The cause survives the re-titling: an operator needs both what went
+        # wrong and why nothing tried again.
+        assert "handler raised" in last_error["detail"]
+        assert "budget left for another attempt" in last_error["detail"]
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        assert run.usage.over(run.budget) == ()
 
     async def test_a_handler_killed_at_its_cap_still_charges_what_it_spent(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]

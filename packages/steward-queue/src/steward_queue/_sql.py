@@ -203,8 +203,13 @@ WHERE id = %(id)s
 """
 
 SELECT_TASK_ATTEMPTS_FOR_UPDATE = """
-SELECT state, attempts, max_attempts, claimed_by FROM tasks WHERE id = %(id)s FOR UPDATE
+SELECT state, attempts, max_attempts, claimed_by, run_id,
+       budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock
+FROM tasks WHERE id = %(id)s FOR UPDATE
 """
+"""The run and the caps come back with the attempt counters because `fail` has
+to decide whether the run can still afford a retry before it schedules one, and
+reading them in a second statement would be a second chance for the row to move."""
 
 SELECT_TASK_RESULT = """
 SELECT result FROM tasks WHERE id = %(id)s

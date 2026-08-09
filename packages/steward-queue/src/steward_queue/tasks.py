@@ -47,7 +47,7 @@ from steward_queue.models import (
     TaskRecord,
     TaskState,
 )
-from steward_queue.runs import record_usage, rollup_run_status, start_run
+from steward_queue.runs import get_run, record_usage, rollup_run_status, start_run
 
 DEFAULT_LEASE = timedelta(minutes=5)
 """How long a claim is honoured before `requeue_stale` may take it back."""
@@ -261,6 +261,45 @@ def complete(
     rollup_run_status(conn, run_id, actor=actor)
 
 
+RETRY_UNAFFORDABLE = "budget_exceeded"
+"""Title of the failure a retry is refused with -- the same vocabulary an
+overrun uses, because to an operator it is the same fact: the run's cap is what
+stopped the work."""
+
+
+def _retry_unaffordable(conn: QueueConnection, run_id: UUID, task_budget: RunBudget) -> tuple[str, ...]:
+    """The dimensions in which one more attempt would carry the run past its cap.
+
+    Asked *after* this attempt's usage is debited, so it projects onto the
+    run's real totals rather than the ones it had before this failure. Empty
+    means the retry is affordable. `RunBudget.over` is the same comparison the
+    plan-time reservation uses -- there is one arithmetic for "does this fit",
+    and a second one written here is how a dimension gets left unenforced
+    (`steward_schemas.budget`).
+    """
+    run = get_run(conn, run_id)
+    if run is None:  # pragma: no cover -- the task's own FK guarantees the run
+        return ()
+    return RunBudget.total((run.usage, task_budget)).over(run.budget)
+
+
+def _retry_refused(error: ProblemDetails, dimensions: tuple[str, ...]) -> ProblemDetails:
+    """Re-title a failure whose retry the run cannot afford, keeping the cause.
+
+    The operator needs both halves: what went wrong, and why nothing will try
+    again. Losing the original title to the budget one would hide the first.
+    """
+    return error.model_copy(
+        update={
+            "title": RETRY_UNAFFORDABLE,
+            "detail": (
+                f"{error.title}: not retried because the run has no {', '.join(dimensions)} "
+                "budget left for another attempt"
+            ),
+        }
+    )
+
+
 def fail(
     conn: QueueConnection,
     task_id: UUID,
@@ -286,18 +325,44 @@ def fail(
     `claimed_by` is the same fencing token `complete` takes; the row is read
     `FOR UPDATE` first, so checking the holder here is as strong as checking it
     in the `UPDATE` predicate.
+
+    **A retry is admitted only if the run can still afford it.** `usage` is
+    debited first, then the next attempt's caps are projected onto the run's
+    new totals, and a retry that would carry them past the run's budget in any
+    dimension is refused: the task dead-letters as `budget_exceeded` instead of
+    going back to `pending` (I12, SPEC.md §13 D12). Without that, recording
+    retry spend would simply document a run walking past its cap one attempt at
+    a time. This is admission *before* spending, which is why it is not the
+    run-level execution-time check D9 rejected -- that one asked whether an
+    overrun had already happened, and it is still not what runs here.
     """
     row = conn.execute(_sql.SELECT_TASK_ATTEMPTS_FOR_UPDATE, {"id": task_id}).fetchone()
     if row is None:
         raise LookupError(f"no such task: {task_id}")
     state, attempts, max_attempts, holder = TaskState(row[0]), row[1], row[2], row[3]
+    run_id: UUID = row[4]
+    task_budget = budget_from(row[5], row[6], row[7], row[8])
     if state not in (TaskState.CLAIMED, TaskState.RUNNING):
         raise TaskNotClaimable(f"task {task_id} is not claimed or running")
     if claimed_by is not None and holder != claimed_by:
         raise TaskNotClaimable(f"task {task_id} is held by {holder!r}, not {claimed_by!r}")
 
+    if usage is not None:
+        record_usage(
+            conn,
+            run_id,
+            TaskResult(task_id=task_id, status=TaskStatus.FAILED, usage=usage, error=error),
+            actor=actor,
+        )
+    unaffordable = (
+        _retry_unaffordable(conn, run_id, task_budget)
+        if retryable and attempts < max_attempts
+        else ()
+    )
+    if unaffordable:
+        error = _retry_refused(error, unaffordable)
     error_json = Jsonb(error.model_dump(mode="json"))
-    if retryable and attempts < max_attempts:
+    if retryable and attempts < max_attempts and not unaffordable:
         delay = retry_delay(attempts, base=base_delay, factor=factor, cap=max_delay)
         outcome = conn.execute(_sql.RETRY_TASK, {"id": task_id, "delay": delay, "error": error_json})
         landed, action = TaskState.PENDING, "task.retry_scheduled"
@@ -313,14 +378,7 @@ def fail(
             _sql.TERMINATE_TASK, {"id": task_id, "state": landed.value, "error": error_json}
         )
         after = {"state": landed.value, "attempts": attempts}
-    run_id: UUID = require_row(outcome.fetchone(), "task transition returned no row")[0]
-    if usage is not None:
-        record_usage(
-            conn,
-            run_id,
-            TaskResult(task_id=task_id, status=TaskStatus.FAILED, usage=usage, error=error),
-            actor=actor,
-        )
+    require_row(outcome.fetchone(), "task transition returned no row")
     write_audit(
         conn,
         actor=actor,
