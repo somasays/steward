@@ -27,6 +27,15 @@ from steward_catalog.profile_handler import profile_state_probe
 from steward_queue import REGISTRY, SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import SourceCreate, TaskResult, TaskSpec, TaskStatus
 
+
+def _ctx(conn: QueueConnection, spec: TaskSpec, attempts: int = 1) -> TaskContext:
+    """A handler context for a test: a trace to hang spans on, and a fresh
+    per-attempt usage ledger (`steward_queue.usage`)."""
+    return TaskContext(
+        connection=conn, spec=spec, attempts=attempts, trace_id="trace-test", usage=UsageLedger()
+    )
+
+
 MISSING_SECRET_REF = "env:STEWARD_NO_SUCH_SOURCE_DSN"
 
 # A rotated-away credential: the source was registered and scanned, and the
@@ -41,7 +50,7 @@ def profile_spec(spec_factory: Callable[[UUID], TaskSpec], payload: dict[str, An
 
 def execute(conn: QueueConnection, spec: TaskSpec, resolver: Any) -> TaskResult:
     handler = build_profile_asset(resolver=resolver, profiler=postgres_profiler)
-    return asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
+    return asyncio.run(handler(_ctx(conn, spec, 1)))
 
 
 def test_the_handler_is_registered_under_its_task_type() -> None:
@@ -73,7 +82,7 @@ def test_an_unresolvable_credential_fails_without_naming_one(
     source, _ = register_source(conn, source_create, actor=SYSTEM_ACTOR)
     conn.commit()
     scan = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    ctx = TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1, usage=UsageLedger())
+    ctx = _ctx(conn, spec_factory(source.id), 1)
     asyncio.run(scan(ctx))
     conn.execute(ROTATE_SECRET, {"ref": MISSING_SECRET_REF, "id": source.id})
     conn.commit()

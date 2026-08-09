@@ -36,6 +36,13 @@ nothing orders the two: a task claimed immediately can be exported first.
 
 TASK_SPAN_NAME = "task"
 
+GENERATION_SPAN_NAME = "generation"
+"""One model call. Unlike the run span, this one does measure its subject: it
+opens before the request and closes when the completion (or the failure) is in
+hand, so its duration is the latency an operator is looking for."""
+
+TOOL_SPAN_NAME = "tool"
+
 _LEVELS: Mapping[SpanOutcome, Literal["DEFAULT", "ERROR"]] = {
     SpanOutcome.OK: "DEFAULT",
     SpanOutcome.ERROR: "ERROR",
@@ -109,6 +116,25 @@ class LangfuseTracer:
             "task_type": task_type,
         }
         with self._span(TASK_SPAN_NAME, trace_id, attributes) as span:
+            yield span
+
+    @contextmanager
+    def generation_span(
+        self, *, trace_id: str, task_id: UUID, model_alias: str, prompt_version: str
+    ) -> Iterator[Span]:
+        attributes = {
+            "task_id": str(task_id),
+            "model_alias": model_alias,
+            "prompt_version": prompt_version,
+        }
+        with self._span(GENERATION_SPAN_NAME, trace_id, attributes) as span:
+            yield span
+
+    @contextmanager
+    def tool_span(self, *, trace_id: str, task_id: UUID, tool_name: str) -> Iterator[Span]:
+        with self._span(
+            TOOL_SPAN_NAME, trace_id, {"task_id": str(task_id), "tool_name": tool_name}
+        ) as span:
             yield span
 
     @contextmanager

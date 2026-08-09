@@ -32,3 +32,18 @@ def write_checkpoint(
     satisfy the registry's idempotence clause without reading its own writes.
     """
     conn.execute(_sql.UPSERT_CHECKPOINT, {"task_id": task_id, "step": step, "state": Jsonb(dict(state))})
+
+
+def latest_checkpoint(conn: QueueConnection, task_id: UUID) -> Mapping[str, Any] | None:
+    """The most recent step's state for `task_id`, or None if it has none.
+
+    The counterpart to `write_checkpoint`, and the reason resume is possible at
+    all: a re-executed attempt reads the furthest step that committed rather
+    than starting over. Only the latest is returned because that is what resume
+    needs -- the earlier rows are the audit trail of how it got there.
+    """
+    row = conn.execute(_sql.SELECT_LATEST_CHECKPOINT, {"task_id": task_id}).fetchone()
+    if row is None:
+        return None
+    state: Mapping[str, Any] = row[1]
+    return state

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 from decimal import Decimal
+from uuid import UUID
 
 import pytest
 from pydantic import BaseModel
@@ -24,6 +25,7 @@ from steward_agents import (
     InMemoryCheckpointStore,
     ModelReservation,
     ToolRegistry,
+    TraceContext,
 )
 from steward_llm import (
     DeploymentMode,
@@ -39,6 +41,8 @@ from steward_llm import (
     ToolCall,
 )
 from steward_schemas import AgentSpec, RunBudget
+
+TRACE = TraceContext(trace_id="trace-1", task_id=UUID(int=7))
 
 
 class EchoInput(BaseModel):
@@ -147,6 +151,7 @@ async def test_stub_backed_tool_flow_is_bounded_validated_and_checkpointed() -> 
         prompt_version="proof.v1",
         messages=(Message(role=Role.USER, content="profile this"),),
         output_model=FinalOutput,
+        trace=TRACE,
     )
 
     assert result.output == FinalOutput(answer="profiled")
@@ -178,6 +183,7 @@ async def test_the_result_schema_is_shown_to_the_model_as_a_tool() -> None:
         prompt_version="proof.v1",
         messages=(Message(role=Role.USER, content="go"),),
         output_model=FinalOutput,
+        trace=TRACE,
     )
     offered = {tool.name: tool for tool in gateway.calls[0].request.tools}
     assert SUBMIT_RESULT in offered
@@ -200,6 +206,7 @@ async def test_stopping_without_submitting_is_a_typed_failure() -> None:
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="go"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
 
 
@@ -225,6 +232,7 @@ async def test_disallowed_tool_is_rejected_without_invocation() -> None:
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="try it"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
     assert invoked == []
 
@@ -245,6 +253,7 @@ async def test_unaffordable_model_step_never_starts() -> None:
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="no budget"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
     assert gateway.calls == []
 
@@ -277,6 +286,7 @@ async def test_a_tool_that_cannot_fit_its_wall_clock_is_never_invoked() -> None:
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="call the slow tool"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
     assert invoked == []
 
@@ -300,6 +310,7 @@ async def test_bad_tool_arguments_are_fed_back_once_then_fail() -> None:
         prompt_version="proof.v1",
         messages=(Message(role=Role.USER, content="go"),),
         output_model=FinalOutput,
+        trace=TRACE,
     )
     assert result.output == FinalOutput(answer="recovered")
     assert invoked == []
@@ -327,6 +338,7 @@ async def test_the_same_bad_call_twice_is_not_fed_back_again() -> None:
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="go"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
 
 
@@ -358,6 +370,7 @@ async def test_a_model_that_never_submits_is_stopped_by_the_budget() -> None:
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="loop"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
 
 
@@ -389,6 +402,7 @@ async def test_every_increment_is_announced_as_it_is_spent() -> None:
         prompt_version="proof.v1",
         messages=(Message(role=Role.USER, content="go"),),
         output_model=FinalOutput,
+        trace=TRACE,
     )
     assert len(spends) == 3  # model, tool, model
     assert RunBudget.total(spends) == result.usage
@@ -419,6 +433,7 @@ async def test_a_failed_call_announces_its_spend_before_the_failure_travels() ->
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="go"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
     assert RunBudget.total(spends).tokens == 6
     assert RunBudget.total(spends).cost_usd == Decimal("0.02")
@@ -447,6 +462,7 @@ async def test_failed_model_usage_is_checkpointed_and_debited_before_resume() ->
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="resume me"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
 
     with pytest.raises(Exception, match="disconnect"):
@@ -498,6 +514,7 @@ async def test_a_prompt_that_fills_the_reservation_is_refused_before_the_call() 
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="x" * 600),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
     assert gateway.calls == []
 
@@ -517,6 +534,7 @@ async def test_the_completion_allowance_is_the_reservation_minus_the_prompt() ->
         prompt_version="proof.v1",
         messages=(Message(role=Role.USER, content="x" * 90),),  # ~30 tokens
         output_model=FinalOutput,
+        trace=TRACE,
     )
     assert gateway.calls[0].request.max_tokens == 70
 
@@ -563,6 +581,7 @@ async def test_a_tool_that_outruns_its_declared_reservation_is_cut_off() -> None
             prompt_version="proof.v1",
             messages=(Message(role=Role.USER, content="go"),),
             output_model=FinalOutput,
+            trace=TRACE,
         )
     # The time it was allowed is charged, not the time it took.
     assert spends[-1].wall_clock == timedelta(milliseconds=50)
@@ -591,6 +610,7 @@ async def test_an_invalid_submission_is_corrected_once_not_checkpointed_as_done(
         prompt_version="proof.v1",
         messages=(Message(role=Role.USER, content="go"),),
         output_model=FinalOutput,
+        trace=TRACE,
     )
     assert result.output == FinalOutput(answer="second time lucky")
     corrections = [m for m in stores.values["task-bad-submit"].messages if m.role is Role.TOOL]
@@ -622,6 +642,7 @@ async def test_submitting_alongside_other_calls_is_refused_not_guessed_at() -> N
         prompt_version="proof.v1",
         messages=(Message(role=Role.USER, content="go"),),
         output_model=FinalOutput,
+        trace=TRACE,
     )
     assert result.output == FinalOutput(answer="properly")
     assert invoked == []  # the discarded echo was never silently run

@@ -37,6 +37,15 @@ from steward_catalog.handler import scan_state_probe
 from steward_queue import REGISTRY, SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import SourceCreate, TaskResult, TaskSpec, TaskStatus
 
+
+def _ctx(conn: QueueConnection, spec: TaskSpec, attempts: int = 1) -> TaskContext:
+    """A handler context for a test: a trace to hang spans on, and a fresh
+    per-attempt usage ledger (`steward_queue.usage`)."""
+    return TaskContext(
+        connection=conn, spec=spec, attempts=attempts, trace_id="trace-test", usage=UsageLedger()
+    )
+
+
 UNREACHABLE = "postgresql://steward_reader:hunter2@127.0.0.1:1/analytics"
 
 
@@ -44,7 +53,7 @@ def execute(
     conn: QueueConnection, spec: TaskSpec, resolver: Any, inspect: Any = postgres_inspector
 ) -> TaskResult:
     handler = build_scan_source(resolver=resolver, inspect=inspect)
-    return asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
+    return asyncio.run(handler(_ctx(conn, spec, 1)))
 
 
 def test_the_handler_is_registered_under_its_task_type() -> None:
@@ -184,7 +193,7 @@ def test_the_registered_handler_runs_from_the_registry(
     registration = REGISTRY[SCAN_SOURCE_TASK_TYPE]
     spec = spec_factory(uuid4()).model_copy(update={"payload": dict(registration.sample_payload)})
 
-    ctx = TaskContext(connection=conn, spec=spec, attempts=attempts, usage=UsageLedger())
+    ctx = _ctx(conn, spec, attempts)
     result = asyncio.run(registration.fn(ctx))
 
     assert result.status is TaskStatus.FAILED

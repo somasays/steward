@@ -94,6 +94,26 @@ class Tracer(Protocol):
         """Open a span for one task execution, on the run's existing trace."""
         ...
 
+    def generation_span(
+        self, *, trace_id: str, task_id: UUID, model_alias: str, prompt_version: str
+    ) -> AbstractContextManager[Span]:
+        """Open a span for one model call inside a task's agent loop.
+
+        `prompt_version` is required rather than optional: I7 asks every
+        generation to carry the version of the prompt that produced it, and a
+        field a caller may omit is one that will be omitted. The alias is the
+        only name for the model here -- provider and endpoint are the gateway's
+        business (I2), and a trace that named them would be describing a
+        deployment decision rather than the work.
+        """
+        ...
+
+    def tool_span(
+        self, *, trace_id: str, task_id: UUID, tool_name: str
+    ) -> AbstractContextManager[Span]:
+        """Open a span for one tool invocation inside a task's agent loop."""
+        ...
+
 
 class NoopSpan:
     """A span that records nothing. Satisfies `Span` structurally."""
@@ -118,4 +138,14 @@ class NoopTracer:
 
     @contextmanager
     def task_span(self, *, trace_id: str, run_id: UUID, task_id: UUID, task_type: str) -> Iterator[Span]:
+        yield NoopSpan()
+
+    @contextmanager
+    def generation_span(
+        self, *, trace_id: str, task_id: UUID, model_alias: str, prompt_version: str
+    ) -> Iterator[Span]:
+        yield NoopSpan()
+
+    @contextmanager
+    def tool_span(self, *, trace_id: str, task_id: UUID, tool_name: str) -> Iterator[Span]:
         yield NoopSpan()

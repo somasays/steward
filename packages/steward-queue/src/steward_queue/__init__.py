@@ -34,7 +34,7 @@ Schema lives in `migrations`; `migrate.upgrade_to_head` applies it.
 
 from steward_queue.audit import write_audit
 from steward_queue.backoff import retry_delay
-from steward_queue.checkpoints import write_checkpoint
+from steward_queue.checkpoints import latest_checkpoint, write_checkpoint
 from steward_queue.db import DSN_ENV, QueueConnection, connect, statement_timeout_ms
 from steward_queue.handlers import NOOP_TASK_TYPE
 from steward_queue.keys import canonical_json, digest
@@ -135,5 +135,6 @@ __all__ = [
     "task_handler",
     "upgrade_to_head",
     "write_audit",
+    "latest_checkpoint",
     "write_checkpoint",
 ]

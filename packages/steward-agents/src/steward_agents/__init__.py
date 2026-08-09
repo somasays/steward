@@ -10,6 +10,7 @@ from steward_agents.runtime import (
     CheckpointStore,
     InMemoryCheckpointStore,
     ModelReservation,
+    TraceContext,
 )
 from steward_agents.tools import (
     DisallowedTool,
@@ -28,6 +29,7 @@ __all__ = [
     "DisallowedTool",
     "InMemoryCheckpointStore",
     "ModelReservation",
+    "TraceContext",
     "ToolRegistry",
     "ToolValidationError",
 ]

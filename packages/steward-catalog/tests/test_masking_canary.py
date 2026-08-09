@@ -82,6 +82,15 @@ from steward_queue import (
 from steward_schemas import RunBudget, SourceCreate, TaskSpec, TaskStatus
 from steward_telemetry import Span, SpanOutcome
 
+
+def _ctx(conn: QueueConnection, spec: TaskSpec, attempts: int = 1) -> TaskContext:
+    """A handler context for a test: a trace to hang spans on, and a fresh
+    per-attempt usage ledger (`steward_queue.usage`)."""
+    return TaskContext(
+        connection=conn, spec=spec, attempts=attempts, trace_id="trace-test", usage=UsageLedger()
+    )
+
+
 pytestmark = pytest.mark.invariants
 
 SOURCE_SECRET_ENV = "STEWARD_TEST_SOURCE_DSN"
@@ -200,7 +209,7 @@ def scanned_source(
     source, _ = register_source(conn, source_create, actor=SYSTEM_ACTOR)
     conn.commit()
     scan = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    ctx = TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1, usage=UsageLedger())
+    ctx = _ctx(conn, spec_factory(source.id), 1)
     result = asyncio.run(scan(ctx))
     conn.commit()
     assert result.status is TaskStatus.SUCCEEDED, result.error

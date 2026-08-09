@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
 from typing import Protocol, TypedDict
+from uuid import UUID
 
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
@@ -46,6 +47,7 @@ from steward_llm import (
     ToolSchema,
 )
 from steward_schemas import AgentSpec, RunBudget
+from steward_telemetry import NoopTracer, SpanOutcome, Tracer
 
 from steward_agents.tools import DisallowedTool, ToolRegistry, ToolValidationError
 
@@ -140,6 +142,20 @@ class InMemoryCheckpointStore:
         self.values[key] = checkpoint
 
 
+@dataclass(frozen=True, slots=True)
+class TraceContext:
+    """Where this run's spans belong: the run's trace, and the task on it.
+
+    Passed in rather than derived, because the trace id is the run's and this
+    package never sees a run -- it is the queue's `ClaimedTask.trace_id`,
+    carried down by the handler so a generation lands on the same trace as the
+    task that caused it (I7).
+    """
+
+    trace_id: str
+    task_id: UUID
+
+
 class _State(TypedDict):
     checkpoint: AgentCheckpoint
 
@@ -186,12 +202,14 @@ class AgentRuntime:
         checkpoints: CheckpointStore,
         reservation: ModelReservation,
         on_spend: Callable[[RunBudget], None] | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         self._client = client
         self._tools = tools
         self._checkpoints = checkpoints
         self._reservation = reservation
         self._on_spend = on_spend
+        self._tracer: Tracer = tracer if tracer is not None else NoopTracer()
 
     def _spent(self, amount: RunBudget) -> None:
         """Report an increment the moment it is incurred, before anything can fail."""
@@ -206,6 +224,7 @@ class AgentRuntime:
         prompt_version: str,
         messages: tuple[Message, ...],
         output_model: type[BaseModel],
+        trace: TraceContext,
     ) -> AgentResult:
         checkpoint = await self._checkpoints.load(key) or AgentCheckpoint(
             messages=messages, usage=NOTHING_SPENT
@@ -219,10 +238,10 @@ class AgentRuntime:
         async def cycle(state: _State) -> _State:
             current = state["checkpoint"]
             updated = (
-                await self._tool_step(key, current, allowlist, spec.limits)
+                await self._tool_step(key, current, allowlist, spec.limits, trace)
                 if current.pending_tool_calls
                 else await self._model_step(
-                    key, current, spec, prompt_version, schemas, output_model
+                    key, current, spec, prompt_version, schemas, output_model, trace
                 )
             )
             return {"checkpoint": updated}
@@ -271,6 +290,7 @@ class AgentRuntime:
         prompt_version: str,
         schemas: tuple[ToolSchema, ...],
         output_model: type[BaseModel],
+        trace: TraceContext,
     ) -> AgentCheckpoint:
         self._preflight_model(current.usage, spec.limits, current.messages)
         request = CompletionRequest(
@@ -283,8 +303,16 @@ class AgentRuntime:
             # prompt on top of everything that was checked for.
             max_tokens=self._completion_allowance(current.messages),
         )
+        span = self._tracer.generation_span(
+            trace_id=trace.trace_id,
+            task_id=trace.task_id,
+            model_alias=spec.model_alias,
+            prompt_version=prompt_version,
+        )
         try:
-            completion = await self._client.complete(request)
+            with span as generation:
+                completion = await self._client.complete(request)
+                generation.record(SpanOutcome.OK)
         except LLMError as exc:
             # The call spent what it generated before it died; report and
             # checkpoint that before letting the failure travel, or a retry
@@ -385,6 +413,7 @@ class AgentRuntime:
         current: AgentCheckpoint,
         allowlist: frozenset[str],
         cap: RunBudget,
+        trace: TraceContext,
     ) -> AgentCheckpoint:
         call = current.pending_tool_calls[0]
         # Asked before the reservation and before the handler: a tool this agent
@@ -403,7 +432,12 @@ class AgentRuntime:
             # awaits; one blocked in C is still the worker deadline's problem
             # (SPEC §13 D7).
             async with asyncio.timeout(reserved.total_seconds()):
-                content = (await self._tools.invoke(call, allowlist=allowlist)).model_dump_json()
+                with self._tracer.tool_span(
+                    trace_id=trace.trace_id, task_id=trace.task_id, tool_name=call.name
+                ):
+                    content = (
+                        await self._tools.invoke(call, allowlist=allowlist)
+                    ).model_dump_json()
         except TimeoutError as exc:
             self._spent(
                 RunBudget(steps=1, tokens=0, cost_usd=Decimal(0), wall_clock=reserved)

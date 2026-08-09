@@ -65,6 +65,14 @@ class TaskContext:
     connection: QueueConnection
     spec: TaskSpec
     attempts: int
+    trace_id: str
+    """The run's trace, so work the handler starts lands on it too (I7).
+
+    A handler that opens spans of its own -- an agent loop's generations and
+    tool calls -- needs the same trace id the worker's task span is on, or the
+    trace shows a task with nothing inside it.
+    """
+
     usage: UsageLedger
     """Where a handler debits what it spends, as it spends it.
 
