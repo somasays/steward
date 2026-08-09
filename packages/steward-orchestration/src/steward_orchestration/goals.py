@@ -243,3 +243,4 @@ def plan_profile_asset(params: ProfileAssetParams) -> tuple[PlannedTask, ...]:
             payload={"asset_id": str(params.asset_id)},
         ),
     )
+

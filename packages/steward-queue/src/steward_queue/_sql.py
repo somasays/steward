@@ -219,6 +219,10 @@ SELECT_CHECKPOINTS = """
 SELECT step, state FROM checkpoints WHERE task_id = %(task_id)s ORDER BY step
 """
 
+SELECT_LATEST_CHECKPOINT = """
+SELECT step, state FROM checkpoints WHERE task_id = %(task_id)s ORDER BY step DESC LIMIT 1
+"""
+
 # The claim. `FOR UPDATE SKIP LOCKED` inside the CTE is what makes concurrent
 # workers disjoint: a row another transaction already locked is skipped rather
 # than waited on, so two workers never hand the same task to two handlers

@@ -79,7 +79,7 @@ async def observe_twice(
     """
     observations: list[tuple[str, str]] = []
     for _ in range(2):
-        ctx = TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())
+        ctx = TaskContext(connection=conn, spec=spec, attempts=1, trace_id="trace-test", usage=UsageLedger())
         result = await registration.fn(ctx)
         conn.commit()
         observations.append((result.model_dump_json(), canonical(registration.state_probe(conn, spec))))

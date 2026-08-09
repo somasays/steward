@@ -34,6 +34,15 @@ from steward_catalog.repository import CATALOG_ENTITIES
 from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import SourceCreate, TaskSpec, TaskStatus
 
+
+def _ctx(conn: QueueConnection, spec: TaskSpec, attempts: int = 1) -> TaskContext:
+    """A handler context for a test: a trace to hang spans on, and a fresh
+    per-attempt usage ledger (`steward_queue.usage`)."""
+    return TaskContext(
+        connection=conn, spec=spec, attempts=attempts, trace_id="trace-test", usage=UsageLedger()
+    )
+
+
 pytestmark = pytest.mark.invariants
 
 SELECT_ASSETS = """
@@ -73,7 +82,7 @@ def snapshot(conn: QueueConnection) -> dict[str, list[tuple[Any, ...]]]:
 def scan(conn: QueueConnection, spec: TaskSpec, resolver: EnvSecretResolver) -> Any:
     """Run the real handler in the caller's transaction, as a worker would."""
     handler = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
+    result = asyncio.run(handler(_ctx(conn, spec, 1)))
     conn.commit()
     return result
 

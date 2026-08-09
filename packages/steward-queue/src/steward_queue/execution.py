@@ -478,7 +478,11 @@ def _run_handler(
     try:
         handoff.publish(conn.info.backend_pid)
         ctx = TaskContext(
-            connection=conn, spec=task.spec, attempts=task.attempts, usage=usage
+            connection=conn,
+            spec=task.spec,
+            attempts=task.attempts,
+            trace_id=task.trace_id,
+            usage=usage,
         )
         started = time.monotonic()
         try:

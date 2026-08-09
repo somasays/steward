@@ -35,6 +35,15 @@ from steward_catalog.repository import CATALOG_ENTITIES
 from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import SourceCreate, TaskSpec, TaskStatus
 
+
+def _ctx(conn: QueueConnection, spec: TaskSpec, attempts: int = 1) -> TaskContext:
+    """A handler context for a test: a trace to hang spans on, and a fresh
+    per-attempt usage ledger (`steward_queue.usage`)."""
+    return TaskContext(
+        connection=conn, spec=spec, attempts=attempts, trace_id="trace-test", usage=UsageLedger()
+    )
+
+
 pytestmark = pytest.mark.invariants
 
 SELECT_PROFILES = """
@@ -64,7 +73,7 @@ def snapshot(conn: QueueConnection) -> dict[str, list[tuple[Any, ...]]]:
 def profile(conn: QueueConnection, spec: TaskSpec, resolver: EnvSecretResolver) -> Any:
     """Run the real handler in the caller's transaction, as a worker would."""
     handler = build_profile_asset(resolver=resolver, profiler=postgres_profiler)
-    result = asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
+    result = asyncio.run(handler(_ctx(conn, spec, 1)))
     conn.commit()
     return result
 
@@ -86,7 +95,7 @@ def catalogued(
     source, _ = register_source(conn, source_create, actor=SYSTEM_ACTOR)
     conn.commit()
     handler = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    ctx = TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1, usage=UsageLedger())
+    ctx = _ctx(conn, spec_factory(source.id), 1)
     result = asyncio.run(handler(ctx))
     conn.commit()
     assert result.status is TaskStatus.SUCCEEDED, result.error
@@ -198,7 +207,7 @@ def test_a_missing_asset_is_refused_before_a_connection_is_opened(
     Profiling it would fail in the driver; failing here names the real cause."""
     source_admin.execute("DROP TABLE sales.customers CASCADE")
     scan = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    ctx = TaskContext(connection=conn, spec=spec_factory(catalogued), attempts=1, usage=UsageLedger())
+    ctx = _ctx(conn, spec_factory(catalogued), 1)
     asyncio.run(scan(ctx))
     conn.commit()
 

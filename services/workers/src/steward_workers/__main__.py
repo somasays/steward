@@ -16,11 +16,48 @@ import socket
 import uuid
 
 import steward_catalog  # noqa: F401 -- imported for its side effect: registers `scan_source`
-from steward_llm import gateway_config_from_env
+from steward_llm import GatewayConfig, StubGateway, gateway_config_from_env
 from steward_queue import DSN_ENV, Worker, registered_types
-from steward_telemetry import tracer_from_env
+from steward_telemetry import Tracer, tracer_from_env
+
+from steward_workers import agent_tasks
 
 WORKER_ID_ENV = "STEWARD_WORKER_ID"
+
+AGENT_TRANSPORT_ENV = "STEWARD_AGENT_TRANSPORT"
+"""Which gateway transport the agent tasks run against; `stub` is the only value.
+
+There is no LiteLLM transport yet and this is where that gap becomes visible
+rather than convenient (SPEC §13 D11): a `GatewayConfig` is the proxy's routing
+table and holds no address for the proxy, so a worker cannot yet be pointed at
+one. Registering the agent tasks against the stub *by default* would give a
+production worker a handler that answers from a fixture, which is the kind of
+green that means nothing. So it is opt-in by name, exactly as development mode
+is, and a worker that says nothing gets no agent handlers at all."""
+
+
+def register_agent_tasks(dsn: str, gateway: GatewayConfig | None, tracer: Tracer) -> str:
+    """Register the agent-backed task types this process can honestly execute.
+
+    Returns what it did, for the log line: an operator should be able to see
+    that a worker has no agent handlers rather than infer it from a task that
+    is never claimed.
+    """
+    transport = os.environ.get(AGENT_TRANSPORT_ENV, "").strip().lower()
+    if not transport:
+        return "none registered (no transport configured)"
+    if transport != "stub":
+        raise SystemExit(
+            f"{AGENT_TRANSPORT_ENV}={transport!r} is not a transport; "
+            "only 'stub' exists until the gateway transport lands (SPEC §13 D11)"
+        )
+    if gateway is None:
+        raise SystemExit(
+            f"{AGENT_TRANSPORT_ENV} is set but no gateway config is; "
+            "an agent handler with no validated gateway cannot exist (I15)"
+        )
+    agent_tasks.register(dsn=dsn, gateway=gateway, transport=StubGateway({}), tracer=tracer)
+    return f"{agent_tasks.AGENT_ECHO} on the stub transport"
 
 SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
@@ -90,9 +127,11 @@ def main() -> None:
         if gateway
         else "none configured; this worker cannot call a model",
     )
+    tracer = tracer_from_env()
+    log.info("agent tasks: %s", register_agent_tasks(dsn, gateway, tracer))
     worker_id = os.environ.get(WORKER_ID_ENV, "").strip() or default_worker_id()
     log.info("worker %s claims %s", worker_id, ", ".join(registered_types()))
-    asyncio.run(run(Worker(dsn, worker_id, tracer=tracer_from_env())))
+    asyncio.run(run(Worker(dsn, worker_id, tracer=tracer)))
 
 
 if __name__ == "__main__":
