@@ -46,6 +46,7 @@ from steward_schemas import (
 )
 
 from steward_catalog._profile_sql import (
+    ORDERED_COLUMNS,
     SET_LOCAL_STATEMENT_TIMEOUT,
     STATS_PER_COLUMN,
     TOP_VALUE_LIMIT,
@@ -129,13 +130,14 @@ class PostgresSourceProfiler:
 
     Carries the wall-clock `budget` because the transaction it opens has to be
     bounded by something, and `statement_timeout` alone is not it: it bounds a
-    *statement* (`steward_queue.db`), and a profile is one stats pass plus one
-    query per column. Under autocommit that did not matter -- locks and snapshot
-    were released between statements -- but one `REPEATABLE READ` transaction
-    holds an `ACCESS SHARE` lock and pins `xmin` for as long as it lives, so N+1
-    statements each allowed the whole budget would let a 60-column table hold a
-    customer's relation for 61 times the cap, blocking their DDL and their
-    VACUUM long after Steward recorded the task `budget_exceeded` (#49 review).
+    *statement* (`steward_queue.db`), and a profile is a catalog lookup, a stats
+    pass and one query per column. Under autocommit that did not matter -- locks
+    and snapshot were released between statements -- but one `REPEATABLE READ`
+    transaction holds an `ACCESS SHARE` lock and pins `xmin` for as long as it
+    lives, so N+2 statements each allowed the whole budget would let a 60-column
+    table hold a customer's relation for 62 times the cap, blocking their DDL and
+    their VACUUM long after Steward recorded the task `budget_exceeded`
+    (#49 review, #70).
 
     So each statement is allowed only what is *left* of the budget: the last one
     gets the remainder, the total is the cap, and a profile that has already
@@ -180,16 +182,31 @@ class PostgresSourceProfiler:
         self.connection.rollback()
         return profile
 
+    def _ordered_columns(self, target: ProfileTarget) -> frozenset[str]:
+        """Which of this relation's columns have a `min`/`max` aggregate.
+
+        One catalog lookup per profile, not per column, and it runs inside the
+        same snapshot as everything else -- so the set of columns the extrema
+        are computed for is the set that existed when the statistics were read.
+        """
+        self._bound_next_statement()
+        rows = self.connection.execute(
+            ORDERED_COLUMNS, {"schema_name": target.schema_name, "name": target.name}
+        ).fetchall()
+        return frozenset(str(row[0]) for row in rows)
+
     def _profile(self, target: ProfileTarget) -> TableProfile:
         names = tuple(column.name for column in target.columns)
+        ordered = self._ordered_columns(target) if names else frozenset()
         self._bound_next_statement()
-        row = self.connection.execute(stats_query(target.schema_name, target.name, names)).fetchone()
+        row = self.connection.execute(stats_query(target.schema_name, target.name, names, ordered)).fetchone()
         if row is None:  # pragma: no cover -- an aggregate always returns a row
             raise RuntimeError(f"no statistics returned for {target.schema_name}.{target.name}")
         expected = 1 + STATS_PER_COLUMN * len(names)
         if len(row) != expected:
             # The row is sliced positionally below, so a mismatch between the
-            # aggregates `_COLUMN_STATS` emits and `STATS_PER_COLUMN` would not
+            # aggregates `_TYPED_EXTREMA`/`_NO_EXTREMA` emit and
+            # `STATS_PER_COLUMN` would not
             # fail -- it would shift every column's min/max onto its neighbour
             # and produce a profile that is wrong rather than absent. The
             # comment on the constant says the two must agree; this is what
