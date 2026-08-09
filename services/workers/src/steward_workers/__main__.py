@@ -66,16 +66,23 @@ def main() -> None:
     hence the side-effecting import above, and the log line that makes the
     resulting claim list visible rather than something to infer from silence.
 
-    The gateway config is validated here, before any task can be claimed: if a
-    production alias resolves anywhere but an approved self-hosted endpoint the
-    exception propagates and the process does not start (I15). No config named
-    means no gateway at all, which is how M0/M1 run credential-free -- not a
-    degraded mode, since nothing in this process can call a model without one.
+    The gateway config is validated first, before this process reads anything
+    else about its environment: if a production alias resolves anywhere but an
+    approved self-hosted endpoint the exception propagates and the process does
+    not start (I15). No config named means no gateway at all, which is how M0/M1
+    run credential-free -- not a degraded mode, since nothing in this process can
+    call a model without one.
+
+    First rather than after the DSN check because the refusal is the one outcome
+    that must not depend on the rest of the environment being right -- and
+    because that ordering is what the H12 harness reads: an entry point booted
+    against an off-allowlist config must refuse for *that* reason, not exit
+    earlier over an unset DSN and look like it refused.
     """
+    gateway = gateway_config_from_env()
     dsn = os.environ.get(DSN_ENV, "").strip()
     if not dsn:
         raise SystemExit(f"{DSN_ENV} is not set")
-    gateway = gateway_config_from_env()
     log = logging.getLogger(__name__)
     log.info(
         "gateway: %s",

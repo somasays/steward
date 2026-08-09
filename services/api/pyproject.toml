@@ -11,6 +11,10 @@ dependencies = [
     # the API validate that a planned task type is executable at all.
     "steward-catalog",
     "steward-telemetry",
+    # The startup refusal (I15): every entry point this service ships validates the
+    # gateway config before it does anything else, so a deployment whose routing table
+    # reaches off the allowlist starts none of them (GUARDRAILS.md H12).
+    "steward-llm",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
 ]
@@ -25,6 +29,7 @@ steward-orchestration = { workspace = true }
 steward-catalog = { workspace = true }
 steward-queue = { workspace = true }
 steward-telemetry = { workspace = true }
+steward-llm = { workspace = true }
 
 [dependency-groups]
 dev = [
