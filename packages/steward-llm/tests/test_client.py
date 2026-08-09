@@ -179,8 +179,8 @@ async def test_a_cancelled_call_stays_exactly_a_cancellation() -> None:
     `CancelledError` — CPython compares the type by identity — and the worker's
     wall-clock verdict is built on that conversion (SPEC.md §13 D7, issue #57).
     An owned subclass would drop that proof back to a clock comparison, so the
-    cancellation is left alone; the overrun it belongs to is charged the whole
-    cap by `budget_exceeded`, so the spend is not under-reported either."""
+    cancellation is left alone. The cost is stated in `errors.py`: a cancelled
+    call's spend is bounded by the cap its task reserved, not reported."""
     gateway = StubGateway(
         {
             "steward-fast": [

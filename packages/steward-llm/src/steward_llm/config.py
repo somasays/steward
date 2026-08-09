@@ -116,8 +116,9 @@ class GatewayConfig:
     """A gateway configuration that has passed the startup check.
 
     Validation happens in `__post_init__`, so an instance of this type is evidence the
-    check ran: there is no construction path that skips it, and callers that need a
-    gateway (the client lands with #50) can take this type instead of a file path.
+    check ran: there is no construction path that skips it. `LLMClient` takes one of
+    these and nothing else — no path, no environment — so a process that skipped the
+    check cannot build a client at all (issue #69, SPEC.md §13 D11).
     """
 
     mode: DeploymentMode

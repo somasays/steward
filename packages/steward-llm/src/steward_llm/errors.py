@@ -19,10 +19,18 @@ into `TimeoutError` only when the exception reaching it *is* `CancelledError`
 worker's wall-clock enforcement is built on exactly that conversion: `_bounded`
 recognises the cap's own expiry in-band and #57 established that this verdict
 must rest on that evidence rather than on a clock comparison. A subclass of
-`CancelledError` silently drops it back to the heuristic. And the spend is not
-lost by staying out of the way: a run whose task is cancelled by its deadline is
-charged `budget_exceeded(budget)` — the whole cap, which is conservative in the
-right direction. So the client lets a cancellation through untouched.
+`CancelledError` silently drops it back to the heuristic.
+
+What that costs is worth stating exactly, because it is a real gap and not a
+covered case: a cancelled call's spend is not reported by this package, so
+nothing debits it. It is *bounded* rather than accounted — the task's whole cap
+was reserved out of its run's budget before the task existed (SPEC.md §13 D9),
+and the cancellation ends the task as `budget_exceeded`, whose usage is never
+rolled into `runs.used_*` (that column sums succeeded tasks only). So the run
+cannot be walked past its budget by cancellations; it just under-reports what a
+cancelled one actually spent. Widening the accounting is a change to how a
+failed attempt's usage is recorded, which is issue #69's other half, not a
+reason to break the type the deadline machinery reads.
 """
 
 from __future__ import annotations
