@@ -247,13 +247,9 @@ async def test_every_binding_for_an_alias_reaches_the_transport() -> None:
     """SPEC.md §6 gives each alias two approved endpoints. Resolving to one of
     them would drop the redundancy that replaced provider diversity, so the
     client hands the transport all of them and routes between none."""
-    client = LLMClient(
-        committed_production_config(), StubGateway({"steward-fast": [StubReply.completed("ok")]})
-    )
-    gateway = client._transport
-    await client.complete(request())
+    gateway = StubGateway({"steward-fast": [StubReply.completed("ok")]})
+    await LLMClient(committed_production_config(), gateway).complete(request())
 
-    assert isinstance(gateway, StubGateway)
     reached = gateway.calls[0].bindings
     assert len(reached) == 2
     assert {binding.api_base for binding in reached} == {
