@@ -11,9 +11,10 @@ dependencies = [
     # before the worker is built -- is what puts `scan_source` on the list of
     # task types this process claims.
     "steward-catalog",
-    # Not for calling models (that client lands with #50) but for refusing to start:
-    # the composition root validates the gateway config before the worker claims
-    # anything, so a production alias pointed off the allowlist never runs (I15).
+    # First for refusing to start: the composition root validates the gateway config
+    # before the worker claims anything, so a production alias pointed off the
+    # allowlist never runs (I15), and H12 boots this entry point to prove it. The
+    # client an M1 handler calls models with (issue #69) comes from the same package.
     "steward-llm",
 ]
 
