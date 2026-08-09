@@ -8,6 +8,7 @@ it happens so a failure that never returns still charges the run.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from decimal import Decimal
 
@@ -53,7 +54,7 @@ class FinalOutput(BaseModel):
 
 
 def budget(
-    *, steps: int = 5, tokens: int = 100, cost: str = "1", wall_clock: timedelta | None = None
+    *, steps: int = 5, tokens: int = 2000, cost: str = "1", wall_clock: timedelta | None = None
 ) -> RunBudget:
     return RunBudget(
         steps=steps,
@@ -84,8 +85,12 @@ def spec(*, tools: tuple[str, ...] = ("echo",), limits: RunBudget | None = None)
     )
 
 
-def reservation() -> ModelReservation:
-    return ModelReservation(tokens=20, cost_usd=Decimal("0.20"), wall_clock=timedelta(seconds=10))
+def reservation(tokens: int = 400) -> ModelReservation:
+    """The per-call worst case. `tokens` is a *total* — prompt plus completion —
+    so it has to be big enough to hold a realistic history, not just an answer."""
+    return ModelReservation(
+        tokens=tokens, cost_usd=Decimal("0.20"), wall_clock=timedelta(seconds=10)
+    )
 
 
 def registry(calls: list[str], *, wall_clock: timedelta = timedelta(seconds=5)) -> ToolRegistry:
@@ -472,3 +477,153 @@ def test_a_tool_must_declare_a_positive_wall_clock_reservation() -> None:
             handler=handler,
             wall_clock=timedelta(0),
         )
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_that_fills_the_reservation_is_refused_before_the_call() -> None:
+    """`max_tokens` bounds the completion only. If the reservation were sent as
+    `max_tokens`, a call would cost the prompt on top of everything checked for,
+    and a long history would overrun the cap the preflight had just approved."""
+    llm, gateway = client([submits("never reached")])
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(tokens=30),
+    )
+    with pytest.raises(BudgetExceeded, match="prompt alone"):
+        await runtime.run(
+            key="task-bloated",
+            spec=spec(tools=()),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="x" * 600),),
+            output_model=FinalOutput,
+        )
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_completion_allowance_is_the_reservation_minus_the_prompt() -> None:
+    llm, gateway = client([submits("done")])
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(tokens=100),
+    )
+    await runtime.run(
+        key="task-allowance",
+        spec=spec(tools=()),
+        prompt_version="proof.v1",
+        messages=(Message(role=Role.USER, content="x" * 90),),  # ~30 tokens
+        output_model=FinalOutput,
+    )
+    assert gateway.calls[0].request.max_tokens == 70
+
+
+@pytest.mark.asyncio
+async def test_a_tool_that_outruns_its_declared_reservation_is_cut_off() -> None:
+    """A reservation nothing enforces is a declaration. Without the timeout a
+    tool reserved for a moment could run indefinitely, and the overrun would be
+    discovered by debiting it afterwards -- the audit fence, one level down."""
+    tools = ToolRegistry()
+
+    async def crawls(request: BaseModel) -> BaseModel:
+        await asyncio.sleep(5)
+        return EchoOutput(value="too late")
+
+    tools.register(
+        name="echo",
+        description="Takes far longer than it claims",
+        input_model=EchoInput,
+        output_model=EchoOutput,
+        handler=crawls,
+        wall_clock=timedelta(milliseconds=50),
+    )
+    llm, _ = client([
+        StubReply.completed(
+            "",
+            prompt_tokens=1,
+            completion_tokens=1,
+            tool_calls=(ToolCall(id="call-1", name="echo", arguments='{"value":"go"}'),),
+        )
+    ])
+    spends: list[RunBudget] = []
+    runtime = AgentRuntime(
+        client=llm,
+        tools=tools,
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+        on_spend=spends.append,
+    )
+    with pytest.raises(AgentRuntimeError, match="outran"):
+        await runtime.run(
+            key="task-slow",
+            spec=spec(),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="go"),),
+            output_model=FinalOutput,
+        )
+    # The time it was allowed is charged, not the time it took.
+    assert spends[-1].wall_clock == timedelta(milliseconds=50)
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_submission_is_corrected_once_not_checkpointed_as_done() -> None:
+    """Finding 4: checkpointing an unvalidated result made `finished` mean "will
+    fail again on every resume, forever, without ever telling the model why"."""
+    llm, _ = client([
+        StubReply.completed(
+            "",
+            prompt_tokens=1,
+            completion_tokens=1,
+            tool_calls=(ToolCall(id="s1", name=SUBMIT_RESULT, arguments='{"wrong":"shape"}'),),
+        ),
+        submits("second time lucky", prompt_tokens=1, completion_tokens=1),
+    ])
+    stores = InMemoryCheckpointStore()
+    runtime = AgentRuntime(
+        client=llm, tools=registry([]), checkpoints=stores, reservation=reservation()
+    )
+    result = await runtime.run(
+        key="task-bad-submit",
+        spec=spec(tools=()),
+        prompt_version="proof.v1",
+        messages=(Message(role=Role.USER, content="go"),),
+        output_model=FinalOutput,
+    )
+    assert result.output == FinalOutput(answer="second time lucky")
+    corrections = [m for m in stores.values["task-bad-submit"].messages if m.role is Role.TOOL]
+    assert "invalid result" in corrections[0].content
+
+
+@pytest.mark.asyncio
+async def test_submitting_alongside_other_calls_is_refused_not_guessed_at() -> None:
+    llm, _ = client([
+        StubReply.completed(
+            "",
+            prompt_tokens=1,
+            completion_tokens=1,
+            tool_calls=(
+                ToolCall(id="e1", name="echo", arguments='{"value":"x"}'),
+                ToolCall(id="s1", name=SUBMIT_RESULT, arguments='{"answer":"early"}'),
+            ),
+        ),
+        submits("properly", prompt_tokens=1, completion_tokens=1),
+    ])
+    stores = InMemoryCheckpointStore()
+    invoked: list[str] = []
+    runtime = AgentRuntime(
+        client=llm, tools=registry(invoked), checkpoints=stores, reservation=reservation()
+    )
+    result = await runtime.run(
+        key="task-mixed",
+        spec=spec(),
+        prompt_version="proof.v1",
+        messages=(Message(role=Role.USER, content="go"),),
+        output_model=FinalOutput,
+    )
+    assert result.output == FinalOutput(answer="properly")
+    assert invoked == []  # the discarded echo was never silently run
+    corrections = [m for m in stores.values["task-mixed"].messages if m.role is Role.TOOL]
+    assert "must be the only call" in corrections[0].content
