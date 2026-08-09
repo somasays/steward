@@ -24,7 +24,7 @@ from steward_catalog import (
     register_source,
 )
 from steward_catalog.profile_handler import profile_state_probe
-from steward_queue import REGISTRY, SYSTEM_ACTOR, QueueConnection, TaskContext
+from steward_queue import REGISTRY, SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import SourceCreate, TaskResult, TaskSpec, TaskStatus
 
 MISSING_SECRET_REF = "env:STEWARD_NO_SUCH_SOURCE_DSN"
@@ -41,7 +41,7 @@ def profile_spec(spec_factory: Callable[[UUID], TaskSpec], payload: dict[str, An
 
 def execute(conn: QueueConnection, spec: TaskSpec, resolver: Any) -> TaskResult:
     handler = build_profile_asset(resolver=resolver, profiler=postgres_profiler)
-    return asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1)))
+    return asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
 
 
 def test_the_handler_is_registered_under_its_task_type() -> None:
@@ -73,7 +73,8 @@ def test_an_unresolvable_credential_fails_without_naming_one(
     source, _ = register_source(conn, source_create, actor=SYSTEM_ACTOR)
     conn.commit()
     scan = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    asyncio.run(scan(TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1)))
+    ctx = TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1, usage=UsageLedger())
+    asyncio.run(scan(ctx))
     conn.execute(ROTATE_SECRET, {"ref": MISSING_SECRET_REF, "id": source.id})
     conn.commit()
     asset_id = conn.execute(SELECT_ASSET_ID).fetchone()

@@ -34,7 +34,7 @@ from steward_catalog import (
     register_source,
 )
 from steward_catalog.handler import scan_state_probe
-from steward_queue import REGISTRY, SYSTEM_ACTOR, QueueConnection, TaskContext
+from steward_queue import REGISTRY, SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger
 from steward_schemas import SourceCreate, TaskResult, TaskSpec, TaskStatus
 
 UNREACHABLE = "postgresql://steward_reader:hunter2@127.0.0.1:1/analytics"
@@ -44,7 +44,7 @@ def execute(
     conn: QueueConnection, spec: TaskSpec, resolver: Any, inspect: Any = postgres_inspector
 ) -> TaskResult:
     handler = build_scan_source(resolver=resolver, inspect=inspect)
-    return asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1)))
+    return asyncio.run(handler(TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())))
 
 
 def test_the_handler_is_registered_under_its_task_type() -> None:
@@ -184,7 +184,8 @@ def test_the_registered_handler_runs_from_the_registry(
     registration = REGISTRY[SCAN_SOURCE_TASK_TYPE]
     spec = spec_factory(uuid4()).model_copy(update={"payload": dict(registration.sample_payload)})
 
-    result = asyncio.run(registration.fn(TaskContext(connection=conn, spec=spec, attempts=attempts)))
+    ctx = TaskContext(connection=conn, spec=spec, attempts=attempts, usage=UsageLedger())
+    result = asyncio.run(registration.fn(ctx))
 
     assert result.status is TaskStatus.FAILED
     assert result.error is not None and result.error.type == "urn:steward:unknown-source"

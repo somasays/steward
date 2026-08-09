@@ -50,8 +50,12 @@ from steward_telemetry import Span, SpanOutcome
 NO_BACKOFF = timedelta(0)
 EXPIRED_LEASE = timedelta(seconds=-1)
 NO_USAGE = RunBudget(steps=1, tokens=0, cost_usd=Decimal("0"), wall_clock=timedelta(0))
+SPENT_PER_CALL = RunBudget(steps=1, tokens=9, cost_usd=Decimal("0.03"), wall_clock=timedelta(0))
+"""What the ledger-debiting handlers below claim to have spent per call."""
 
 EXPLODES = "test.explodes_on_demand"
+SPENDS_THEN_RAISES = "test.spends_then_raises"
+SPENDS_THEN_OVERRUNS = "test.spends_then_overruns"
 OVERSPENDS = "test.overspends_its_budget"
 REPORTS_FAILURE = "test.reports_failure"
 SLEEPS = "test.sleeps"
@@ -113,6 +117,31 @@ async def explodes_on_demand(ctx: TaskContext) -> TaskResult:
     if ctx.spec.payload.get("boom"):
         raise RuntimeError("handler exploded")
     write_checkpoint(ctx.connection, ctx.spec.task_id, step=0, state={"boom": False})
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(SPENDS_THEN_RAISES, sample_payload={"boom": False})
+async def spends_then_raises(ctx: TaskContext) -> TaskResult:
+    """Debits the ledger, then dies without a result.
+
+    The shape of every model-backed handler that fails mid-run: the tokens are
+    gone, and the `TaskResult` that would have reported them is never built.
+    """
+    if ctx.spec.payload.get("boom"):
+        ctx.usage.debit(SPENT_PER_CALL)
+        raise RuntimeError("handler exploded after spending")
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(SPENDS_THEN_OVERRUNS, sample_payload={"seconds": 0.0})
+async def spends_then_overruns(ctx: TaskContext) -> TaskResult:
+    """Debits the ledger, then outlives its wall-clock cap.
+
+    The worker abandons this thread rather than waiting for it, so the ledger
+    is the only surviving account of what it spent.
+    """
+    ctx.usage.debit(SPENT_PER_CALL)
+    await asyncio.sleep(float(ctx.spec.payload["seconds"]))
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
 
 
@@ -531,6 +560,60 @@ class TestFailurePaths:
         assert run.usage.steps == 2
         assert run.usage.tokens == 14
         assert run.usage.cost_usd == Decimal("0.04")
+
+    async def test_a_handler_that_raises_after_spending_still_charges_the_run(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """The failure that carries no result. Before the ledger, the tokens a
+        raising handler had already spent were charged to nobody and
+        `runs.used_*` counted succeeded tasks only (SPEC §13 D9)."""
+        spec = queued(task_type=SPENDS_THEN_RAISES, payload={"boom": True}, max_attempts=1)
+        await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once()
+
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        assert run.usage.tokens == SPENT_PER_CALL.tokens
+        assert run.usage.cost_usd == SPENT_PER_CALL.cost_usd
+
+    async def test_every_retry_of_a_raising_handler_is_charged(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """Each attempt spends again, so each attempt is charged again -- the
+        ledger counts one attempt, and a retry starts a fresh one."""
+        spec = queued(task_type=SPENDS_THEN_RAISES, payload={"boom": True}, max_attempts=2)
+        worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
+
+        assert await worker.run_once() == 1
+        assert await worker.run_once() == 1
+
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        assert run.usage.tokens == 2 * SPENT_PER_CALL.tokens
+
+    async def test_a_handler_killed_at_its_cap_still_charges_what_it_spent(
+        self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
+    ) -> None:
+        """The most expensive failure there is: a task killed at its wall-clock
+        cap is by definition one that spent up to the cap. The worker abandons
+        the thread, so the ledger snapshot is the only account of it."""
+        spec = queued(
+            task_type=SPENDS_THEN_OVERRUNS,
+            payload={"seconds": 5.0},
+            budget=RunBudget(
+                steps=5,
+                tokens=100,
+                cost_usd=Decimal("1"),
+                wall_clock=timedelta(milliseconds=200),
+            ),
+            max_attempts=1,
+        )
+        await Worker(dsn, "w1", retry_base_delay=NO_BACKOFF).run_once()
+
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.DEAD
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        assert run.usage.tokens == SPENT_PER_CALL.tokens
 
     async def test_a_handler_that_outruns_its_wall_clock_budget_is_terminated(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]

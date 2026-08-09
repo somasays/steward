@@ -73,6 +73,7 @@ from steward_queue import (
     QueueConnection,
     TaskContext,
     TaskState,
+    UsageLedger,
     Worker,
     create_run,
     enqueue,
@@ -199,7 +200,8 @@ def scanned_source(
     source, _ = register_source(conn, source_create, actor=SYSTEM_ACTOR)
     conn.commit()
     scan = build_scan_source(resolver=resolver, inspect=postgres_inspector)
-    result = asyncio.run(scan(TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1)))
+    ctx = TaskContext(connection=conn, spec=spec_factory(source.id), attempts=1, usage=UsageLedger())
+    result = asyncio.run(scan(ctx))
     conn.commit()
     assert result.status is TaskStatus.SUCCEEDED, result.error
     assets = {row[0]: row[1] for row in conn.execute(SELECT_ASSET_IDS).fetchall()}

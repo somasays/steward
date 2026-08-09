@@ -35,6 +35,7 @@ from steward_queue import (
 )
 from steward_queue.db import QueueConnection
 from steward_queue.registry import TaskContext
+from steward_queue.usage import UsageLedger
 from steward_schemas import RunBudget, TaskResult, TaskSpec, TaskStatus
 
 pytestmark = pytest.mark.invariants
@@ -78,7 +79,8 @@ async def observe_twice(
     """
     observations: list[tuple[str, str]] = []
     for _ in range(2):
-        result = await registration.fn(TaskContext(connection=conn, spec=spec, attempts=1))
+        ctx = TaskContext(connection=conn, spec=spec, attempts=1, usage=UsageLedger())
+        result = await registration.fn(ctx)
         conn.commit()
         observations.append((result.model_dump_json(), canonical(registration.state_probe(conn, spec))))
         conn.commit()

@@ -36,6 +36,13 @@ Registering a handler is a promise with four clauses:
    result plus its checkpoints -- covers handlers whose only writes are those.
    A handler that writes elsewhere must supply a probe that reads it back, or
    its idempotency is unproven.
+5. **Debit as you spend.** A handler that consumes metered resources debits
+   `ctx.usage` at the moment each one is gone, in addition to reporting its
+   total on the result it returns. Reporting alone is not enough: a handler
+   that raises never builds a result, and one abandoned at its wall-clock cap
+   never gets to return, so on both paths the ledger is the only record of what
+   the run actually spent (I12). A handler that spends nothing metered -- no
+   model call -- has nothing to debit and can ignore this.
 """
 
 from collections.abc import Awaitable, Callable, Mapping
@@ -46,6 +53,7 @@ from steward_schemas import TaskResult, TaskSpec
 
 from steward_queue import _sql
 from steward_queue.db import QueueConnection
+from steward_queue.usage import UsageLedger
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +65,15 @@ class TaskContext:
     connection: QueueConnection
     spec: TaskSpec
     attempts: int
+    usage: UsageLedger
+    """Where a handler debits what it spends, as it spends it.
+
+    A handler that returns reports its total on its `TaskResult` and need not
+    touch this. A handler that can *fail after spending* -- anything calling a
+    model -- must debit here too, because the two failure paths that carry no
+    result (a raise, and an abandonment at the wall-clock cap) can only charge
+    the run what this ledger says (clause 5 below).
+    """
 
 
 type TaskHandler = Callable[[TaskContext], Awaitable[TaskResult]]

@@ -79,6 +79,7 @@ from steward_queue.execution import (
 )
 from steward_queue.models import SYSTEM_ACTOR, Actor, ClaimedTask
 from steward_queue.registry import HandlerRegistration, UnknownTaskType, get_handler, registered_types
+from steward_queue.usage import NOTHING_SPENT, UsageLedger
 
 __all__ = ["BUDGET_EXCEEDED", "DEADLINE_GRACE", "EXECUTION_FAILED", "HANDLER_FAILED", "Worker"]
 """The vocabulary of a task's outcome, addressed where the worker is addressed.
@@ -256,16 +257,28 @@ class Worker:
         )
         conn.commit()
 
-    def _record(self, conn: QueueConnection, task: ClaimedTask, outcome: TaskResult | ProblemDetails) -> None:
+    def _record(
+        self,
+        conn: QueueConnection,
+        task: ClaimedTask,
+        outcome: TaskResult | ProblemDetails,
+        spent: RunBudget,
+    ) -> None:
         """Write an attempt's terminal state on the connection it is given.
 
         The connection is an argument because the two contexts that can reach
         this point hold different ones: the handler thread records on its own,
         together with the handler's writes, and the loop records on the
         worker's when it has had to end an attempt itself.
+
+        `spent` is the ledger's figure and is charged only where there is no
+        result to charge instead: a `ProblemDetails` is a failure the handler
+        never got to describe, so what it spent survives nowhere else. A
+        `TaskResult` reports its own usage and is charged that -- billing both
+        would double-count every handler that follows the ledger contract.
         """
         if isinstance(outcome, ProblemDetails):
-            self._fail(conn, task, outcome)
+            self._fail(conn, task, outcome, usage=spent)
         elif outcome.status is not TaskStatus.SUCCEEDED:
             self._fail(
                 conn,
@@ -425,22 +438,24 @@ class Worker:
             registration = get_handler(task.spec.task_type)
         except UnknownTaskType:
             unknown = problem(UNKNOWN_TYPE, task.spec.task_type)
-            await self._record_failure(conn, task, unknown, span)
+            # No handler ran, so nothing was spent and there is no ledger yet.
+            await self._record_failure(conn, task, unknown, span, NOTHING_SPENT)
             return True
 
         handoff = Handoff()
-        finished = self._spawn(task, registration, handoff)
+        ledger = UsageLedger()
+        finished = self._spawn(task, registration, handoff, ledger)
         deadline = task.spec.budget.wall_clock + DEADLINE_GRACE
         started = time.monotonic()
         await wait(finished, deadline, stop)
 
         if finished.done():
-            return await self._settle(conn, task, handoff, finished.result(), span)
+            return await self._settle(conn, task, handoff, finished.result(), span, ledger)
         stopping = time.monotonic() - started < deadline.total_seconds()
         if not handoff.take():
             # The thread claimed the recording in the moment between the wait
             # returning and this line; its outcome is the authoritative one.
-            return await self._settle(conn, task, handoff, await finished, span)
+            return await self._settle(conn, task, handoff, await finished, span, ledger)
         await asyncio.to_thread(self._abandon, conn, handoff)
         if stopping:
             # `stop` fired before the cap: the budget is intact, so this is not
@@ -453,11 +468,20 @@ class Worker:
             # any more.
             span.record(SpanOutcome.ERROR, WORKER_STOPPING)
             return True
-        await self._record_failure(conn, task, budget_exceeded(task.spec.budget), span)
+        # The handler is still running and will never report; the ledger is the
+        # only account of what it spent before the cap, and a snapshot of it is
+        # a lower bound rather than a total (`UsageLedger`).
+        await self._record_failure(
+            conn, task, budget_exceeded(task.spec.budget), span, ledger.total()
+        )
         return True
 
     def _spawn(
-        self, task: ClaimedTask, registration: HandlerRegistration, handoff: Handoff
+        self,
+        task: ClaimedTask,
+        registration: HandlerRegistration,
+        handoff: Handoff,
+        ledger: UsageLedger,
     ) -> asyncio.Future[Executed]:
         """Hand one claimed task to `execution`, with this worker's way of recording it."""
         return spawn(
@@ -466,6 +490,7 @@ class Worker:
             registration=registration,
             handoff=handoff,
             record=self._record,
+            usage=ledger,
         )
 
     async def _settle(
@@ -475,6 +500,7 @@ class Worker:
         handoff: Handoff,
         executed: Executed,
         span: Span,
+        ledger: UsageLedger,
     ) -> bool:
         """Close out an execution the handler thread has finished with.
 
@@ -496,12 +522,21 @@ class Worker:
             span.record(SpanOutcome.OK)
             return True
         if not executed.recorded and handoff.take():
-            await asyncio.to_thread(self._fail, conn, task, executed.error)
+            # The thread never got its outcome written, so nothing charged the
+            # run for it either; the ledger it filled in is still readable here.
+            await asyncio.to_thread(
+                self._fail, conn, task, executed.error, usage=ledger.total()
+            )
         span.record(SpanOutcome.ERROR, executed.error.title)
         return True
 
     async def _record_failure(
-        self, conn: QueueConnection, task: ClaimedTask, error: ProblemDetails, span: Span
+        self,
+        conn: QueueConnection,
+        task: ClaimedTask,
+        error: ProblemDetails,
+        span: Span,
+        spent: RunBudget,
     ) -> None:
         """Persist a failed attempt and mark its span.
 
@@ -509,5 +544,5 @@ class Worker:
         values, not raises -- the tracer's own exception handling would never
         see them, and an unmarked span would read as a success.
         """
-        await asyncio.to_thread(self._fail, conn, task, error)
+        await asyncio.to_thread(self._fail, conn, task, error, usage=spent)
         span.record(SpanOutcome.ERROR, error.title)
