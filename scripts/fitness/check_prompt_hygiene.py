@@ -181,24 +181,30 @@ def _fixture(module: Path, literal: str) -> None:
 
 
 def _selftest() -> int:
-    """Plant the three cases the exemption's wording distinguishes.
+    """Plant one case per branch of the exemption's wording.
 
-    The middle one is the case this check claimed and did not enforce: `private`
+    The second one is the case this check claimed and did not enforce: `private`
     was in the docstring and in GUARDRAILS.md while the code tested only the
     `_sql.py` suffix, so a *public* module with the same name shape carried a
-    long literal past S4.
+    long literal past S4. The fourth pins the other branch — an Alembic revision
+    under `versions/`, which is exempt by *directory* and is not private — so
+    the sentence and the code stay pinned together on both.
     """
     ok = True
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         pkg = root / "packages" / "steward-probe" / "src" / "steward_probe"
-        _fixture(pkg / "_probe_sql.py", _LONG_SQL)      # exempt: private, SQL-opening
-        _fixture(pkg / "probe_sql.py", _LONG_SQL)       # not exempt: public module
-        _fixture(pkg / "_prose_sql.py", _LONG_PROSE)    # not exempt: prose, not SQL
+        _fixture(pkg / "_probe_sql.py", _LONG_SQL)              # exempt: private, SQL-opening
+        _fixture(pkg / "probe_sql.py", _LONG_SQL)               # not exempt: public module
+        _fixture(pkg / "_prose_sql.py", _LONG_PROSE)            # not exempt: prose, not SQL
+        _fixture(pkg / "versions" / "0001_init.py", _LONG_SQL)  # exempt: Alembic revision
         findings, scanned, unparsed, _ = _scan_tree((root / "packages",), root)
         flagged = {Path(f.path).name for f in findings}
-        if scanned != 3 or unparsed:
-            print(f"selftest FAIL: scanned {scanned} files, {len(unparsed)} unparsable (expected 3, 0)")
+        if scanned != 4 or unparsed:
+            print(f"selftest FAIL: scanned {scanned} files, {len(unparsed)} unparsable (expected 4, 0)")
+            ok = False
+        if "0001_init.py" in flagged:
+            print("selftest FAIL: an Alembic revision's SQL literal was flagged (should be exempt)")
             ok = False
         if "_probe_sql.py" in flagged:
             print("selftest FAIL: a private _sql module's SQL literal was flagged (should be exempt)")
@@ -210,7 +216,8 @@ def _selftest() -> int:
             print("selftest FAIL: prose in a private _sql module was exempted (only SQL is)")
             ok = False
         if ok:
-            print(f"selftest: exemption is private-only and SQL-only ({scanned} fixtures, flagged {sorted(flagged)})")
+            print(f"selftest: exemption is private-or-versions and SQL-only "
+                  f"({scanned} fixtures, flagged {sorted(flagged)})")
     print(f"S4 selftest: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

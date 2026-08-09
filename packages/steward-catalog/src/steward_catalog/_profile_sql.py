@@ -222,7 +222,7 @@ def _relation(schema_name: str, name: str) -> sql.Identifier:
 
 
 def stats_query(
-    schema_name: str, name: str, columns: tuple[str, ...], ordered: frozenset[str] = frozenset()
+    schema_name: str, name: str, columns: tuple[str, ...], ordered: frozenset[str]
 ) -> sql.Composed:
     """Row count plus four aggregates per column, in one pass over the table.
 
