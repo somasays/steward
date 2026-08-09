@@ -134,6 +134,7 @@ def test_every_service_entry_point_refuses_an_off_allowlist_gateway(tmp_path: Pa
         refused.append(where)
 
     assert len(refused) == len(entry_points)
+    print(f"refused by {len(refused)} entry points: {', '.join(refused)}")
 
 
 def test_the_committed_config_is_not_refused_by_any_entry_point(tmp_path: Path) -> None:
@@ -154,3 +155,4 @@ def test_the_committed_config_is_not_refused_by_any_entry_point(tmp_path: Path) 
         checked.append(where)
 
     assert len(checked) == len(entry_points)
+    print(f"accepted by {len(checked)} entry points: {', '.join(checked)}")
