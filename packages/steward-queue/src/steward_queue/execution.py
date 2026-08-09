@@ -490,7 +490,9 @@ def _settled(result: TaskResult, budget: RunBudget) -> TaskResult | ProblemDetai
     it says it spent fits the cap it was given (`_overspent`).
     """
     if result.status is not TaskStatus.SUCCEEDED:
-        return result.error or problem(HANDLER_FAILED, result.status.value)
+        if result.error is None:
+            return result.model_copy(update={"error": problem(HANDLER_FAILED, result.status.value)})
+        return result
     return _overspent(result, budget) or result
 
 
@@ -536,7 +538,11 @@ def _record_in_thread(
     handoff is gone, and this thread might still commit), so the attempt is
     left to its lease and `requeue_stale` returns it (N1).
     """
-    error = outcome if isinstance(outcome, ProblemDetails) else None
+    error = (
+        outcome
+        if isinstance(outcome, ProblemDetails)
+        else outcome.error if outcome.status is not TaskStatus.SUCCEEDED else None
+    )
     if not handoff.take():
         return Executed(error=error, lost_claim=False, recorded=False)
     try:

@@ -80,6 +80,9 @@ class Message(GatewayModel):
     tool_call_id: str | None = None
     """The call this message answers. Required on a `TOOL` message, meaningless
     on any other — the model matches a result to the call it made by this id."""
+    tool_calls: tuple[ToolCall, ...] = ()
+    """Calls emitted by an assistant message. Preserved on the next request so
+    the gateway can associate subsequent tool results with the originating turn."""
 
 
 class ToolSchema(GatewayModel):

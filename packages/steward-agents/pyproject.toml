@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "steward-schemas",
     "steward-llm",
+    "langgraph>=1.2,<2",
 ]
 
 [tool.uv.sources]
