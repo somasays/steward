@@ -349,8 +349,10 @@ def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, act
     figure is not to be trusted, and trusting it is the one thing that would
     let a lying handler write the run's totals.
 
-    Across attempts the totals can legitimately exceed the run's budget, since
-    retries are recorded but not reserved (D9). Summing is the right operation
+    Across attempts the totals still stay inside the run's budget, but for a
+    different reason than they used to: `tasks.fail` refuses to schedule a
+    retry the run can no longer fund, so the run declines to spend more rather
+    than discarding the record of what it spent. Summing is the right operation
     for steps, tokens and cost; for `wall_clock` it means aggregate task time
     rather than the run's elapsed duration, which is the conservative reading
     (`RunBudget.wall_clock`).
