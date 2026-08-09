@@ -46,6 +46,7 @@ from steward_schemas import (
 )
 
 from steward_catalog._profile_sql import (
+    ORDERED_COLUMNS,
     SET_LOCAL_STATEMENT_TIMEOUT,
     STATS_PER_COLUMN,
     TOP_VALUE_LIMIT,
@@ -180,10 +181,24 @@ class PostgresSourceProfiler:
         self.connection.rollback()
         return profile
 
+    def _ordered_columns(self, target: ProfileTarget) -> frozenset[str]:
+        """Which of this relation's columns have a `min`/`max` aggregate.
+
+        One catalog lookup per profile, not per column, and it runs inside the
+        same snapshot as everything else -- so the set of columns the extrema
+        are computed for is the set that existed when the statistics were read.
+        """
+        self._bound_next_statement()
+        rows = self.connection.execute(
+            ORDERED_COLUMNS, {"schema_name": target.schema_name, "name": target.name}
+        ).fetchall()
+        return frozenset(str(row[0]) for row in rows)
+
     def _profile(self, target: ProfileTarget) -> TableProfile:
         names = tuple(column.name for column in target.columns)
+        ordered = self._ordered_columns(target) if names else frozenset()
         self._bound_next_statement()
-        row = self.connection.execute(stats_query(target.schema_name, target.name, names)).fetchone()
+        row = self.connection.execute(stats_query(target.schema_name, target.name, names, ordered)).fetchone()
         if row is None:  # pragma: no cover -- an aggregate always returns a row
             raise RuntimeError(f"no statistics returned for {target.schema_name}.{target.name}")
         expected = 1 + STATS_PER_COLUMN * len(names)

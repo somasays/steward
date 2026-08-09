@@ -42,8 +42,19 @@ def _in_prompts_dir(path: Path) -> bool:
 
 
 def _sql_module(path: Path) -> bool:
-    """Modules that exist to hold static SQL: the I5 constant-statement pattern."""
-    return path.name == "_sql.py" or path.parent.name == "versions"
+    """Modules that exist to hold static SQL: the I5 constant-statement pattern.
+
+    Any private module whose name ends in `_sql`, not only `_sql.py` exactly:
+    a package with two SQL surfaces names the second one for what it holds
+    (`_profile_sql.py`, the statements profiling runs against a *customer's*
+    database, as opposed to `_sql.py`'s statements against Steward's own). The
+    narrower spelling flagged the second module's first long statement as a
+    prompt -- a check narrower than the rule it enforces, the same shape as
+    issue #21's attribute-docstring gap. The exemption stays tight either way:
+    it applies only to literals that *begin* with a SQL keyword, so prose in
+    such a module is still caught.
+    """
+    return path.name.endswith("_sql.py") or path.parent.name == "versions"
 
 
 def run() -> CheckResult:

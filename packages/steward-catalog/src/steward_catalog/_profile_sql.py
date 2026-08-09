@@ -38,6 +38,7 @@ from psycopg import sql
 __all__ = [
     "ROW_COUNT_ONLY",
     "TOP_VALUE_LIMIT",
+    "ORDERED_COLUMNS",
     "SET_LOCAL_STATEMENT_TIMEOUT",
     "stats_query",
     "top_values_query",
@@ -50,12 +51,22 @@ Small on purpose: the sample exists to show *shape* to a classifier (#50), and
 every extra value is another masked payload stored forever.
 """
 
-# Every value is profiled through its `::text` rendering. That is what makes one
-# code path cover every column type a source can hold: `json` has no equality
-# operator (so `count(DISTINCT json)` fails), several types have no `min`/`max`
-# aggregate at all, and the masker would otherwise need a branch per driver type
-# instead of one function over text.
-_COLUMN_STATS = sql.SQL("count({col}), count(DISTINCT ({col})::text), min(({col})::text), max(({col})::text)")
+# Counting is always done on the `::text` rendering. That is what makes one code
+# path cover every column type a source can hold: `json` has no equality
+# operator, so `count(DISTINCT json)` fails outright.
+#
+# **Extrema are not.** `min(({col})::text)` orders the *renderings*, so a column
+# of 2, 10, 100 reports a minimum of `10` and a maximum of `2` -- not a coarser
+# fact than the truth but a different one, and #50 reasons over profile evidence
+# (issue #70). So the cast moves outside the aggregate: `min({col})::text` picks
+# the extreme by the column's own ordering and renders the winner. Where the
+# type has no `min`/`max` at all, the profile publishes nothing rather than a
+# lexical value wearing a semantic label -- see `ORDERED_COLUMNS`.
+_TYPED_EXTREMA = sql.SQL("count({col}), count(DISTINCT ({col})::text), min({col})::text, max({col})::text")
+
+_NO_EXTREMA = sql.SQL("count({col}), count(DISTINCT ({col})::text), NULL::text, NULL::text")
+"""The same four slots for a type that cannot be ordered, so the reader's
+positional slicing does not have to know which branch produced a column."""
 
 _STATS = sql.SQL("SELECT count(*), {stats} FROM {relation}")
 
@@ -73,8 +84,60 @@ _TOP_VALUES = sql.SQL(
 values" is one answer rather than whichever five the plan happened to emit."""
 
 STATS_PER_COLUMN = 4
-"""Aggregates `_COLUMN_STATS` contributes per column: non-null, distinct, min,
-max. The reader slices the result row by this, so the two must agree."""
+"""Aggregates each column contributes: non-null, distinct, min, max. The reader
+slices the result row by this, so the two must agree -- which is why the
+unordered branch emits `NULL::text` twice rather than fewer columns."""
+
+ORDERED_COLUMNS = """
+SELECT a.attname
+FROM pg_catalog.pg_attribute AS a
+JOIN pg_catalog.pg_class AS c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_type AS t ON t.oid = a.atttypid
+WHERE n.nspname = %(schema_name)s
+  AND c.relname = %(name)s
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc AS p
+      WHERE p.proname = 'min' AND p.prokind = 'a'
+        AND (
+            p.proargtypes[0] = COALESCE(NULLIF(t.typbasetype, 0), a.atttypid)
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_cast AS implicit
+                WHERE implicit.castsource = COALESCE(NULLIF(t.typbasetype, 0), a.atttypid)
+                  AND implicit.casttarget = p.proargtypes[0]
+                  AND implicit.castcontext IN ('i', 'b')
+            )
+            OR (p.proargtypes[0] = 'anyarray'::regtype AND t.typcategory = 'A')
+            OR (p.proargtypes[0] = 'anyenum'::regtype AND t.typcategory = 'E')
+        )
+  )
+"""
+"""Which of a relation's columns have a `min`/`max` aggregate at all.
+
+**Asked of the server, not guessed from a type name**, and that distinction is
+the whole point: an allowlist of "numeric and temporal types" drifts the moment
+a source uses a domain, an enum, an array or an extension type, and the failure
+mode of guessing *wrong* is a query that errors and fails the whole profile.
+
+It is also not the question it first looks like. The obvious oracle -- does the
+type have a default btree operator class -- is **wrong in six ways**, measured:
+`uuid`, `bytea`, `jsonb` and `boolean` are all orderable and have no `min`
+aggregate, while `varchar` and arrays have `min` and no matching opclass entry.
+Ordering and aggregation are different facts about a type, and only the second
+one is what this query needs.
+
+So it asks `pg_proc` directly, the way Postgres resolves the call itself:
+an exact argument-type match, an implicit or binary-coercible cast to one
+(`varchar` -> `text`), or one of the two polymorphic signatures (`anyarray`,
+`anyenum`). Domains resolve through `typbasetype`. A type this misses simply
+publishes no extrema, so being wrong costs a fact rather than inventing one --
+and `tests/test_profiler.py` asserts the prediction against what `min()` really
+does, over every type class, so the two cannot drift silently.
+"""
 
 
 SET_LOCAL_STATEMENT_TIMEOUT = "SELECT set_config('statement_timeout', %(milliseconds)s, true)"
@@ -101,8 +164,13 @@ def _relation(schema_name: str, name: str) -> sql.Identifier:
     return sql.Identifier(schema_name, name)
 
 
-def stats_query(schema_name: str, name: str, columns: tuple[str, ...]) -> sql.Composed:
+def stats_query(
+    schema_name: str, name: str, columns: tuple[str, ...], ordered: frozenset[str] = frozenset()
+) -> sql.Composed:
     """Row count plus four aggregates per column, in one pass over the table.
+
+    `ordered` names the columns whose type has a `min`/`max` aggregate
+    (`ORDERED_COLUMNS`); the rest report no extrema rather than lexical ones.
 
     One statement rather than one per column, so the *aggregates* cost one pass
     over the relation however wide it is. That argument covers this query only:
@@ -115,7 +183,10 @@ def stats_query(schema_name: str, name: str, columns: tuple[str, ...]) -> sql.Co
     relation = _relation(schema_name, name)
     if not columns:
         return ROW_COUNT_ONLY.format(relation=relation)
-    stats = sql.SQL(", ").join(_COLUMN_STATS.format(col=sql.Identifier(column)) for column in columns)
+    stats = sql.SQL(", ").join(
+        (_TYPED_EXTREMA if column in ordered else _NO_EXTREMA).format(col=sql.Identifier(column))
+        for column in columns
+    )
     return _STATS.format(stats=stats, relation=relation)
 
 

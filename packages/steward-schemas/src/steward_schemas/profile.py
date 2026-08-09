@@ -104,6 +104,15 @@ class ColumnProfile(SchemaModel):
     package is: two runs over unchanged data must produce byte-identical JSON,
     and binary floating point does not promise that across platforms.
 
+    **`min_value`/`max_value` are extrema in the column's own type, or absent.**
+    They are computed with the source's `min`/`max` over the column and only
+    then rendered as text, so a column of 2, 10, 100 reports 2 and 100 -- not
+    the extrema of the *renderings*, which are `10` and `2` (issue #70). A type
+    with no `min`/`max` aggregate at all -- `json`, `uuid`, `bytea`, `point` --
+    reports `None` for both. A consumer may therefore read these as facts about
+    the column, and `None` means "this type has no order, or the column has no
+    rows", never "here is a lexical stand-in".
+
     `top_values` doubles as the column's sample. Profiling reads the most
     frequent values rather than an arbitrary page of rows because frequency is
     the statistic worth having, and because "the k most common values, ties

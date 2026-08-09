@@ -17,7 +17,7 @@ import pytest
 from psycopg import sql
 from steward_catalog import DiscoveredColumn, ProfileTarget, Secret, postgres_profiler
 from steward_catalog.profiler import PostgresSourceProfiler, SourceProfiler
-from steward_schemas import SemanticType, TableProfile
+from steward_schemas import ColumnProfile, SemanticType, TableProfile
 
 BUDGET = timedelta(seconds=30)
 
@@ -147,6 +147,115 @@ BINARY_DOMAINS: tuple[tuple[str, str, str], ...] = (
     ("flagged", "", "Y"),
     ("mixed", "1", "no"),
 )
+
+
+# The extrema fixture (issue #70). Every column is chosen so the *lexical* order
+# of the text renderings disagrees with the type's own order, because a fixture
+# where they agree cannot tell a fixed profiler from a broken one:
+#   n: 2, 10, 100          lexical min "10", max "2"   typed min 2, max 100
+#   d: 1 hour/2/10 days    lexical max "2 days"        typed max "10 days"
+# `t` is text, where lexical *is* the type's order, and `j`/`u` have no `min`
+# aggregate at all -- `u` being the case that disproves the obvious design, since
+# uuid is orderable and still has no aggregate.
+EXTREMA_TABLE = (
+    "CREATE TABLE sales.extrema (n integer, d interval, t text, j json, u uuid)",
+    "INSERT INTO sales.extrema (n, d, t, j, u) VALUES "
+    "(2, '1 hour', 'apple', '{\"a\":1}', '11111111-1111-1111-1111-111111111111'),"
+    "(10, '2 days', 'banana', '{\"b\":2}', '22222222-2222-2222-2222-222222222222'),"
+    "(100, '10 days', 'cherry', '{\"c\":3}', '33333333-3333-3333-3333-333333333333')",
+    "GRANT SELECT ON sales.extrema TO steward_reader",
+)
+
+EXTREMA_COLUMNS = (
+    column("n", "integer", 1),
+    column("d", "interval", 2),
+    column("t", "text", 3),
+    column("j", "json", 4),
+    column("u", "uuid", 5),
+)
+
+
+@pytest.fixture
+def extrema(
+    profiler: SourceProfiler, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+) -> dict[str, ColumnProfile]:
+    for statement in EXTREMA_TABLE:
+        source_admin.execute(statement)
+    profile = profiler.profile(ProfileTarget(schema_name="sales", name="extrema", columns=EXTREMA_COLUMNS))
+    return {column_profile.name: column_profile for column_profile in profile.columns}
+
+
+def test_numeric_extrema_are_the_types_own_not_the_renderings(
+    extrema: dict[str, ColumnProfile],
+) -> None:
+    """The defect this issue is about: 2, 10, 100 reported min `10`, max `2`.
+
+    Asserted through `length`, because the values themselves are masked and stay
+    that way -- `2` masks to `*` and `100` to `***`, so the published profile
+    distinguishes them without publishing them. Lexical ordering would give a
+    minimum of `10` (two characters) and a maximum of `2` (one).
+    """
+    numeric = extrema["n"]
+    assert numeric.min_value is not None and numeric.max_value is not None
+
+    assert numeric.min_value.length == 1, "the minimum is not 2"
+    assert numeric.max_value.length == 3, "the maximum is not 100"
+    assert numeric.min_value.masked == "*" and numeric.max_value.masked == "***"
+
+
+def test_temporal_extrema_are_the_types_own_not_the_renderings(
+    extrema: dict[str, ColumnProfile],
+) -> None:
+    """Dates render in an order-preserving format, so they cannot show this;
+    intervals can. `10 days` sorts before `2 days` as text and after it in time.
+    """
+    interval = extrema["d"]
+    assert interval.min_value is not None and interval.max_value is not None
+
+    assert interval.min_value.length == len("01:00:00"), "the minimum is not 1 hour"
+    assert interval.max_value.length == len("10 days"), "the maximum is not 10 days"
+
+
+def test_text_extrema_keep_their_well_defined_lexical_order(
+    extrema: dict[str, ColumnProfile],
+) -> None:
+    """For text the rendering *is* the value, so its order is the type's order --
+    nothing to correct, and the fix must not take the extrema away."""
+    text = extrema["t"]
+    assert text.min_value is not None and text.max_value is not None
+
+    assert text.min_value.masked == "a***e"  # apple
+    assert text.max_value.masked == "c****y"  # cherry
+
+
+@pytest.mark.parametrize("name", ["j", "u"])
+def test_a_type_with_no_extrema_publishes_none_rather_than_a_lexical_stand_in(
+    extrema: dict[str, ColumnProfile], name: str
+) -> None:
+    """A column whose type has no `min`/`max` reports no extrema at all.
+
+    The alternative -- falling back to the text rendering -- is what this issue
+    is about: a value true of the renderings and false of the column, in the
+    field a classifier reads as the column's minimum. Counts still work, because
+    those are computed on the rendering.
+    """
+    unordered = extrema[name]
+
+    assert unordered.min_value is None
+    assert unordered.max_value is None
+    assert unordered.distinct_count == 3  # the rest of the profile is unaffected
+
+
+def test_extrema_are_masked_like_every_other_sampled_value(
+    extrema: dict[str, ColumnProfile],
+) -> None:
+    """I6 does not weaken because a value arrived through an aggregate."""
+    for column_profile in extrema.values():
+        for sample in (column_profile.min_value, column_profile.max_value):
+            if sample is not None:
+                assert "apple" not in sample.masked
+                assert "cherry" not in sample.masked
+                assert sample.masked.count("*") >= 1
 
 
 @pytest.mark.parametrize(("name", "first", "second"), BINARY_DOMAINS)
@@ -482,3 +591,73 @@ def test_a_relation_with_no_columns_to_profile_still_reports_its_row_count(
 
     assert profile.row_count == 1
     assert profile.columns == ()
+
+
+# Every type class a source might hold, including the six that disprove the
+# obvious design. `ORDERED_COLUMNS` asks whether a `min` aggregate resolves;
+# the tempting question -- does the type have a btree operator class -- gets
+# `uuid`, `bytea`, `jsonb` and `boolean` wrong in one direction (orderable, no
+# aggregate) and `varchar` and arrays wrong in the other.
+TYPE_PROBE = (
+    "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+    "CREATE DOMAIN positive_int AS integer CHECK (VALUE > 0)",
+    "CREATE TABLE sales.probe ("
+    "  c_int integer, c_bigint bigint, c_smallint smallint, c_numeric numeric(10,2),"
+    "  c_real real, c_float double precision, c_money money,"
+    "  c_text text, c_varchar varchar(10), c_char char(4), c_name name,"
+    "  c_bool boolean, c_uuid uuid, c_bytea bytea,"
+    "  c_date date, c_ts timestamp, c_tstz timestamptz, c_time time, c_timetz timetz,"
+    "  c_interval interval, c_json json, c_jsonb jsonb, c_xml xml, c_point point,"
+    "  c_inet inet, c_cidr cidr, c_macaddr macaddr, c_array integer[],"
+    "  c_textarray text[], c_domain positive_int, c_oid oid, c_bit bit(3),"
+    "  c_tsvector tsvector, c_enum mood)",
+    "GRANT SELECT ON sales.probe TO steward_reader",
+)
+
+PROBE_COLUMN_NAMES = (
+    "SELECT attname FROM pg_attribute WHERE attrelid = 'sales.probe'::regclass AND attnum > 0"
+)
+
+
+def test_the_orderability_prediction_matches_what_min_actually_does(
+    source_secret: Secret, source_admin: psycopg.Connection[psycopg.rows.TupleRow]
+) -> None:
+    """`ORDERED_COLUMNS` must agree with the server, type class by type class.
+
+    This is the check that keeps the prediction honest. It is a catalog query
+    standing in for "does `min(col)` resolve", and the two can drift -- a new
+    Postgres release adds an aggregate, an extension adds a type, someone
+    simplifies the polymorphic branches away. So the test asks both and compares:
+    the prediction against actually running `min()` on every column of a table
+    that holds every type class this codebase can name, including the six that
+    make the obvious implementation wrong.
+
+    Failing *this* is the good outcome. A drift in the safe direction costs a
+    fact; a drift in the other errors the whole profile.
+    """
+    for statement in TYPE_PROBE:
+        source_admin.execute(statement)
+
+    with postgres_profiler(source_secret, BUDGET) as reader:
+        assert isinstance(reader, PostgresSourceProfiler)
+        predicted = reader._ordered_columns(ProfileTarget(schema_name="sales", name="probe", columns=()))
+        reader.connection.rollback()
+
+    actual = set()
+    for (name,) in source_admin.execute(PROBE_COLUMN_NAMES).fetchall():
+        try:
+            source_admin.execute(
+                sql.SQL("SELECT min({col})::text FROM sales.probe").format(col=sql.Identifier(name))
+            ).fetchall()
+        except psycopg.Error:
+            source_admin.execute("ROLLBACK")
+        else:
+            actual.add(name)
+
+    assert predicted == actual, (
+        f"prediction and reality disagree on: {predicted.symmetric_difference(actual)}"
+    )
+    # ...and the probe covers both answers, so agreeing is not agreeing on an
+    # empty set or on "everything is orderable".
+    assert {"c_int", "c_text", "c_varchar", "c_array", "c_enum", "c_domain"} <= actual
+    assert {"c_uuid", "c_json", "c_jsonb", "c_bool", "c_bytea", "c_point"}.isdisjoint(actual)
