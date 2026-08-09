@@ -23,6 +23,7 @@ have been nominal rather than real:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -147,6 +148,24 @@ def _add(left: RunBudget, right: RunBudget) -> RunBudget:
     return RunBudget.total((left, right))
 
 
+CHARS_PER_TOKEN = 3
+"""Conservative characters-per-token ratio for estimating a prompt's size.
+
+Deliberately below the ~4 that English averages, so the estimate errs high and
+the reservation errs toward refusing. It is an estimate and the residual is
+stated rather than hidden: a single call can overshoot its reservation by the
+estimator's error, and what catches that is the debit afterwards, which makes
+the *next* preflight refuse. Exact accounting needs the gateway's own token
+count before the call, which the transport seam cannot ask for yet (D11).
+"""
+
+
+def _estimated_prompt_tokens(messages: tuple[Message, ...]) -> int:
+    """About how many tokens this history will cost to send."""
+    characters = sum(len(message.content) for message in messages)
+    return -(-characters // CHARS_PER_TOKEN)  # ceiling division
+
+
 def _model_usage(usage: ModelUsage) -> RunBudget:
     return RunBudget(
         steps=1,
@@ -202,7 +221,9 @@ class AgentRuntime:
             updated = (
                 await self._tool_step(key, current, allowlist, spec.limits)
                 if current.pending_tool_calls
-                else await self._model_step(key, current, spec, prompt_version, schemas)
+                else await self._model_step(
+                    key, current, spec, prompt_version, schemas, output_model
+                )
             )
             return {"checkpoint": updated}
 
@@ -249,14 +270,18 @@ class AgentRuntime:
         spec: AgentSpec,
         prompt_version: str,
         schemas: tuple[ToolSchema, ...],
+        output_model: type[BaseModel],
     ) -> AgentCheckpoint:
-        self._preflight_model(current.usage, spec.limits)
+        self._preflight_model(current.usage, spec.limits, current.messages)
         request = CompletionRequest(
             alias=spec.model_alias,
             messages=current.messages,
             prompt_version=prompt_version,
             tools=schemas,
-            max_tokens=self._reservation.tokens,
+            # `max_tokens` bounds the *completion*, while the reservation is a
+            # total. Sending the reservation here would let a call cost the
+            # prompt on top of everything that was checked for.
+            max_tokens=self._completion_allowance(current.messages),
         )
         try:
             completion = await self._client.complete(request)
@@ -273,36 +298,86 @@ class AgentRuntime:
 
         spend = _model_usage(completion.usage)
         self._spent(spend)
-        usage = _add(current.usage, spend)
+        answered = current.messages + (
+            Message(
+                role=Role.ASSISTANT,
+                content=completion.text,
+                tool_calls=completion.tool_calls,
+            ),
+        )
+        base = current.model_copy(
+            update={"messages": answered, "usage": _add(current.usage, spend)}
+        )
         submitted = next(
             (call for call in completion.tool_calls if call.name == SUBMIT_RESULT), None
         )
-        if submitted is None and completion.finish_reason is FinishReason.STOP:
-            raise AgentRuntimeError(
-                f"the agent stopped without calling {SUBMIT_RESULT!r}; "
-                "a run's result is submitted through that tool, never as prose"
+        if submitted is None:
+            if completion.finish_reason is FinishReason.STOP:
+                raise AgentRuntimeError(
+                    f"the agent stopped without calling {SUBMIT_RESULT!r}; "
+                    "a run's result is submitted through that tool, never as prose"
+                )
+            updated = base.model_copy(
+                update={"pending_tool_calls": completion.tool_calls}
             )
-        updated = current.model_copy(
-            update={
-                "messages": current.messages
-                + (
-                    Message(
-                        role=Role.ASSISTANT,
-                        content=completion.text,
-                        tool_calls=completion.tool_calls,
-                    ),
-                ),
-                "usage": usage,
-                "output_json": submitted.arguments if submitted is not None else None,
-                "pending_tool_calls": ()
-                if submitted is not None
-                else tuple(
-                    call for call in completion.tool_calls if call.name != SUBMIT_RESULT
-                ),
-            }
-        )
+        else:
+            updated = self._submission(base, submitted, completion.tool_calls, output_model)
         await self._checkpoints.save(key, updated)
         return updated
+
+    def _submission(
+        self,
+        base: AgentCheckpoint,
+        submitted: ToolCall,
+        calls: tuple[ToolCall, ...],
+        output_model: type[BaseModel],
+    ) -> AgentCheckpoint:
+        """Accept a submitted result, or hand it back once for correction.
+
+        Validated *here*, before anything terminal is written. Checkpointing an
+        unvalidated `output_json` and letting `_result` reject it later would
+        make the checkpoint the record of a finished run that cannot finish: a
+        resume reads `finished`, re-validates, fails again, and does so forever
+        without ever giving the model the correction SPEC §3.2 promises it.
+
+        Submitting alongside other tool calls is refused rather than guessed
+        at. Running them and finishing would discard the results the model
+        asked for; finishing without them silently drops work it thought it had
+        done. Either way the run's meaning would depend on ordering nobody
+        declared, so the model is told to submit on its own.
+        """
+        problem = self._rejection(submitted, calls, output_model)
+        if problem is None:
+            return base.model_copy(
+                update={"output_json": submitted.arguments, "pending_tool_calls": ()}
+            )
+        if submitted.id in base.answered_with_feedback:
+            raise AgentRuntimeError(f"{SUBMIT_RESULT} was rejected twice: {problem}")
+        return base.model_copy(
+            update={
+                "messages": base.messages
+                + (Message(role=Role.TOOL, content=problem, tool_call_id=submitted.id),),
+                "answered_with_feedback": base.answered_with_feedback + (submitted.id,),
+                "pending_tool_calls": (),
+            }
+        )
+
+    @staticmethod
+    def _rejection(
+        submitted: ToolCall, calls: tuple[ToolCall, ...], output_model: type[BaseModel]
+    ) -> str | None:
+        """Why this submission cannot be accepted, in words the model can act on."""
+        if len(calls) > 1:
+            others = ", ".join(sorted({c.name for c in calls if c.name != SUBMIT_RESULT}))
+            return (
+                f"{SUBMIT_RESULT} must be the only call in a response; it arrived "
+                f"alongside {others}. Finish those first, then submit on its own."
+            )
+        try:
+            output_model.model_validate_json(submitted.arguments)
+        except ValidationError as exc:
+            return f"invalid result for {SUBMIT_RESULT}: {exc}"
+        return None
 
     async def _tool_step(
         self,
@@ -316,11 +391,26 @@ class AgentRuntime:
         # may not call is refused, not costed.
         if not self._tools.allows(call.name, allowlist):
             raise DisallowedTool(f"tool {call.name!r} is not allowed for this agent")
-        self._preflight_tool(current.usage, cap, self._tools.reservation(call.name))
+        reserved = self._tools.reservation(call.name)
+        self._preflight_tool(current.usage, cap, reserved)
         started = time.monotonic()
         answered = current.answered_with_feedback
         try:
-            content = (await self._tools.invoke(call, allowlist=allowlist)).model_dump_json()
+            # The reservation is only a bound if something enforces it. Without
+            # this, a tool could be reserved for a second and run for an hour,
+            # and the overrun would be discovered by debiting it afterwards --
+            # the audit fence again, one level down. This binds a tool that
+            # awaits; one blocked in C is still the worker deadline's problem
+            # (SPEC §13 D7).
+            async with asyncio.timeout(reserved.total_seconds()):
+                content = (await self._tools.invoke(call, allowlist=allowlist)).model_dump_json()
+        except TimeoutError as exc:
+            self._spent(
+                RunBudget(steps=1, tokens=0, cost_usd=Decimal(0), wall_clock=reserved)
+            )
+            raise AgentRuntimeError(
+                f"tool {call.name!r} outran the {reserved} it declared"
+            ) from exc
         except ToolValidationError as exc:
             # Bad arguments are the model's to fix, once (SPEC.md §3.2). A second
             # failure on the same call is not feedback any more, it is a loop.
@@ -348,14 +438,35 @@ class AgentRuntime:
         await self._checkpoints.save(key, updated)
         return updated
 
-    def _preflight_model(self, used: RunBudget, cap: RunBudget) -> None:
+    def _preflight_model(
+        self, used: RunBudget, cap: RunBudget, messages: tuple[Message, ...]
+    ) -> None:
+        """Refuse a model step whose worst case does not fit what is left.
+
+        The reservation is a *total* -- prompt plus completion -- so a growing
+        message history eats into what the completion may be. When the prompt
+        alone no longer fits, there is no completion allowance left to ask for
+        and the step is refused here rather than sent as a request that could
+        only overrun.
+        """
+        prompt = _estimated_prompt_tokens(messages)
         reserved = RunBudget(
             steps=1,
-            tokens=self._reservation.tokens,
+            tokens=max(self._reservation.tokens, prompt),
             cost_usd=self._reservation.cost_usd,
             wall_clock=self._reservation.wall_clock,
         )
         self._require_fit(_add(used, reserved), cap, "model")
+        if prompt >= self._reservation.tokens:
+            raise BudgetExceeded(
+                f"model step refused before execution; the prompt alone is about {prompt} "
+                f"tokens, which leaves nothing inside the {self._reservation.tokens}-token "
+                "reservation for a completion"
+            )
+
+    def _completion_allowance(self, messages: tuple[Message, ...]) -> int:
+        """What is left of the reservation once the prompt is paid for."""
+        return max(1, self._reservation.tokens - _estimated_prompt_tokens(messages))
 
     @staticmethod
     def _preflight_tool(used: RunBudget, cap: RunBudget, wall_clock: timedelta) -> None:
