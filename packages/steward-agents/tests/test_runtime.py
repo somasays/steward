@@ -1,3 +1,11 @@
+"""What the bounded loop is asserted to do.
+
+The properties here are the ones a budget can be faked past: that a step which
+cannot fit is *never started* (not merely reported afterwards), that the tool
+half of that check is as real as the model half, and that spend is announced as
+it happens so a failure that never returns still charges the run.
+"""
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -6,8 +14,10 @@ from decimal import Decimal
 import pytest
 from pydantic import BaseModel
 from steward_agents import (
+    SUBMIT_RESULT,
     AgentResult,
     AgentRuntime,
+    AgentRuntimeError,
     BudgetExceeded,
     DisallowedTool,
     InMemoryCheckpointStore,
@@ -42,12 +52,14 @@ class FinalOutput(BaseModel):
     answer: str
 
 
-def budget(*, steps: int = 5, tokens: int = 100, cost: str = "1") -> RunBudget:
+def budget(
+    *, steps: int = 5, tokens: int = 100, cost: str = "1", wall_clock: timedelta | None = None
+) -> RunBudget:
     return RunBudget(
         steps=steps,
         tokens=tokens,
         cost_usd=Decimal(cost),
-        wall_clock=timedelta(minutes=1),
+        wall_clock=wall_clock if wall_clock is not None else timedelta(minutes=1),
     )
 
 
@@ -76,7 +88,7 @@ def reservation() -> ModelReservation:
     return ModelReservation(tokens=20, cost_usd=Decimal("0.20"), wall_clock=timedelta(seconds=10))
 
 
-def registry(calls: list[str]) -> ToolRegistry:
+def registry(calls: list[str], *, wall_clock: timedelta = timedelta(seconds=5)) -> ToolRegistry:
     tools = ToolRegistry()
 
     async def echo(request: BaseModel) -> BaseModel:
@@ -90,8 +102,20 @@ def registry(calls: list[str]) -> ToolRegistry:
         input_model=EchoInput,
         output_model=EchoOutput,
         handler=echo,
+        wall_clock=wall_clock,
     )
     return tools
+
+
+def submits(answer: str, **usage: object) -> StubReply:
+    """A reply that ends the run the only way it can end: through the tool."""
+    return StubReply.completed(
+        "",
+        tool_calls=(
+            ToolCall(id="submit-1", name=SUBMIT_RESULT, arguments=f'{{"answer":"{answer}"}}'),
+        ),
+        **usage,  # type: ignore[arg-type]
+    )
 
 
 @pytest.mark.asyncio
@@ -104,16 +128,13 @@ async def test_stub_backed_tool_flow_is_bounded_validated_and_checkpointed() -> 
             cost_usd=Decimal("0.05"),
             tool_calls=(ToolCall(id="call-1", name="echo", arguments='{"value":"safe"}'),),
         ),
-        StubReply.completed(
-            '{"answer":"profiled"}',
-            prompt_tokens=4,
-            completion_tokens=3,
-            cost_usd=Decimal("0.07"),
-        ),
+        submits("profiled", prompt_tokens=4, completion_tokens=3, cost_usd=Decimal("0.07")),
     ])
     stores = InMemoryCheckpointStore()
     invoked: list[str] = []
-    runtime = AgentRuntime(client=llm, tools=registry(invoked), checkpoints=stores, reservation=reservation())
+    runtime = AgentRuntime(
+        client=llm, tools=registry(invoked), checkpoints=stores, reservation=reservation()
+    )
 
     result = await runtime.run(
         key="task-1",
@@ -130,14 +151,61 @@ async def test_stub_backed_tool_flow_is_bounded_validated_and_checkpointed() -> 
     assert invoked == ["safe"]
     assert len(gateway.calls) == 2
     assert stores.values["task-1"].finished
+    # SerializeAsAny: the declared type is `BaseModel`, so without it every
+    # field of the real result is silently dropped from the dump.
+    assert result.model_dump()["output"] == {"answer": "profiled"}
+
+
+@pytest.mark.asyncio
+async def test_the_result_schema_is_shown_to_the_model_as_a_tool() -> None:
+    """A result the model was never given a schema for is a result it can only
+    produce by luck. The output model reaches it as `submit_result`'s parameters."""
+    llm, gateway = client([submits("done")])
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+    )
+    await runtime.run(
+        key="task-schema",
+        spec=spec(tools=()),
+        prompt_version="proof.v1",
+        messages=(Message(role=Role.USER, content="go"),),
+        output_model=FinalOutput,
+    )
+    offered = {tool.name: tool for tool in gateway.calls[0].request.tools}
+    assert SUBMIT_RESULT in offered
+    assert offered[SUBMIT_RESULT].parameters == FinalOutput.model_json_schema()
+
+
+@pytest.mark.asyncio
+async def test_stopping_without_submitting_is_a_typed_failure() -> None:
+    llm, _ = client([StubReply.completed("here is my answer in prose")])
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+    )
+    with pytest.raises(AgentRuntimeError, match=SUBMIT_RESULT):
+        await runtime.run(
+            key="task-prose",
+            spec=spec(tools=()),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="go"),),
+            output_model=FinalOutput,
+        )
 
 
 @pytest.mark.asyncio
 async def test_disallowed_tool_is_rejected_without_invocation() -> None:
-    llm, _ = client([StubReply.completed(
-        "",
-        tool_calls=(ToolCall(id="call-1", name="delete_everything", arguments="{}"),),
-    )])
+    llm, _ = client([
+        StubReply.completed(
+            "",
+            tool_calls=(ToolCall(id="call-1", name="delete_everything", arguments="{}"),),
+        )
+    ])
     invoked: list[str] = []
     runtime = AgentRuntime(
         client=llm,
@@ -158,7 +226,7 @@ async def test_disallowed_tool_is_rejected_without_invocation() -> None:
 
 @pytest.mark.asyncio
 async def test_unaffordable_model_step_never_starts() -> None:
-    llm, gateway = client([StubReply.completed('{"answer":"must not run"}')])
+    llm, gateway = client([submits("must not run")])
     runtime = AgentRuntime(
         client=llm,
         tools=registry([]),
@@ -177,6 +245,181 @@ async def test_unaffordable_model_step_never_starts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_tool_that_cannot_fit_its_wall_clock_is_never_invoked() -> None:
+    """The tool half of the preflight. Reserving zero wall-clock for tools and
+    debiting the real elapsed time afterwards is an audit fence, not a budget:
+    the overrun is discovered once it has already happened."""
+    llm, _ = client([
+        StubReply.completed(
+            "",
+            prompt_tokens=1,
+            completion_tokens=1,
+            cost_usd=Decimal("0.01"),
+            tool_calls=(ToolCall(id="call-1", name="echo", arguments='{"value":"slow"}'),),
+        )
+    ])
+    invoked: list[str] = []
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry(invoked, wall_clock=timedelta(seconds=30)),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+    )
+    with pytest.raises(BudgetExceeded, match="tool step refused"):
+        await runtime.run(
+            key="task-slow-tool",
+            spec=spec(limits=budget(wall_clock=timedelta(seconds=20))),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="call the slow tool"),),
+            output_model=FinalOutput,
+        )
+    assert invoked == []
+
+
+@pytest.mark.asyncio
+async def test_bad_tool_arguments_are_fed_back_once_then_fail() -> None:
+    """SPEC §3.2: a validation error is the model's to fix, once."""
+    bad = ToolCall(id="call-bad", name="echo", arguments='{"wrong":"shape"}')
+    llm, _ = client([
+        StubReply.completed("", tool_calls=(bad,), prompt_tokens=1, completion_tokens=1),
+        submits("recovered", prompt_tokens=1, completion_tokens=1),
+    ])
+    invoked: list[str] = []
+    stores = InMemoryCheckpointStore()
+    runtime = AgentRuntime(
+        client=llm, tools=registry(invoked), checkpoints=stores, reservation=reservation()
+    )
+    result = await runtime.run(
+        key="task-feedback",
+        spec=spec(),
+        prompt_version="proof.v1",
+        messages=(Message(role=Role.USER, content="go"),),
+        output_model=FinalOutput,
+    )
+    assert result.output == FinalOutput(answer="recovered")
+    assert invoked == []
+    fed_back = [m for m in stores.values["task-feedback"].messages if m.role is Role.TOOL]
+    assert "invalid input" in fed_back[0].content
+    assert stores.values["task-feedback"].answered_with_feedback == ("call-bad",)
+
+
+@pytest.mark.asyncio
+async def test_the_same_bad_call_twice_is_not_fed_back_again() -> None:
+    bad = ToolCall(id="call-bad", name="echo", arguments='{"wrong":"shape"}')
+    llm, _ = client([
+        StubReply.completed("", tool_calls=(bad, bad), prompt_tokens=1, completion_tokens=1),
+    ])
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+    )
+    with pytest.raises(Exception, match="invalid input"):
+        await runtime.run(
+            key="task-loop",
+            spec=spec(),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="go"),),
+            output_model=FinalOutput,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_never_submits_is_stopped_by_the_budget() -> None:
+    """Not by LangGraph's recursion backstop, which would surface a framework
+    type through a seam this package exists to keep closed (I2, I9)."""
+    llm, _ = client([
+        StubReply.completed(
+            "",
+            prompt_tokens=1,
+            completion_tokens=1,
+            cost_usd=Decimal("0.01"),
+            finish_reason=FinishReason.TOOL_CALLS,
+            tool_calls=(ToolCall(id=f"call-{n}", name="echo", arguments='{"value":"again"}'),),
+        )
+        for n in range(20)
+    ])
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+    )
+    with pytest.raises(BudgetExceeded):
+        await runtime.run(
+            key="task-forever",
+            spec=spec(limits=budget(steps=4)),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="loop"),),
+            output_model=FinalOutput,
+        )
+
+
+@pytest.mark.asyncio
+async def test_every_increment_is_announced_as_it_is_spent() -> None:
+    """The seam a task's usage ledger is wired to: a run that dies without
+    returning is charged from these, not from a result it never built."""
+    llm, _ = client([
+        StubReply.completed(
+            "",
+            prompt_tokens=3,
+            completion_tokens=2,
+            cost_usd=Decimal("0.05"),
+            tool_calls=(ToolCall(id="call-1", name="echo", arguments='{"value":"x"}'),),
+        ),
+        submits("done", prompt_tokens=1, completion_tokens=1, cost_usd=Decimal("0.02")),
+    ])
+    spends: list[RunBudget] = []
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+        on_spend=spends.append,
+    )
+    result = await runtime.run(
+        key="task-spend",
+        spec=spec(),
+        prompt_version="proof.v1",
+        messages=(Message(role=Role.USER, content="go"),),
+        output_model=FinalOutput,
+    )
+    assert len(spends) == 3  # model, tool, model
+    assert RunBudget.total(spends) == result.usage
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_announces_its_spend_before_the_failure_travels() -> None:
+    llm, _ = client([
+        StubReply.streaming(
+            ("lost",),
+            prompt_tokens=5,
+            cost_per_token=Decimal("0.02"),
+            fails_with=OSError("disconnect"),
+        ),
+    ])
+    spends: list[RunBudget] = []
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+        on_spend=spends.append,
+    )
+    with pytest.raises(Exception, match="disconnect"):
+        await runtime.run(
+            key="task-lost",
+            spec=spec(tools=()),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="go"),),
+            output_model=FinalOutput,
+        )
+    assert RunBudget.total(spends).tokens == 6
+    assert RunBudget.total(spends).cost_usd == Decimal("0.02")
+
+
+@pytest.mark.asyncio
 async def test_failed_model_usage_is_checkpointed_and_debited_before_resume() -> None:
     llm, gateway = client([
         StubReply.streaming(
@@ -185,16 +428,13 @@ async def test_failed_model_usage_is_checkpointed_and_debited_before_resume() ->
             cost_per_token=Decimal("0.02"),
             fails_with=OSError("disconnect"),
         ),
-        StubReply.completed(
-            '{"answer":"resumed"}',
-            prompt_tokens=2,
-            completion_tokens=2,
-            cost_usd=Decimal("0.03"),
-            finish_reason=FinishReason.STOP,
-        ),
+        submits("resumed", prompt_tokens=2, completion_tokens=2, cost_usd=Decimal("0.03")),
     ])
     stores = InMemoryCheckpointStore()
-    runtime = AgentRuntime(client=llm, tools=registry([]), checkpoints=stores, reservation=reservation())
+    runtime = AgentRuntime(
+        client=llm, tools=registry([]), checkpoints=stores, reservation=reservation()
+    )
+
     async def execute() -> AgentResult:
         return await runtime.run(
             key="task-4",
@@ -215,3 +455,20 @@ async def test_failed_model_usage_is_checkpointed_and_debited_before_resume() ->
     assert result.usage.tokens == 10
     assert result.usage.cost_usd == Decimal("0.05")
     assert len(gateway.calls) == 2
+
+
+def test_a_tool_must_declare_a_positive_wall_clock_reservation() -> None:
+    tools = ToolRegistry()
+
+    async def handler(request: BaseModel) -> BaseModel:
+        return EchoOutput(value="x")
+
+    with pytest.raises(ValueError, match="positive wall-clock"):
+        tools.register(
+            name="free",
+            description="costs nothing, apparently",
+            input_model=EchoInput,
+            output_model=EchoOutput,
+            handler=handler,
+            wall_clock=timedelta(0),
+        )
