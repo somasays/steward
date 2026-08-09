@@ -22,22 +22,73 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Which half of the gate this diff has a subject for. A prose change cannot
+      # break a type check, an import contract or a test — ruff already excludes
+      # `*.md` and S4 reads `.py` only — but it CAN break two things, and those two
+      # run either way: S7, because a new doc outside `filegraph.json` is exactly a
+      # docs-only failure, and G4 (its own job below), because a secret pasted into a
+      # README is a secret. This is why the workflow does not use `paths-ignore`,
+      # which would drop those two as well.
+      #
+      # It fails closed. No base, an unreadable base, a diff that errors, or a diff
+      # that lists nothing all classify as code and run the full suite: a
+      # misclassification here is a silently disabled gate, which is the one outcome
+      # GUARDRAILS.md §3 does not allow.
+      - name: Classify the change
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -u
+          code=true
+          reason="no resolvable base (dispatch, new branch, or first push) — running the full gate"
+          if [ -n "${BASE:-}" ] && git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            if changed=$(git diff --name-only "${BASE}" HEAD); then
+              count=$(printf '%s' "${changed}" | grep -c '' || true)
+              if [ "${count}" -eq 0 ]; then
+                reason="diff against ${BASE} lists no files — running the full gate"
+              elif printf '%s\n' "${changed}" | grep -qvE '\.md$|^LICENSE$'; then
+                reason="${count} changed file(s), not all prose — running the full gate"
+              else
+                code=false
+                reason="${count} changed file(s), all prose (*.md, LICENSE)"
+              fi
+            else
+              reason="could not diff against ${BASE} — running the full gate"
+            fi
+          fi
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+          echo "${reason}"
+
       - name: Install uv
+        if: steps.scope.outputs.code == 'true'
         uses: astral-sh/setup-uv@v5
 
       - name: Sync project (once pyproject exists)
+        if: steps.scope.outputs.code == 'true'
         run: |
           if [ -f pyproject.toml ]; then uv sync --all-packages; fi
 
       - name: Run fitness suite
+        if: steps.scope.outputs.code == 'true'
         run: python3 scripts/fitness/run.py --stage ci
 
+      # The docs-only path. It reports what it ran, not that "the gate passed": the
+      # checks it skipped had nothing to read in this diff, and saying so is the
+      # difference between an honest skip and a green claim about work not done.
+      - name: File-graph coverage (S7) — the check a prose change can break
+        if: steps.scope.outputs.code != 'true'
+        run: |
+          echo "docs-only change: S1/S3/S9, H*, G1-G3 have no subject in this diff and were not run."
+          echo "S7 and the secret scan (G4, its own job) do, and run here."
+          python3 scripts/fitness/check_filegraph.py
+
       - name: Fitness report (JSON artifact)
-        if: always()
+        if: always() && steps.scope.outputs.code == 'true'
         run: python3 scripts/fitness/run.py --json > fitness-report.json || true
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.scope.outputs.code == 'true'
         with:
           name: fitness-report
           path: fitness-report.json
@@ -56,6 +107,8 @@ jobs:
       # on pull_request events ("stderr is not empty", 0 bytes scanned) and exits 1
       # on a scan that never happened. G4 promises full history on every event, so
       # invoke the CLI directly and scan the whole repo the same way every time.
+      # Unconditional, including on docs-only changes: prose is exactly where a
+      # pasted key hides.
       - name: Install gitleaks
         run: |
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
