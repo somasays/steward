@@ -26,6 +26,19 @@ class CheckResult(NamedTuple):
     findings: List[Finding]
     detail: str = ""
     pragma_count: int = 0
+    incapable: bool = False
+    """This environment could not run the check — as opposed to the check having
+    no subject yet.
+
+    The two are both SKIPs and mean opposite things. "B* activates in M2" is a
+    milestone that has not arrived; "8 files unparsable by python 3.9.6" is this
+    machine being unable to look, at files that exist and may be broken. The
+    runner refuses to call the second one green, because a documented command
+    that prints `all checks green` while skipping the check a branch is changing
+    is how a subagent verifies nothing and believes it verified something
+    (issue #74, and #21's family: a true statement that reads as a stronger
+    one).
+    """
 
 
 def repo_root() -> Path:

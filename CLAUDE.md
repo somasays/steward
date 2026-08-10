@@ -38,7 +38,7 @@ When a task seems to require violating an invariant, **stop and redesign** — o
 | `make fitness` | Run the full suite: S (static architecture), H (behavioral harnesses), B (evals), G (hygiene); stdlib checks always, tool checks when available |
 | `make hooks` | Install git hooks (pre-commit fitness gate, commit-msg format check) — run once after clone |
 | `make lint` / `make type` / `make test` | Individual gates (ruff / mypy --strict / pytest+coverage) |
-| `python3 scripts/fitness/run.py --json` | Fitness results as JSON (used by CI and subagents) |
+| `scripts/fitness/fitness --json` | Fitness results as JSON (used by CI and subagents). Use the launcher, never `python3 scripts/fitness/run.py`: it selects the project interpreter, and an older system `python3` cannot parse this project's own syntax (#74) |
 
 ## Subagents
 

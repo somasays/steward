@@ -178,9 +178,49 @@ def main() -> int:
     if failed:
         print(f"FAIL: {', '.join(r.check_id for r in failed)} — see GUARDRAILS.md")
         return 1
+    incapable = [r for r in results if r.incapable]
+    if incapable:
+        # Not green, and not a FAIL either: nothing is known to be broken, but
+        # this interpreter could not look. Saying so — and exiting non-zero — is
+        # the difference between a suite that ran and one that reported (#74).
+        names = ", ".join(r.check_id for r in incapable)
+        print(f"INCONCLUSIVE: {names} could not run in this environment — see the detail above.")
+        print("Run `make fitness`, which selects the project interpreter, rather than run.py directly.")
+        return 1
     print("fitness: all checks green")
     return 0
 
 
+def _verdict(results: List[CheckResult]) -> int:
+    """The suite's exit code, extracted so it can be tested without running it."""
+    if any(r.status == "FAIL" for r in results):
+        return 1
+    return 1 if any(r.incapable for r in results) else 0
+
+
+def _selftest() -> int:
+    """The verdict logic, on fixtures — the three cases that must stay distinct."""
+    passing = CheckResult("X1", "x", "PASS", [])
+    milestone_skip = CheckResult("X2", "x", "SKIP", [], "activates in M2")
+    env_skip = CheckResult("X3", "x", "SKIP", [], "unparsable by python 3.9", incapable=True)
+    failing = CheckResult("X4", "x", "FAIL", [], "broken")
+    cases = [
+        ("all passing is green", [passing], 0),
+        ("a milestone skip is still green", [passing, milestone_skip], 0),
+        ("an environment skip is not green", [passing, env_skip], 1),
+        ("a failure is not green", [passing, failing], 1),
+        ("a failure outranks an environment skip", [failing, env_skip], 1),
+    ]
+    for label, results, expected in cases:
+        actual = _verdict(results)
+        if actual != expected:
+            print(f"selftest FAIL: {label} — expected {expected}, got {actual}")
+            return 1
+    print(f"selftest PASS: {len(cases)} verdict cases")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
     sys.exit(main())

@@ -71,7 +71,7 @@ jobs:
 
       - name: Run fitness suite
         if: steps.scope.outputs.code == 'true'
-        run: python3 scripts/fitness/run.py --stage ci
+        run: scripts/fitness/fitness --stage ci
 
       # The docs-only path. It reports what it ran, not that "the gate passed": the
       # checks it skipped had nothing to read in this diff, and saying so is the
@@ -85,7 +85,7 @@ jobs:
 
       - name: Fitness report (JSON artifact)
         if: always() && steps.scope.outputs.code == 'true'
-        run: python3 scripts/fitness/run.py --json > fitness-report.json || true
+        run: scripts/fitness/fitness --json > fitness-report.json || true
 
       - uses: actions/upload-artifact@v4
         if: always() && steps.scope.outputs.code == 'true'
