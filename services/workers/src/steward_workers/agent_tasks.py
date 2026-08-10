@@ -38,11 +38,21 @@ from steward_agents import (
     TraceContext,
 )
 from steward_llm import GatewayConfig, GatewayTransport, LLMClient, Message, Role
-from steward_queue import TaskContext, connect, latest_checkpoint, task_handler, write_checkpoint
+from steward_queue import (
+    TaskContext,
+    connect,
+    latest_checkpoint,
+    record_step_usage,
+    task_handler,
+    write_checkpoint,
+)
 from steward_queue.db import QueueConnection
 from steward_queue.registry import TaskHandler
 from steward_schemas import AgentSpec, ProblemDetails, RunBudget, TaskResult, TaskStatus
 from steward_telemetry import Tracer
+
+NOTHING_SPENT = RunBudget(steps=0, tokens=0, cost_usd=Decimal(0), wall_clock=timedelta())
+"""What an agent task reports on its result: its spend is already recorded."""
 
 AGENT_ECHO = "agent.echo"
 """The task type of the end-to-end proof.
@@ -122,10 +132,14 @@ class DurableCheckpointStore:
     Satisfies the protocol structurally; `steward-agents` never learns it exists.
     """
 
-    def __init__(self, task_id: UUID, dsn: str) -> None:
+    def __init__(self, task_id: UUID, run_id: UUID, dsn: str) -> None:
         self._task_id = task_id
+        self._run_id = run_id
         self._dsn = dsn
         self._conn: QueueConnection | None = None
+        self._charged = NOTHING_SPENT
+        """What this attempt has already been billed for, so a save charges the
+        delta rather than the running total."""
 
     def _connection(self) -> QueueConnection:
         if self._conn is None:
@@ -145,10 +159,25 @@ class DurableCheckpointStore:
         return AgentCheckpoint.model_validate(state)
 
     async def save(self, key: str, checkpoint: AgentCheckpoint) -> None:
+        """Persist this step, and charge what it cost, in one transaction.
+
+        The two commit together because they are one fact. A checkpoint that
+        outlived its charge is the crash case with the accounting removed: the
+        worker died, so no `TaskResult` and no in-memory ledger survived to
+        record anything, and a resumed attempt would read three model calls of
+        progress and a cap that looked untouched -- then spend it again.
+        """
         payload: dict[str, Any] = json.loads(checkpoint.model_dump_json())
         conn = self._connection()
         write_checkpoint(conn, self._task_id, step=CHECKPOINT_STEP, state=payload)
+        record_step_usage(
+            conn,
+            run_id=self._run_id,
+            task_id=self._task_id,
+            amount=checkpoint.usage.remaining(self._charged),
+        )
         conn.commit()
+        self._charged = checkpoint.usage
 
 
 def _failed(
@@ -158,7 +187,7 @@ def _failed(
     return TaskResult(
         task_id=ctx.spec.task_id,
         status=TaskStatus.FAILED,
-        usage=ctx.usage.total(),
+        usage=NOTHING_SPENT,
         error=ProblemDetails(type=kind, title=title, status=status, detail=str(exc)),
     )
 
@@ -186,13 +215,16 @@ def build_agent_echo(
     )
 
     async def agent_echo(ctx: TaskContext) -> TaskResult:
-        checkpoints = DurableCheckpointStore(ctx.spec.task_id, dsn)
+        checkpoints = DurableCheckpointStore(ctx.spec.task_id, ctx.spec.run_id, dsn)
         runtime = AgentRuntime(
             client=LLMClient(gateway, transport),
             tools=echo_registry(),
             checkpoints=checkpoints,
             reservation=limits,
-            on_spend=ctx.usage.debit,
+            # Not `ctx.usage.debit`: this agent's spend is charged where it
+            # becomes durable, inside the checkpoint transaction, so the ledger
+            # the worker reads on the failure paths must stay empty or the same
+            # tokens would be billed twice.
             tracer=tracer,
         )
         prompt = str(ctx.spec.payload.get("prompt", "echo the value 'steward'"))
@@ -225,7 +257,7 @@ def build_agent_echo(
             # against one cap -- reporting it here would charge the run again
             # for everything the failed attempts were already charged for
             # (`steward_queue.usage`, SPEC §13 D12).
-            usage=ctx.usage.total(),
+            usage=NOTHING_SPENT,
             output=result.output.model_dump(),
         )
 

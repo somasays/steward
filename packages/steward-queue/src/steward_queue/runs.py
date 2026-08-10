@@ -33,6 +33,7 @@ __all__ = [
     "claim_single_flight",
     "create_run",
     "get_run",
+    "record_step_usage",
     "record_usage",
     "rollup_run_status",
     "set_run_status",
@@ -326,6 +327,49 @@ def _usage_fields(budget: RunBudget) -> dict[str, Any]:
         "cost_usd": str(budget.cost_usd),
         "wall_clock_seconds": budget.wall_clock.total_seconds(),
     }
+
+
+def record_step_usage(
+    conn: QueueConnection,
+    *,
+    run_id: UUID,
+    task_id: UUID,
+    amount: RunBudget,
+    actor: Actor = SYSTEM_ACTOR,
+) -> None:
+    """Charge one step's spend, durably, before the task it belongs to ends.
+
+    The crash-safety half of I12. `record_usage` runs when an attempt settles,
+    which means a process that dies mid-run charges nothing -- and a handler
+    that had already committed three model calls' worth of checkpoint would
+    resume with its cap apparently untouched and spend it again. A handler that
+    persists progress must therefore persist the *cost* of that progress in the
+    same transaction, which is what this is for.
+
+    The caller owns the transaction, as everywhere here. Committing the
+    checkpoint and this together is the whole point: what the stored state says
+    was done, the stored totals say was paid for.
+    """
+    amounts = {
+        "steps": amount.steps,
+        "tokens": amount.tokens,
+        "cost_usd": amount.cost_usd,
+        "wall_clock": amount.wall_clock,
+    }
+    # Run first, then task -- the lock order `record_usage` documents.
+    row = conn.execute(_sql.ADD_RUN_USAGE, {"id": run_id, **amounts}).fetchone()
+    conn.execute(_sql.ADD_TASK_USAGE, {"id": task_id, **amounts})
+    before = require_row(row, "run usage update returned no row")
+    write_audit(
+        conn,
+        actor=actor,
+        action="run.usage_recorded",
+        entity_type=RUN_ENTITY,
+        entity_id=str(run_id),
+        before=_usage_fields(budget_from(before[0], before[1], before[2], before[3])),
+        after=_usage_fields(budget_from(before[4], before[5], before[6], before[7]))
+        | {"task_id": str(task_id), "step": True},
+    )
 
 
 def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, actor: Actor) -> None:

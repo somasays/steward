@@ -21,8 +21,9 @@ What each of these is for, since "end to end" can mean almost nothing:
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -40,6 +41,7 @@ from steward_llm import (
     StubReply,
     ToolCall,
 )
+from steward_llm.transport import CompletionChunk
 from steward_orchestration import GoalParams, PlannedTask, goal, plan_run
 from steward_orchestration.registry import REGISTRY as GOAL_REGISTRY
 from steward_queue import (
@@ -51,11 +53,36 @@ from steward_queue import (
     get_run,
     get_task,
     latest_checkpoint,
+    requeue_stale,
+    task_handler,
 )
 from steward_queue.db import QueueConnection
 from steward_schemas import RunBudget, TaskSpec
 from steward_telemetry import Span, SpanOutcome
 from steward_workers.agent_tasks import AGENT_ECHO, build_agent_echo
+
+
+class StallsAfter:
+    """A transport that answers `after` calls, then never returns.
+
+    The stand-in for a worker that dies mid-run: progress is committed, and then
+    nothing else is -- no result, no ledger, no terminal state. What the test
+    does with it is stop the worker, which leaves the attempt exactly where a
+    killed process would (running, lease ticking) for `requeue_stale` to find.
+    """
+
+    def __init__(self, inner: StubGateway, after: int) -> None:
+        self._inner = inner
+        self._after = after
+        self.calls = 0
+
+    async def stream(self, call: object) -> AsyncIterator[CompletionChunk]:
+        self.calls += 1
+        if self.calls > self._after:
+            await asyncio.sleep(3600)
+        async for chunk in self._inner.stream(call):  # type: ignore[arg-type]
+            yield chunk
+
 
 pytestmark = pytest.mark.acceptance
 
@@ -434,3 +461,86 @@ class TestAgentEndToEnd:
         # `failed + (failed + submitted)`.
         assert run.usage.tokens < 2 * failed_attempt_spend.tokens + submitted
         assert run.usage.over(run.budget) == ()
+
+
+class TestCrashSafety:
+    """What survives a worker that never comes back (N1, I12).
+
+    The gateway-failure case is a *handled* failure: the handler catches it,
+    the ledger is read, a terminal state is written. A killed process leaves
+    none of that -- and before spend was charged inside the checkpoint
+    transaction, a run resumed after one would find several model calls of
+    committed progress against a cap that looked untouched, and spend it twice.
+    """
+
+    async def test_progress_committed_before_a_crash_is_charged_to_the_run(
+        self, dsn: str, conn: QueueConnection
+    ) -> None:
+        tracer = RecordingTracer()
+        stub = StubGateway({"steward-fast": uses_the_tool_then_submits()})
+        stalling = StallsAfter(stub, after=1)
+        REGISTRY.pop(AGENT_ECHO, None)
+        task_handler(AGENT_ECHO, sample_payload={"prompt": "echo the value 'steward'"})(
+            build_agent_echo(dsn=dsn, gateway=gateway(), transport=stalling, tracer=tracer)
+        )
+        spec = planned(conn, max_attempts=2)
+
+        # Run until the handler stalls, then stop the worker. The attempt is
+        # left `running` for a reaper -- which is what a killed pod looks like
+        # to everyone else (SPEC §13 D7).
+        stop = asyncio.Event()
+        worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=50), tracer=tracer)
+        loop_task = asyncio.create_task(worker.run_forever(stop))
+        await _until(lambda: latest_checkpoint(conn, spec.task_id) is not None)
+        stop.set()
+        await asyncio.wait_for(loop_task, timeout=10)
+
+        # No result was ever written, and no ledger survived the worker.
+        assert conn.execute(
+            "SELECT result, last_error FROM tasks WHERE id = %s", (spec.task_id,)
+        ).fetchone() == (None, None)
+        # The spend is charged anyway, because it was committed with the
+        # checkpoint that recorded the work it paid for.
+        charged = get_run(conn, spec.run_id)
+        assert charged is not None
+        assert charged.usage.tokens > 0, "a crash lost the spend its checkpoint kept"
+        crashed_spend = charged.usage
+
+        used = conn.execute(
+            "SELECT used_tokens FROM tasks WHERE id = %s", (spec.task_id,)
+        ).fetchone()
+        assert used is not None and used[0] == crashed_spend.tokens
+
+        # Lease recovery returns it, and the retry is handed what is left.
+        conn.execute(
+            "UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+            (spec.task_id,),
+        )
+        conn.commit()
+        assert requeue_stale(conn) 
+        conn.commit()
+
+        REGISTRY.pop(AGENT_ECHO, None)
+        finishing = StubGateway({"steward-fast": [uses_the_tool_then_submits()[1]]})
+        task_handler(AGENT_ECHO, sample_payload={"prompt": "echo the value 'steward'"})(
+            build_agent_echo(dsn=dsn, gateway=gateway(), transport=finishing, tracer=tracer)
+        )
+        assert await Worker(dsn, "w2", tracer=tracer).run_once() == 1
+
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.SUCCEEDED
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        # The pre-crash steps were paid for once, and only once.
+        assert run.usage.tokens > crashed_spend.tokens
+        assert run.usage.over(run.budget) == ()
+
+
+async def _until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
+    """Poll until `predicate` holds, or fail the test."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition never held")
