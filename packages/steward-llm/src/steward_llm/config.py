@@ -297,6 +297,22 @@ def _binding(entry: object, source: str, index: int) -> ModelBinding:
     )
 
 
+def _template_tokens(value: object, where: str) -> int:
+    """The declared per-message template allowance, as an integer or a refusal.
+
+    Coerced with `int()` before, which silently truncated: `8.9` became `8` and
+    weakened the very ceiling it contributes to, and `true` became `1`. A field
+    that participates in a hard bound is the last place to accept a value the
+    parser had to reinterpret -- so the type has to be right in the file.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidGatewayConfig(
+            f"{where}: chat_template_tokens_per_message must be a whole number of tokens, "
+            f"not {type(value).__name__}"
+        )
+    return value
+
+
 def _pricing(info: object, where: str) -> TokenPricing | None:
     """The entry's token prices, or None when it declares none.
 
@@ -313,7 +329,9 @@ def _pricing(info: object, where: str) -> TokenPricing | None:
         return TokenPricing(
             input_cost_per_token=Decimal(str(info["input_cost_per_token"])),
             output_cost_per_token=Decimal(str(info["output_cost_per_token"])),
-            chat_template_tokens_per_message=int(info["chat_template_tokens_per_message"]),
+            chat_template_tokens_per_message=_template_tokens(
+                info["chat_template_tokens_per_message"], where
+            ),
         )
     except KeyError as exc:
         raise InvalidGatewayConfig(f"{where}: model_info has no {exc.args[0]}") from exc

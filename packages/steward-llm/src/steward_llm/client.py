@@ -86,6 +86,47 @@ class LLMClient:
         self._transport = transport
         self._bindings = _alias_index(config.bindings)
 
+    def _charge(
+        self, request: CompletionRequest, spent: ModelUsage, started: float
+    ) -> ModelUsage:
+        """What to charge a call that did not finish.
+
+        A gateway reports token counts once, in a terminal frame, so a stream cut
+        short leaves the prompt uncounted and the completion counted only by
+        however many deltas arrived. Charging that is charging **zero dollars for
+        a call that spent money** -- the transport had nothing to price -- which
+        is the failure mode I12's "debit actual usage, including failed calls"
+        exists to prevent, and it is the direction that lets a run overspend
+        quietly.
+
+        So an interrupted call is charged its **proven upper bound**: the same
+        prompt ceiling and completion allowance the preflight approved before it
+        started, priced the same way. Conservative rather than exact, and exact
+        is not available -- but a bound that was already checked against the
+        budget cannot, by charging it, push the run past that budget.
+
+        A call whose gateway *did* report a prompt count finished its accounting,
+        so that figure is charged instead: this replaces nothing that is known.
+        """
+        elapsed = self._elapsed(started)
+        if spent.prompt_tokens > 0:
+            return spent.with_latency(elapsed)
+        allowance = request.max_tokens
+        ceiling = (
+            self.prompt_ceiling(request, max_tokens=allowance) if allowance is not None else None
+        )
+        if ceiling is None or allowance is None:
+            return spent.with_latency(elapsed)
+        cost = self.cost_ceiling(
+            request.alias, prompt_tokens=ceiling, completion_tokens=allowance
+        )
+        return ModelUsage(
+            prompt_tokens=ceiling,
+            completion_tokens=max(spent.completion_tokens, allowance),
+            cost_usd=cost if cost is not None else spent.cost_usd,
+            latency=elapsed,
+        )
+
     def prompt_ceiling(self, request: CompletionRequest, *, max_tokens: int) -> int | None:
         """An upper bound on this request's prompt tokens, or None if unstated.
 
@@ -177,7 +218,7 @@ class LLMClient:
             raise CompletionTimedOut(
                 f"{request.alias!r} timed out: {exc}",
                 alias=request.alias,
-                usage=spent.with_latency(self._elapsed(started)),
+                usage=self._charge(request, spent, started),
             ) from exc
         # A cancellation is not caught here at all, and neither are `SystemExit` and
         # `KeyboardInterrupt`: `except Exception` reaches none of them. That is the
@@ -188,14 +229,14 @@ class LLMClient:
             raise CompletionFailed(
                 f"{request.alias!r} failed: {exc}",
                 alias=request.alias,
-                usage=spent.with_latency(self._elapsed(started)),
+                usage=self._charge(request, spent, started),
             ) from exc
         usage = spent.with_latency(self._elapsed(started))
         if finish_reason is None:
             raise CompletionFailed(
                 f"{request.alias!r} ended its answer without a finish reason",
                 alias=request.alias,
-                usage=usage,
+                usage=self._charge(request, spent, started),
             )
         return CompletionResult(
             alias=request.alias,

@@ -393,3 +393,34 @@ class TestStartupFromTheEnvironment:
         monkeypatch.setattr(gateway, "COMMITTED_CONFIG", write(tmp_path, HOSTED_YAML))
         assert validate_main() == 1
         assert "REFUSED" in capsys.readouterr().out
+
+
+class TestTemplateAllowanceParsing:
+    """It participates in a hard bound, so it is not coerced into shape."""
+
+    def document(self, allowance: object) -> dict[str, object]:
+        return {
+            "model_list": [
+                {
+                    "model_name": "steward-fast",
+                    "litellm_params": {"model": "hosted_vllm/x", "api_base": APPROVED},
+                    "model_info": {
+                        "input_cost_per_token": "0.0000001",
+                        "output_cost_per_token": "0.0000003",
+                        "chat_template_tokens_per_message": allowance,
+                    },
+                }
+            ]
+        }
+
+    def test_a_whole_number_parses(self) -> None:
+        bindings = parse_litellm_config(self.document(8), "test")
+        assert bindings[0].pricing is not None
+        assert bindings[0].pricing.chat_template_tokens_per_message == 8
+
+    @pytest.mark.parametrize("allowance", [8.9, "8", True, None])
+    def test_anything_needing_reinterpretation_refuses(self, allowance: object) -> None:
+        """`int(8.9)` was 8 -- a weakened ceiling, arrived at silently -- and
+        `int(True)` was 1."""
+        with pytest.raises(InvalidGatewayConfig, match="whole number of tokens"):
+            parse_litellm_config(self.document(allowance), "test")

@@ -31,10 +31,14 @@ dies mid-stream cannot be told exactly what it spent. Rather than report zero --
 which would make every failed call look free, the failure mode `errors.py`
 exists to prevent -- each content delta carries one completion token as
 provisional spend, and the final usage frame carries the *difference* between
-what the proxy reports and what has already been counted. A completed call is
-therefore exact; an interrupted one reports a lower bound. That is stated here
-because it is a property of the protocol, not a choice this module could make
-differently.
+what the proxy reports and what has already been counted, so a completed call
+is exact.
+
+An **interrupted** call has no reported figure at all, and the client charges it
+the upper bound the preflight approved rather than the handful of provisional
+tokens seen so far -- see `LLMClient._charge`. A lower bound there meant a failed
+call that spent real money was recorded at zero dollars, which is the direction
+that lets a run overspend quietly.
 """
 
 from __future__ import annotations

@@ -18,9 +18,13 @@ import pytest
 from steward_llm import (
     CompletionRequest,
     CompletionTimedOut,
+    DeploymentMode,
+    EndpointAllowlist,
     FinishReason,
+    GatewayConfig,
     InvalidProxyConfig,
     LiteLLMProxyTransport,
+    LLMClient,
     Message,
     ModelBinding,
     ProxyConfig,
@@ -435,3 +439,57 @@ class TestPricingBounds:
         handler = responding(sse(frame, usage_frame(1, 1, "0")))
         with pytest.raises(CompletionFailed, match="without an id or a name"):
             await drain(transport_for(handler), call())
+
+
+class TestInterruptedCallAccounting:
+    """An interrupted production call is charged, not forgiven (I12).
+
+    The gateway reports tokens once, in a terminal frame. A stream cut short
+    before it leaves the prompt uncounted and the cost at zero -- so a failed
+    call that really spent money looked free, which is the direction that lets a
+    run overspend quietly. It is charged its proven upper bound instead: the
+    ceiling the preflight already approved.
+    """
+
+    def client_for(self, handler: object) -> LLMClient:
+        endpoint = "https://gateway.internal/v1"
+        config = GatewayConfig(
+            mode=DeploymentMode.DEVELOPMENT,
+            source="test",
+            bindings=(
+                ModelBinding(
+                    alias="steward-fast",
+                    model="hosted_vllm/qwen",
+                    api_base=endpoint,
+                    pricing=PRICING,
+                ),
+            ),
+            allowlist=EndpointAllowlist.from_urls((endpoint,)),
+        )
+        return LLMClient(config, transport_for(handler))
+
+    async def test_a_stream_cut_before_the_usage_frame_is_charged_its_bound(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            # Content, and then the connection dies -- no usage frame, which is
+            # the only place a gateway states what the call cost.
+            def body() -> Iterator[bytes]:
+                yield f"data: {json.dumps(delta('partial answer'))}\n\n".encode()
+                raise httpx.ReadError("connection reset", request=request)
+
+            return httpx.Response(200, content=body())
+
+        request = CompletionRequest(
+            alias="steward-fast",
+            messages=(Message(role=Role.USER, content="describe this table"),),
+            prompt_version="catalog/describe@v3",
+            max_tokens=500,
+        )
+        with pytest.raises(CompletionFailed) as raised:
+            await self.client_for(handler).complete(request)
+
+        spent = raised.value.usage
+        assert spent.prompt_tokens > 0, "a failed call reported no prompt tokens"
+        assert spent.cost_usd > 0, "a failed call that spent money was charged nothing"
+        # And it is the bound the preflight approved, not a number invented here.
+        bound = self.client_for(handler).prompt_ceiling(request, max_tokens=500)
+        assert bound is not None and spent.prompt_tokens == bound
