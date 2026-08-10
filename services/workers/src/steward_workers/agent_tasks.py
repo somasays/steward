@@ -38,6 +38,7 @@ from steward_agents import (
 )
 from steward_llm import GatewayConfig, GatewayTransport, LLMClient, Message, Role
 from steward_queue import (
+    RunBudgetBreached,
     TaskContext,
     connect,
     guard_claim,
@@ -252,6 +253,12 @@ def build_agent_echo(
             return _failed(ctx, "urn:steward:budget-exceeded", "budget_exceeded", 422, exc)
         except AgentRuntimeError as exc:
             return _failed(ctx, "urn:steward:agent-failed", "agent_failed", 500, exc)
+        except RunBudgetBreached as exc:
+            # The run had less left than this step spent. The balance was capped
+            # where it is stored and the full attempt is in the audit trail; what
+            # is left is for the task to end as what it is, so an operator sees a
+            # budget failure rather than a success charged for less than it used.
+            return _failed(ctx, "urn:steward:budget-exceeded", "budget_exceeded", 422, exc)
         finally:
             # However the run ended, this connection is not the worker's to
             # reclaim -- an abandoned handler thread would otherwise leave it

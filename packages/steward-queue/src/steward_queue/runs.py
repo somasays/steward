@@ -27,12 +27,14 @@ from steward_queue.audit import RUN_ENTITY, write_audit
 from steward_queue.db import QueueConnection
 from steward_queue.keys import digest
 from steward_queue.models import SYSTEM_ACTOR, Actor, RunRecord, RunStatus
+from steward_queue.usage import NOTHING_SPENT
 
 __all__ = [
     "bind_idempotency_key",
     "claim_single_flight",
     "create_run",
     "get_run",
+    "RunBudgetBreached",
     "record_step_usage",
     "record_usage",
     "rollup_run_status",
@@ -50,6 +52,37 @@ the façade, so that check is a property of the worker's route, not of every
 possible caller. Naming it here rather than underscoring it says which it
 is -- an underscore said "do not call this" to `tasks`, which has to (#58).
 """
+
+
+class RunBudgetBreached(RuntimeError):
+    """A charge was larger than the run had left, and the excess was not stored.
+
+    `runs.used_*` is clamped at the cap, so the balance an operator and the
+    scheduler act on is always inside the budget (I12). The excess is not lost:
+    the audit row for the charge carries what was requested, what was applied,
+    and the difference, so "how far past its cap did this run actually go" stays
+    a query rather than a guess. This exception is how the *task* learns, so it
+    can end as `budget_exceeded` instead of succeeding on spend the run declined
+    to record.
+    """
+
+    def __init__(self, run_id: UUID, requested: RunBudget, applied: RunBudget) -> None:
+        self.requested = requested
+        self.applied = applied
+        self.overspend = requested.remaining(applied)
+        super().__init__(
+            f"run {run_id} had less left than this step spent: requested "
+            f"{requested.steps} steps / {requested.tokens} tokens / {requested.cost_usd}, "
+            f"applied {applied.steps} / {applied.tokens} / {applied.cost_usd}"
+        )
+
+
+def _applied(before: Sequence[Any]) -> tuple[RunBudget, RunBudget]:
+    """What the run's totals were, and what they became."""
+    return (
+        budget_from(before[0], before[1], before[2], before[3]),
+        budget_from(before[4], before[5], before[6], before[7]),
+    )
 
 
 def _run_record(row: Sequence[Any]) -> RunRecord:
@@ -358,18 +391,31 @@ def record_step_usage(
     }
     # Run first, then task -- the lock order `record_usage` documents.
     row = conn.execute(_sql.ADD_RUN_USAGE, {"id": run_id, **amounts}).fetchone()
-    before = require_row(row, "run usage update returned no row")
+    row_values = require_row(row, "run usage update returned no row")
     conn.execute(_sql.ADD_TASK_USAGE, {"id": task_id, **amounts})
+    was, now = _applied(row_values)
+    applied = now.remaining(was)
+    overspend = amount.remaining(applied)
     write_audit(
         conn,
         actor=actor,
         action="run.usage_recorded",
         entity_type=RUN_ENTITY,
         entity_id=str(run_id),
-        before=_usage_fields(budget_from(before[0], before[1], before[2], before[3])),
-        after=_usage_fields(budget_from(before[4], before[5], before[6], before[7]))
-        | {"task_id": str(task_id), "step": True, "requested": _usage_fields(amount)},
+        before=_usage_fields(was),
+        after=_usage_fields(now)
+        | {
+            "task_id": str(task_id),
+            "step": True,
+            # Durable, and the reason clamping does not lose the truth: the
+            # balance is capped, the *fact* is not.
+            "requested": _usage_fields(amount),
+            "applied": _usage_fields(applied),
+            "overspend": _usage_fields(overspend),
+        },
     )
+    if overspend != NOTHING_SPENT:
+        raise RunBudgetBreached(run_id, amount, applied)
 
 
 def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, actor: Actor) -> None:

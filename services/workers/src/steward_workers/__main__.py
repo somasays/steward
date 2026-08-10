@@ -16,7 +16,16 @@ import socket
 import uuid
 
 import steward_catalog  # noqa: F401 -- imported for its side effect: registers `scan_source`
-from steward_llm import GatewayConfig, StubGateway, gateway_config_from_env
+from steward_llm import (
+    PROXY_KEY_ENV,
+    PROXY_URL_ENV,
+    GatewayConfig,
+    GatewayTransport,
+    LiteLLMProxyTransport,
+    StubGateway,
+    gateway_config_from_env,
+    proxy_config_from_env,
+)
 from steward_queue import DSN_ENV, Worker, registered_types
 from steward_telemetry import Tracer, tracer_from_env
 
@@ -25,15 +34,13 @@ from steward_workers import agent_tasks
 WORKER_ID_ENV = "STEWARD_WORKER_ID"
 
 AGENT_TRANSPORT_ENV = "STEWARD_AGENT_TRANSPORT"
-"""Which gateway transport the agent tasks run against; `stub` is the only value.
+"""How this worker reaches models: `proxy` for production, `stub` for a fixture.
 
-There is no LiteLLM transport yet and this is where that gap becomes visible
-rather than convenient (SPEC §13 D11): a `GatewayConfig` is the proxy's routing
-table and holds no address for the proxy, so a worker cannot yet be pointed at
-one. Registering the agent tasks against the stub *by default* would give a
-production worker a handler that answers from a fixture, which is the kind of
-green that means nothing. So it is opt-in by name, exactly as development mode
-is, and a worker that says nothing gets no agent handlers at all."""
+Opt-in by name, exactly as development mode is. Defaulting to the stub would
+give a production worker a handler that answers from a fixture -- green that
+means nothing -- and defaulting to the proxy would have a credential-less worker
+fail at the first model call instead of at boot. So a worker that says nothing
+registers no agent handlers, and says so in its log line."""
 
 
 def register_agent_tasks(dsn: str, gateway: GatewayConfig | None, tracer: Tracer) -> str:
@@ -43,21 +50,31 @@ def register_agent_tasks(dsn: str, gateway: GatewayConfig | None, tracer: Tracer
     that a worker has no agent handlers rather than infer it from a task that
     is never claimed.
     """
-    transport = os.environ.get(AGENT_TRANSPORT_ENV, "").strip().lower()
-    if not transport:
+    choice = os.environ.get(AGENT_TRANSPORT_ENV, "").strip().lower()
+    if not choice:
         return "none registered (no transport configured)"
-    if transport != "stub":
-        raise SystemExit(
-            f"{AGENT_TRANSPORT_ENV}={transport!r} is not a transport; "
-            "only 'stub' exists until the gateway transport lands (SPEC §13 D11)"
-        )
+    if choice not in {"proxy", "stub"}:
+        raise SystemExit(f"{AGENT_TRANSPORT_ENV}={choice!r} is not a transport ('proxy' or 'stub')")
     if gateway is None:
         raise SystemExit(
             f"{AGENT_TRANSPORT_ENV} is set but no gateway config is; "
             "an agent handler with no validated gateway cannot exist (I15)"
         )
-    agent_tasks.register(dsn=dsn, gateway=gateway, transport=StubGateway({}), tracer=tracer)
-    return f"{agent_tasks.AGENT_ECHO} on the stub transport"
+    transport: GatewayTransport
+    if choice == "proxy":
+        proxy = proxy_config_from_env(os.environ)
+        if proxy is None:
+            raise SystemExit(
+                f"{AGENT_TRANSPORT_ENV}=proxy needs {PROXY_URL_ENV} and {PROXY_KEY_ENV}; "
+                "a worker that cannot reach the gateway should not start pretending it can"
+            )
+        transport = LiteLLMProxyTransport(proxy)
+        where = f"the gateway at {proxy.base_url}"
+    else:
+        transport = StubGateway({})
+        where = "the stub transport"
+    agent_tasks.register(dsn=dsn, gateway=gateway, transport=transport, tracer=tracer)
+    return f"{agent_tasks.AGENT_ECHO} on {where}"
 
 SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
