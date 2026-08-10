@@ -94,6 +94,7 @@ def affordable(
 EXPLODES = "test.explodes_on_demand"
 SPENDS_THEN_RAISES = "test.spends_then_raises"
 SPENDS_THEN_OVERRUNS = "test.spends_then_overruns"
+SPENDS_WHAT_IS_LEFT = "test.spends_what_is_left"
 OVERSPENDS = "test.overspends_its_budget"
 REPORTS_FAILURE = "test.reports_failure"
 SLEEPS = "test.sleeps"
@@ -181,6 +182,21 @@ async def spends_then_overruns(ctx: TaskContext) -> TaskResult:
     ctx.usage.debit(SPENT_PER_CALL)
     await asyncio.sleep(float(ctx.spec.payload["seconds"]))
     return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=NO_USAGE)
+
+
+@task_handler(SPENDS_WHAT_IS_LEFT, sample_payload={"fail_first": False})
+async def spends_what_is_left(ctx: TaskContext) -> TaskResult:
+    """Reports having spent exactly the budget this attempt was given.
+
+    The handler shape that made cumulative overspend possible: it does not
+    checkpoint, so every attempt starts from nothing and helps itself to the
+    whole cap it is handed. What stops it now is that a retry is handed the
+    task's *remainder*, not its original budget.
+    """
+    if ctx.spec.payload.get("fail_first") and ctx.attempts == 1:
+        ctx.usage.debit(SPENT_PER_CALL)
+        raise RuntimeError("first attempt fails after spending")
+    return TaskResult(task_id=ctx.spec.task_id, status=TaskStatus.SUCCEEDED, usage=ctx.spec.budget)
 
 
 @task_handler(SLEEPS, sample_payload={"seconds": 0.0})
@@ -686,6 +702,35 @@ class TestFailurePaths:
         # wrong and why nothing tried again.
         assert "handler raised" in last_error["detail"]
         assert "budget left for another attempt" in last_error["detail"]
+
+    async def test_a_retry_cannot_spend_the_cap_a_second_time(
+        self, dsn: str, conn: QueueConnection
+    ) -> None:
+        """A non-checkpointing handler restarts from zero on every attempt, so
+        without this it could spend part of its budget, fail, and then spend the
+        whole thing again -- each attempt fitting its cap and the total blowing
+        it, invisibly to both the reservation and `_overspent`, which each look
+        at one attempt at a time (#69 review)."""
+        spec = affordable(
+            conn,
+            task_type=SPENDS_WHAT_IS_LEFT,
+            payload={"fail_first": True},
+            max_attempts=2,
+            attempts_affordable=1,
+        )
+        worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
+
+        assert await worker.run_once() == 1  # spends some of it, then fails
+        assert await worker.run_once() == 1  # retried, and helps itself to the rest
+
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.SUCCEEDED
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        # Exactly one budget between the two attempts, not one and a bit.
+        assert run.usage.tokens == ONE_ATTEMPT.tokens
+        assert run.usage.steps == ONE_ATTEMPT.steps
+        assert run.usage.over(run.budget) == ()
 
     async def test_a_partly_spent_task_is_still_retried(
         self, dsn: str, conn: QueueConnection

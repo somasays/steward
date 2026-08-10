@@ -265,7 +265,8 @@ FROM claimable AS c, runs AS r
 WHERE t.id = c.id AND r.id = t.run_id
 RETURNING t.id, t.run_id, t.task_type, t.payload, t.attempts, t.max_attempts,
           t.budget_steps, t.budget_tokens, t.budget_cost_usd, t.budget_wall_clock,
-          t.claimed_by, t.lease_expires_at, r.trace_id
+          t.claimed_by, t.lease_expires_at, r.trace_id,
+          t.used_steps, t.used_tokens, t.used_cost_usd, t.used_wall_clock
 """
 
 # The `claimed_by` predicate is a fencing token: a worker whose lease expired and

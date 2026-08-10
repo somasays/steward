@@ -156,7 +156,22 @@ def claim(
             run_id=row[1],
             task_type=row[2],
             payload=row[3],
-            budget=budget_from(row[6], row[7], row[8], row[9]),
+            # What this *attempt* may spend: the task's budget less what earlier
+            # attempts already spent of it. Handing every attempt the original
+            # figure is what let a task exceed its own cap across retries -- a
+            # handler that spent 60% and failed, then restarted from zero and
+            # spent 100%, fitted its cap on both attempts and blew it in total,
+            # and neither the reservation nor `_overspent` could see it because
+            # both look at one attempt at a time (#69 review).
+            #
+            # A task with nothing left is claimable and will refuse its first
+            # step, which is the same answer `fail`'s admission gives one
+            # attempt earlier -- two guards, deliberately, because this one also
+            # covers the attempts admission never saw (a lease recovery, an
+            # operator requeue).
+            budget=budget_from(row[6], row[7], row[8], row[9]).remaining(
+                budget_from(row[13], row[14], row[15], row[16])
+            ),
             max_attempts=row[5],
         )
         claimed.append(

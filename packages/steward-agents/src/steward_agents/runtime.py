@@ -24,6 +24,7 @@ have been nominal rather than real:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -90,12 +91,17 @@ class AgentCheckpoint(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     messages: tuple[Message, ...]
     usage: RunBudget
-    """Cumulative across attempts -- what the *cap* is checked against.
+    """What *this attempt* has spent, against the budget this attempt was given.
 
-    Distinct from the per-attempt ledger the worker reads: that one counts this
-    attempt's increments so a retry is not charged for its predecessors again,
-    while this one must carry everything so a resumed run cannot spend the cap
-    twice.
+    Per-attempt rather than cumulative, because the cap handed to a resumed
+    attempt has already had earlier attempts subtracted from it by the queue
+    (`tasks.used_*`). One layer accounts across attempts and one accounts within
+    one; when both did, a resumed run was refused for spend that had already
+    been deducted from its cap.
+
+    What *does* carry across a resume is everything else on this checkpoint --
+    the message history, the pending calls, the one-retry allowance -- which is
+    what makes a restart cost one step rather than a run.
     """
 
     pending_tool_calls: tuple[ToolCall, ...] = ()
@@ -164,22 +170,60 @@ def _add(left: RunBudget, right: RunBudget) -> RunBudget:
     return RunBudget.total((left, right))
 
 
-CHARS_PER_TOKEN = 3
-"""Conservative characters-per-token ratio for estimating a prompt's size.
+PER_MESSAGE_TOKEN_OVERHEAD = 8
+"""Tokens a chat template spends per message on role markers and separators.
 
-Deliberately below the ~4 that English averages, so the estimate errs high and
-the reservation errs toward refusing. It is an estimate and the residual is
-stated rather than hidden: a single call can overshoot its reservation by the
-estimator's error, and what catches that is the debit afterwards, which makes
-the *next* preflight refuse. Exact accounting needs the gateway's own token
-count before the call, which the transport seam cannot ask for yet (D11).
+Additive and generous, so it only ever makes the ceiling below more
+conservative. The exact number is the gateway's business and differs per
+template; what matters here is that it is never negative.
 """
 
 
-def _estimated_prompt_tokens(messages: tuple[Message, ...]) -> int:
-    """About how many tokens this history will cost to send."""
-    characters = sum(len(message.content) for message in messages)
-    return -(-characters // CHARS_PER_TOKEN)  # ceiling division
+def _prompt_token_ceiling(messages: tuple[Message, ...], tools: tuple[ToolSchema, ...]) -> int:
+    """An upper bound -- not an estimate -- on what this request's prompt costs.
+
+    The bound is the UTF-8 **byte** length of everything sent. Byte-level BPE,
+    which every model behind our aliases uses (Qwen, Llama and the GPT family
+    all tokenize bytes), builds each token from one or more bytes, so a token
+    can never be cheaper than a byte and `tokens <= bytes` holds for any input
+    -- including the identifiers, JSON, and non-ASCII text a
+    characters-divided-by-three estimate under-counts.
+
+    Tool schemas are counted because they are part of the prompt: a request
+    offering four tools sends their JSON Schema every time, and leaving it out
+    made the reservation wrong by however many tools an agent had.
+
+    Loose, deliberately. A ceiling that is never exceeded is worth more here
+    than a closer figure that sometimes is: this is what makes "a step that
+    cannot fit is never started" a bound rather than a hope (I12). The one
+    assumption is stated above and is a property of the tokenizer family, not
+    of this code -- a model tokenizing something other than bytes would need
+    this revisited, and the gateway is where that would be known (D11).
+    """
+    prompt = sum(len(message.content.encode("utf-8")) for message in messages)
+    overhead = PER_MESSAGE_TOKEN_OVERHEAD * len(messages)
+    schemas = sum(
+        len(tool.name.encode("utf-8"))
+        + len(tool.description.encode("utf-8"))
+        + len(json.dumps(tool.parameters).encode("utf-8"))
+        for tool in tools
+    )
+    return prompt + overhead + schemas
+
+
+def _usage_fields(usage: ModelUsage) -> dict[str, object]:
+    """What a generation cost, as trace fields (I7).
+
+    One renderer for both outcomes, so a failed call cannot quietly carry fewer
+    fields than a successful one -- which is the shape the omission took.
+    """
+    return {
+        "latency_seconds": usage.latency.total_seconds(),
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+        "cost_usd": str(usage.cost_usd),
+    }
 
 
 def _model_usage(usage: ModelUsage) -> RunBudget:
@@ -226,8 +270,18 @@ class AgentRuntime:
         output_model: type[BaseModel],
         trace: TraceContext,
     ) -> AgentResult:
-        checkpoint = await self._checkpoints.load(key) or AgentCheckpoint(
-            messages=messages, usage=NOTHING_SPENT
+        resumed = await self._checkpoints.load(key)
+        # A resumed attempt starts its usage at zero, and that is not an
+        # oversight about what earlier attempts spent -- it is because the cap
+        # it is given has *already* had that subtracted. The queue owns
+        # cross-attempt accounting (`tasks.used_*`, and the remaining budget a
+        # claim hands out); this loop owns one attempt against the budget it was
+        # handed. Carrying the cumulative figure here as well would subtract the
+        # same spend twice and refuse a resume that is affordable.
+        checkpoint = (
+            resumed.model_copy(update={"usage": NOTHING_SPENT})
+            if resumed is not None
+            else AgentCheckpoint(messages=messages, usage=NOTHING_SPENT)
         )
         if checkpoint.finished:
             return self._result(checkpoint, output_model)
@@ -292,7 +346,7 @@ class AgentRuntime:
         output_model: type[BaseModel],
         trace: TraceContext,
     ) -> AgentCheckpoint:
-        self._preflight_model(current.usage, spec.limits, current.messages)
+        self._preflight_model(current.usage, spec.limits, current.messages, schemas)
         request = CompletionRequest(
             alias=spec.model_alias,
             messages=current.messages,
@@ -301,7 +355,7 @@ class AgentRuntime:
             # `max_tokens` bounds the *completion*, while the reservation is a
             # total. Sending the reservation here would let a call cost the
             # prompt on top of everything that was checked for.
-            max_tokens=self._completion_allowance(current.messages),
+            max_tokens=self._completion_allowance(current.messages, schemas),
         )
         span = self._tracer.generation_span(
             trace_id=trace.trace_id,
@@ -311,18 +365,23 @@ class AgentRuntime:
         )
         try:
             with span as generation:
-                completion = await self._client.complete(request)
+                try:
+                    completion = await self._client.complete(request)
+                except LLMError as failure:
+                    # A call that died after generating is the accounting case
+                    # that matters most, so its span carries the same fields a
+                    # successful one does. Observed *inside* the span, because
+                    # once the exception leaves this block the observation is
+                    # closed and there is nothing left to attach them to.
+                    generation.observe(_usage_fields(failure.usage) | {"failed": True})
+                    raise
                 # What the call cost and what passed through it (I7). The
                 # request's messages are what the model was actually sent, and
                 # anything customer-derived reached them masked (I6) -- this
                 # seam exports, it does not sanitise.
                 generation.observe(
-                    {
-                        "latency_seconds": completion.usage.latency.total_seconds(),
-                        "prompt_tokens": completion.usage.prompt_tokens,
-                        "completion_tokens": completion.usage.completion_tokens,
-                        "total_tokens": completion.usage.total_tokens,
-                        "cost_usd": str(completion.usage.cost_usd),
+                    _usage_fields(completion.usage)
+                    | {
                         "finish_reason": completion.finish_reason.value,
                         "input": [message.content for message in request.messages],
                         "output": completion.text,
@@ -546,34 +605,45 @@ class AgentRuntime:
         )
 
     def _preflight_model(
-        self, used: RunBudget, cap: RunBudget, messages: tuple[Message, ...]
+        self,
+        used: RunBudget,
+        cap: RunBudget,
+        messages: tuple[Message, ...],
+        tools: tuple[ToolSchema, ...],
     ) -> None:
         """Refuse a model step whose worst case does not fit what is left.
 
-        The reservation is a *total* -- prompt plus completion -- so a growing
-        message history eats into what the completion may be. When the prompt
-        alone no longer fits, there is no completion allowance left to ask for
-        and the step is refused here rather than sent as a request that could
-        only overrun.
+        The reservation is a *total* -- prompt plus completion -- and both
+        halves are bounded rather than guessed: the prompt by the byte ceiling
+        (`_prompt_token_ceiling`), the completion by the `max_tokens` the
+        request carries. A step is started only when the two together fit, so
+        the call cannot come back having spent more than was checked for.
         """
-        prompt = _estimated_prompt_tokens(messages)
+        ceiling = _prompt_token_ceiling(messages, tools)
         reserved = RunBudget(
             steps=1,
-            tokens=max(self._reservation.tokens, prompt),
+            tokens=max(self._reservation.tokens, ceiling),
             cost_usd=self._reservation.cost_usd,
             wall_clock=self._reservation.wall_clock,
         )
         self._require_fit(_add(used, reserved), cap, "model")
-        if prompt >= self._reservation.tokens:
+        if ceiling >= self._reservation.tokens:
             raise BudgetExceeded(
-                f"model step refused before execution; the prompt alone is about {prompt} "
+                f"model step refused before execution; the prompt is at most {ceiling} "
                 f"tokens, which leaves nothing inside the {self._reservation.tokens}-token "
                 "reservation for a completion"
             )
 
-    def _completion_allowance(self, messages: tuple[Message, ...]) -> int:
-        """What is left of the reservation once the prompt is paid for."""
-        return max(1, self._reservation.tokens - _estimated_prompt_tokens(messages))
+    def _completion_allowance(
+        self, messages: tuple[Message, ...], tools: tuple[ToolSchema, ...]
+    ) -> int:
+        """What is left of the reservation once the prompt's ceiling is paid for.
+
+        Sent as `max_tokens`, which bounds the completion at the gateway. With
+        the prompt bounded above and the completion bounded here, the call's
+        total cannot exceed the reservation the preflight approved.
+        """
+        return max(1, self._reservation.tokens - _prompt_token_ceiling(messages, tools))
 
     @staticmethod
     def _preflight_tool(used: RunBudget, cap: RunBudget, wall_clock: timedelta) -> None:
