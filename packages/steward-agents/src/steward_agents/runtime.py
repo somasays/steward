@@ -193,6 +193,13 @@ def _prompt_token_ceiling(messages: tuple[Message, ...], tools: tuple[ToolSchema
     offering four tools sends their JSON Schema every time, and leaving it out
     made the reservation wrong by however many tools an agent had.
 
+    So is everything else a message carries. An assistant turn's `tool_calls`
+    are preserved precisely so they are sent again on the next request, and
+    their `arguments` are unbounded JSON -- a single large call could push the
+    real prompt past a ceiling computed from `content` alone, which is a ceiling
+    that does not hold. `tool_call_id` is counted for the same reason: small,
+    but sent.
+
     Loose, deliberately. A ceiling that is never exceeded is worth more here
     than a closer figure that sometimes is: this is what makes "a step that
     cannot fit is never started" a bound rather than a hope (I12). The one
@@ -200,7 +207,7 @@ def _prompt_token_ceiling(messages: tuple[Message, ...], tools: tuple[ToolSchema
     of this code -- a model tokenizing something other than bytes would need
     this revisited, and the gateway is where that would be known (D11).
     """
-    prompt = sum(len(message.content.encode("utf-8")) for message in messages)
+    prompt = sum(_message_bytes(message) for message in messages)
     overhead = PER_MESSAGE_TOKEN_OVERHEAD * len(messages)
     schemas = sum(
         len(tool.name.encode("utf-8"))
@@ -224,6 +231,26 @@ def _usage_fields(usage: ModelUsage) -> dict[str, object]:
         "total_tokens": usage.total_tokens,
         "cost_usd": str(usage.cost_usd),
     }
+
+
+def _message_bytes(message: Message) -> int:
+    """Every byte of one message that goes back over the wire.
+
+    `content` is the obvious part and was once the only part. The rest is what
+    a conversation carries between turns: the calls an assistant emitted, their
+    arguments, and the id a tool result answers. Anything omitted here is a hole
+    in the bound, not a rounding error.
+    """
+    return (
+        len(message.content.encode("utf-8"))
+        + len((message.tool_call_id or "").encode("utf-8"))
+        + sum(
+            len(call.id.encode("utf-8"))
+            + len(call.name.encode("utf-8"))
+            + len(call.arguments.encode("utf-8"))
+            for call in message.tool_calls
+        )
+    )
 
 
 def _model_usage(usage: ModelUsage) -> RunBudget:
@@ -373,7 +400,17 @@ class AgentRuntime:
                     # successful one does. Observed *inside* the span, because
                     # once the exception leaves this block the observation is
                     # closed and there is nothing left to attach them to.
-                    generation.observe(_usage_fields(failure.usage) | {"failed": True})
+                    generation.observe(
+                        _usage_fields(failure.usage)
+                        | {
+                            "failed": True,
+                            # The same input a successful call records. It is in
+                            # hand either way, and a trace that shows what a
+                            # working call saw but not what a failing one saw is
+                            # missing the case an operator opens the trace for.
+                            "input": [message.content for message in request.messages],
+                        }
+                    )
                     raise
                 # What the call cost and what passed through it (I7). The
                 # request's messages are what the model was actually sent, and
