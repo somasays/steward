@@ -50,9 +50,11 @@ from urllib.parse import urlparse
 import httpx
 
 from steward_llm.completion import FinishReason, ModelUsage, ToolCall
+from steward_llm.config import ModelBinding
 from steward_llm.endpoints import GatewayConfigError
 from steward_llm.errors import CompletionFailed, CompletionTimedOut
 from steward_llm.transport import CompletionChunk, GatewayCall
+from steward_llm.wire import request_body
 
 __all__ = [
     "PROXY_KEY_ENV",
@@ -164,36 +166,8 @@ class LiteLLMProxyTransport:
         await self._client.aclose()
 
     def _body(self, call: GatewayCall) -> dict[str, Any]:
-        """The request, addressed by alias.
-
-        `model` is the Steward alias and nothing else: the proxy holds the table
-        that turns it into an endpoint, so a worker naming a provider model
-        would be routing, which is the job this client exists not to do.
-        `stream_options.include_usage` is what makes the proxy send the usage
-        frame at all -- without it a completed call would report nothing spent.
-        """
-        request = call.request
-        body: dict[str, Any] = {
-            "model": request.alias,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            "messages": [_message(message) for message in request.messages],
-        }
-        if request.tools:
-            body["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    },
-                }
-                for tool in request.tools
-            ]
-        if request.max_tokens is not None:
-            body["max_tokens"] = request.max_tokens
-        return body
+        """The request, from the one serialiser the budget bound also measures."""
+        return request_body(call.request)
 
     async def stream(self, call: GatewayCall) -> AsyncIterator[CompletionChunk]:
         """Send the call and yield the answer as it arrives.
@@ -225,7 +199,7 @@ class LiteLLMProxyTransport:
                     frame = _frame(line)
                     if frame is None:
                         continue
-                    for chunk in _chunks(frame, counted, calls):
+                    for chunk in _chunks(frame, counted, calls, call.bindings):
                         counted += chunk.usage.completion_tokens
                         yield chunk
         except httpx.TimeoutException as exc:
@@ -354,17 +328,55 @@ class _ToolCallBuffer:
         Called when a choice finishes, because that is the first moment a call
         is known to be whole -- there is no per-call terminator in the protocol.
         """
-        assembled = [
-            ToolCall(id=part["id"], name=part["name"], arguments=part["arguments"])
-            for _, part in sorted(self.parts.items())
-            if part["name"]
-        ]
+        assembled = []
+        for (_, index), part in sorted(self.parts.items()):
+            if not part["id"] or not part["name"]:
+                # Refused, not dropped. A buffer that never received an id or a
+                # name is a truncated or malformed response, and skipping it
+                # would produce a `tool_calls` finish with the call absent --
+                # the model would appear to have asked for nothing and the run
+                # would carry on as if it had.
+                raise CompletionFailed(
+                    f"the gateway sent tool call {index} without an id or a name; "
+                    "the response is truncated or malformed",
+                    alias="unknown",
+                    usage=ModelUsage.nothing(),
+                )
+            assembled.append(
+                ToolCall(id=part["id"], name=part["name"], arguments=part["arguments"])
+            )
         self.parts.clear()
         return assembled
 
 
+def _cost(bindings: tuple[ModelBinding, ...], prompt: int, completion: int) -> Decimal:
+    """What this call cost, computed from validated prices rather than read.
+
+    `usage.cost` is not part of the OpenAI streaming usage object -- LiteLLM
+    reports response cost through its own logging data and a
+    `x-litellm-response-cost` header, not the body -- so reading it recorded a
+    confident **zero** for every real call while preflight had reserved a real
+    amount. Computing it from the tokens the gateway *does* report and the
+    prices the routing table declares is deterministic and needs no non-standard
+    field.
+
+    The dearest binding for this call's own mixture is used, because the client
+    does not choose which of an alias's endpoints answered (SPEC §6) -- the same
+    conservative reading the reservation takes.
+    """
+    ceilings = [
+        binding.pricing.ceiling(prompt_tokens=prompt, completion_tokens=completion)
+        for binding in bindings
+        if binding.pricing is not None
+    ]
+    return max(ceilings) if ceilings else Decimal(0)
+
+
 def _chunks(
-    frame: dict[str, Any], counted: int, calls: _ToolCallBuffer
+    frame: dict[str, Any],
+    counted: int,
+    calls: _ToolCallBuffer,
+    bindings: tuple[ModelBinding, ...],
 ) -> list[CompletionChunk]:
     """The increments one frame carries.
 
@@ -407,7 +419,11 @@ def _chunks(
                     completion_tokens=max(
                         0, int(usage.get("completion_tokens") or 0) - counted
                     ),
-                    cost_usd=Decimal(str(usage.get("cost") or "0")),
+                    cost_usd=_cost(
+                        bindings,
+                        int(usage.get("prompt_tokens") or 0),
+                        int(usage.get("completion_tokens") or 0),
+                    ),
                     latency=timedelta(0),
                 )
             )

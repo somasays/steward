@@ -25,13 +25,21 @@ from steward_llm import (
     ModelBinding,
     ProxyConfig,
     Role,
+    TokenPricing,
     ToolSchema,
     proxy_config_from_env,
 )
+from steward_llm.endpoints import GatewayConfigError
 from steward_llm.errors import CompletionFailed
 from steward_llm.transport import GatewayCall
 
 KEY = "sk-do-not-log-me"
+
+PRICING = TokenPricing(
+    input_cost_per_token=Decimal("0.00001"),
+    output_cost_per_token=Decimal("0.00002"),
+    chat_template_tokens_per_message=8,
+)
 
 
 def config(**overrides: object) -> ProxyConfig:
@@ -48,7 +56,14 @@ def call(*, tools: tuple[ToolSchema, ...] = (), max_tokens: int | None = None) -
             tools=tools,
             max_tokens=max_tokens,
         ),
-        bindings=(ModelBinding(alias="steward-fast", model="hosted_vllm/qwen", api_base="https://a/v1"),),
+        bindings=(
+            ModelBinding(
+                alias="steward-fast",
+                model="hosted_vllm/qwen",
+                api_base="https://a/v1",
+                pricing=PRICING,
+            ),
+        ),
     )
 
 
@@ -158,7 +173,12 @@ class TestStreamAssembly:
         # carries the remaining four so the sum is the proxy's number exactly.
         assert sum(chunk.usage.completion_tokens for chunk in chunks) == 7  # type: ignore[attr-defined]
         assert sum(chunk.usage.prompt_tokens for chunk in chunks) == 41  # type: ignore[attr-defined]
-        assert sum(chunk.usage.cost_usd for chunk in chunks) == Decimal("0.0003")  # type: ignore[attr-defined]
+        # Computed from the tokens the gateway reported and the prices the
+        # routing table declares -- not read from `usage.cost`, which is not part
+        # of the OpenAI streaming object and left every real call recording $0.
+        assert sum(chunk.usage.cost_usd for chunk in chunks) == (  # type: ignore[attr-defined]
+            41 * Decimal("0.00001") + 7 * Decimal("0.00002")
+        )
         assert chunks[-2].finish_reason is FinishReason.STOP  # type: ignore[attr-defined]
 
     async def test_a_stream_that_dies_mid_answer_reports_a_lower_bound(self) -> None:
@@ -362,3 +382,56 @@ class TestUrlSafety:
             await drain(transport_for(handler), call())
         assert KEY not in str(raised.value)
         assert "***" in str(raised.value)
+
+
+class TestPricingBounds:
+    def test_the_dearest_binding_for_this_call_wins_not_the_largest_sum(self) -> None:
+        """Ranking by `input + output` is wrong for any request that is not an
+        even mixture: the binding with the larger sum can be the cheaper one for
+        an output-heavy call, and the reservation would then underestimate
+        whichever endpoint answered."""
+        cheap_out = TokenPricing(
+            input_cost_per_token=Decimal("10"),
+            output_cost_per_token=Decimal("1"),
+            chat_template_tokens_per_message=8,
+        )
+        dear_out = TokenPricing(
+            input_cost_per_token=Decimal("1"),
+            output_cost_per_token=Decimal("9"),
+            chat_template_tokens_per_message=8,
+        )
+        assert (
+            cheap_out.input_cost_per_token + cheap_out.output_cost_per_token
+            > dear_out.input_cost_per_token + dear_out.output_cost_per_token
+        )
+        # ... and yet, for one prompt token and ten completion tokens:
+        assert dear_out.ceiling(prompt_tokens=1, completion_tokens=10) > cheap_out.ceiling(
+            prompt_tokens=1, completion_tokens=10
+        )
+
+    @pytest.mark.parametrize("bad", ["-0.1", "NaN", "Infinity"])
+    def test_a_price_that_is_not_a_price_is_refused(self, bad: str) -> None:
+        """A NaN price makes every budget comparison false, an infinite one
+        refuses every call, and a negative one funds a run by being used."""
+        with pytest.raises(GatewayConfigError, match="finite, non-negative"):
+            TokenPricing(
+                input_cost_per_token=Decimal(bad),
+                output_cost_per_token=Decimal("1"),
+                chat_template_tokens_per_message=8,
+            )
+
+    async def test_a_malformed_tool_call_fails_the_stream_rather_than_vanishing(self) -> None:
+        """Dropping it would produce a `tool_calls` finish with the call absent:
+        the model would appear to have asked for nothing."""
+        frame = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]},
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        handler = responding(sse(frame, usage_frame(1, 1, "0")))
+        with pytest.raises(CompletionFailed, match="without an id or a name"):
+            await drain(transport_for(handler), call())

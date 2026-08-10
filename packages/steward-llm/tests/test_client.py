@@ -39,7 +39,9 @@ from steward_llm.stub import StubGateway, StubReply
 from steward_llm.transport import CompletionChunk
 
 PRICING = TokenPricing(
-    input_cost_per_token=Decimal("0.0000001"), output_cost_per_token=Decimal("0.0000003")
+    input_cost_per_token=Decimal("0.0000001"),
+    output_cost_per_token=Decimal("0.0000003"),
+    chat_template_tokens_per_message=8,
 )
 
 APPROVED = "http://vllm-reasoning-a.steward-inference.svc.cluster.local:8000/v1"

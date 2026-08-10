@@ -27,7 +27,6 @@ from steward_agents import (
     ToolRegistry,
     TraceContext,
 )
-from steward_agents.runtime import _prompt_token_ceiling
 from steward_llm import (
     DeploymentMode,
     EndpointAllowlist,
@@ -85,6 +84,7 @@ def client(replies: list[StubReply]) -> tuple[LLMClient, StubGateway]:
                 pricing=TokenPricing(
                     input_cost_per_token=Decimal("0.000001"),
                     output_cost_per_token=Decimal("0.000002"),
+                    chat_template_tokens_per_message=8,
                 ),
             ),
         ),
@@ -562,11 +562,12 @@ async def test_the_completion_allowance_is_the_reservation_minus_the_prompt() ->
         trace=TRACE,
     )
     sent = gateway.calls[0].request
-    ceiling = _prompt_token_ceiling(messages, sent.tools)
-    assert sent.max_tokens == 1000 - ceiling
+    ceiling = llm.prompt_ceiling(sent, max_tokens=1000)
+    assert ceiling is not None
     # The bound is what makes this a guarantee: the prompt cannot cost more
-    # than `ceiling`, the completion cannot cost more than `max_tokens`, so the
-    # call cannot cost more than the reservation the preflight approved.
+    # than `ceiling` -- measured over the whole serialised body, from the same
+    # function the transport sends -- and the completion cannot cost more than
+    # `max_tokens`, so the call cannot cost more than the reservation approved.
     assert ceiling + sent.max_tokens == 1000
 
 
@@ -701,7 +702,7 @@ async def test_an_unpriced_alias_cannot_start_a_step() -> None:
         checkpoints=InMemoryCheckpointStore(),
         reservation=reservation(),
     )
-    with pytest.raises(BudgetExceeded, match="declares no token prices"):
+    with pytest.raises(BudgetExceeded, match="declares no model_info"):
         await runtime.run(
             key="task-unpriced",
             spec=spec(tools=()),

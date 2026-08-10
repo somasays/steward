@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import time
 from datetime import timedelta
+from decimal import Decimal
 
 from steward_llm.completion import (
     CompletionRequest,
@@ -40,9 +41,10 @@ from steward_llm.completion import (
     ModelUsage,
     ToolCall,
 )
-from steward_llm.config import PASS_THROUGH_MODEL, GatewayConfig, ModelBinding, TokenPricing
+from steward_llm.config import PASS_THROUGH_MODEL, GatewayConfig, ModelBinding
 from steward_llm.errors import CompletionFailed, CompletionTimedOut, UnboundAlias
 from steward_llm.transport import GatewayCall, GatewayTransport
+from steward_llm.wire import request_body, serialised_size
 
 __all__ = ["LLMClient"]
 
@@ -84,17 +86,56 @@ class LLMClient:
         self._transport = transport
         self._bindings = _alias_index(config.bindings)
 
-    def pricing_for(self, alias: str) -> TokenPricing | None:
-        """What a token costs on `alias`, or None if its bindings do not say.
+    def prompt_ceiling(self, request: CompletionRequest, *, max_tokens: int) -> int | None:
+        """An upper bound on this request's prompt tokens, or None if unstated.
 
-        The most expensive binding wins: an alias is served by two endpoints
-        (SPEC §6) and the client does not choose between them, so a bound that
-        holds must assume the dearer one answered.
+        Measured over the **whole serialised body** -- the document the
+        transport actually sends, from the one function that builds it -- plus
+        the per-message chat-template allowance the alias's configuration
+        declares. Measuring message contents and tool schemas instead left the
+        JSON framing uncounted, and a bound over a subset of the request is not
+        a bound on the request.
+
+        `None` when the alias declares no `model_info`: an unbounded call is
+        refused by the caller rather than started on a number nobody set.
         """
-        prices = [b.pricing for b in self._bindings.get(alias, ()) if b.pricing is not None]
-        if not prices:
+        allowance = self._template_allowance(request.alias)
+        if allowance is None:
             return None
-        return max(prices, key=lambda p: p.input_cost_per_token + p.output_cost_per_token)
+        body = request_body(request, max_tokens=max_tokens)
+        return serialised_size(body) + allowance * len(request.messages)
+
+    def _template_allowance(self, alias: str) -> int | None:
+        """The dearest declared template overhead among this alias's bindings."""
+        declared = [
+            binding.pricing.chat_template_tokens_per_message
+            for binding in self._bindings.get(alias, ())
+            if binding.pricing is not None
+        ]
+        return max(declared) if declared else None
+
+    def cost_ceiling(
+        self, alias: str, *, prompt_tokens: int, completion_tokens: int
+    ) -> Decimal | None:
+        """The most a call on `alias` can cost, or None if its prices are unstated.
+
+        Evaluated **per binding against this call's own shape**, then maximised.
+        Ranking bindings by `input + output` instead is wrong for any request
+        that is not an even mixture: given `(in 10, out 1)` and `(in 1, out 9)`,
+        the first has the larger sum and the second costs more for an
+        output-heavy call, so the reservation would underestimate whichever
+        endpoint LiteLLM happened to pick. The client does not choose the
+        endpoint (SPEC §6 gives each alias two), so a bound that holds has to
+        assume the dearest *for this call*.
+        """
+        ceilings = [
+            binding.pricing.ceiling(
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+            )
+            for binding in self._bindings.get(alias, ())
+            if binding.pricing is not None
+        ]
+        return max(ceilings) if ceilings else None
 
     @property
     def aliases(self) -> tuple[str, ...]:
