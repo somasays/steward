@@ -41,9 +41,16 @@ SELFTEST_MARKER = '"--selftest" in sys.argv'
 
 
 def _discover(fitness_dir: Path) -> List[Path]:
-    """check_*.py scripts (excluding this one) that declare the --selftest branch."""
+    """Scripts in this directory that declare a `--selftest` branch.
+
+    `check_*.py` plus `run.py`: the runner decides the suite's verdict, so its
+    own logic is exactly the kind of "real software, not a mechanical script"
+    S8 exists to sweep — and it was unswept while it was the one component that
+    could turn a skipped check into a green line (issue #74).
+    """
     found = []
-    for path in sorted(fitness_dir.glob("check_*.py")):
+    candidates = sorted(fitness_dir.glob("check_*.py")) + [fitness_dir / "run.py"]
+    for path in candidates:
         if path.name == Path(__file__).name:
             continue
         if SELFTEST_MARKER in path.read_text(encoding="utf-8"):

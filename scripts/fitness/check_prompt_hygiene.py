@@ -160,7 +160,7 @@ def run() -> CheckResult:
                            f"{scanned - len(unparsed)}/{scanned} files scanned; "
                            f"{len(unparsed)} unparsable by python {version} "
                            f"(e.g. {unparsed[0]}) — cannot vouch for them",
-                           pragma_count=pragmas)
+                           pragma_count=pragmas, incapable=True)
     return CheckResult("S4", "prompt hygiene", "PASS", [],
                        f"{scanned} files scanned", pragma_count=pragmas)
 
