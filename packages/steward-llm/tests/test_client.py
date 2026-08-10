@@ -30,12 +30,17 @@ from steward_llm.config import (
     DeploymentMode,
     GatewayConfig,
     ModelBinding,
+    TokenPricing,
     committed_production_config,
 )
 from steward_llm.endpoints import EndpointAllowlist
 from steward_llm.errors import CompletionFailed, CompletionTimedOut, LLMError, UnboundAlias
 from steward_llm.stub import StubGateway, StubReply
 from steward_llm.transport import CompletionChunk
+
+PRICING = TokenPricing(
+    input_cost_per_token=Decimal("0.0000001"), output_cost_per_token=Decimal("0.0000003")
+)
 
 APPROVED = "http://vllm-reasoning-a.steward-inference.svc.cluster.local:8000/v1"
 ALLOWLIST = EndpointAllowlist.from_urls([APPROVED])
@@ -44,7 +49,12 @@ ALLOWLIST = EndpointAllowlist.from_urls([APPROVED])
 def config(*extra: ModelBinding) -> GatewayConfig:
     """A validated production config: every required alias, all on the allowlist."""
     bindings = tuple(
-        ModelBinding(alias=alias, model="hosted_vllm/qwen3-32b-instruct", api_base=APPROVED)
+        ModelBinding(
+            alias=alias,
+            model="hosted_vllm/qwen3-32b-instruct",
+            api_base=APPROVED,
+            pricing=PRICING,
+        )
         for alias in sorted(PRODUCTION_ALIASES)
     )
     return GatewayConfig(
@@ -236,7 +246,12 @@ async def test_an_unbound_alias_is_refused_before_any_call_is_made() -> None:
 
 
 async def test_the_callable_aliases_are_the_config_s_not_a_constant() -> None:
-    extra = ModelBinding(alias="steward-rerank", model="hosted_vllm/bge-reranker", api_base=APPROVED)
+    extra = ModelBinding(
+        alias="steward-rerank",
+        model="hosted_vllm/bge-reranker",
+        api_base=APPROVED,
+        pricing=PRICING,
+    )
     client = LLMClient(config(extra), StubGateway({"steward-rerank": [StubReply.completed("ok")]}))
 
     assert "steward-rerank" in client.aliases

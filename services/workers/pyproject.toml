@@ -18,6 +18,19 @@ dependencies = [
     "steward-llm",
 ]
 
+# Test-only, and written down because no tool can see it. #69's acceptance proof
+# enters through `POST /v1/runs` -- the path the issue requires -- so this
+# service's *test tree* imports the API service. import-linter's root packages
+# are `src/` trees, so a tests/ import is outside every contract it enforces
+# (the same blind spot #49 recorded twice), and uv's workspace would resolve it
+# silently whether or not it were declared. Declared here so the edge is a
+# stated dependency rather than an accident of one shared virtualenv; the
+# `src/` trees stay independent, which the root import-linter contract enforces.
+[dependency-groups]
+dev = [
+    "steward-api",
+]
+
 [project.scripts]
 steward-worker = "steward_workers.__main__:main"
 
@@ -26,6 +39,7 @@ steward-queue = { workspace = true }
 steward-telemetry = { workspace = true }
 steward-catalog = { workspace = true }
 steward-llm = { workspace = true }
+steward-api = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

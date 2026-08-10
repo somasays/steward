@@ -170,6 +170,84 @@ class TestStreamAssembly:
 
         assert sum(chunk.usage.completion_tokens for chunk in chunks) == 2  # type: ignore[attr-defined]
 
+    async def test_a_fragmented_tool_call_assembles_into_one(self) -> None:
+        """How a gateway actually streams a tool call: identity on the first
+        delta, arguments in slices after it, correlated by `index` and not by
+        id -- most of the fragments do not carry one. Emitting a call per delta
+        produced three malformed calls with empty names and partial JSON, and
+        the client above appends rather than merges, so the run saw all three."""
+        fragments = [
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {"name": "echo", "arguments": "{"},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{"index": 0, "function": {"arguments": '"value":'}}]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{"index": 0, "function": {"arguments": '"steward"}'}}]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+        ]
+        handler = responding(sse(*fragments, usage_frame(9, 6, "0.0002")))
+        chunks = await drain(transport_for(handler), call())
+
+        calls = [chunk.tool_call for chunk in chunks if chunk.tool_call is not None]  # type: ignore[attr-defined]
+        assert len(calls) == 1, "each fragment became its own call"
+        assert calls[0].id == "call_1"
+        assert calls[0].name == "echo"
+        assert json.loads(calls[0].arguments) == {"value": "steward"}
+
+    async def test_two_parallel_tool_calls_stay_separate(self) -> None:
+        """Correlated by index, so concurrent calls do not merge into one."""
+        frame = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "id": "a", "function": {"name": "one", "arguments": "{}"}},
+                            {"index": 1, "id": "b", "function": {"name": "two", "arguments": "{}"}},
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        handler = responding(sse(frame, usage_frame(3, 2, "0")))
+        chunks = await drain(transport_for(handler), call())
+
+        calls = [chunk.tool_call for chunk in chunks if chunk.tool_call is not None]  # type: ignore[attr-defined]
+        assert [(c.id, c.name) for c in calls] == [("a", "one"), ("b", "two")]
+
     async def test_tool_calls_come_back_typed(self) -> None:
         frame = {
             "choices": [
@@ -188,6 +266,11 @@ class TestStreamAssembly:
 
         calls = [chunk.tool_call for chunk in chunks if chunk.tool_call is not None]  # type: ignore[attr-defined]
         assert (calls[0].id, calls[0].name, calls[0].arguments) == ("c1", "echo", '{"v":1}')
+        # The finish reason arrives after the call it belongs to, so a client
+        # reading in order never ends the answer without it.
+        assert chunks.index(next(c for c in chunks if c.tool_call is not None)) < chunks.index(  # type: ignore[attr-defined]
+            next(c for c in chunks if c.finish_reason is not None)
+        )
 
 
 class TestFailures:
@@ -237,10 +320,45 @@ class TestFailures:
 
 @pytest.fixture(autouse=True)
 def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Nothing here may open a socket; every test drives `MockTransport`."""
+    """Nothing here may open a socket -- and this makes that true rather than
+    stating it.
+
+    It was a bare `yield` under exactly this docstring: a guarantee asserted in
+    prose and enforced by nothing, which is the shape this repo hunts. Now the
+    real connection pool raises, so a test that reached the network would fail
+    instead of quietly reaching it.
+    """
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("this suite drives MockTransport; nothing here opens a socket")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", refuse)
     yield
 
 
 def test_the_timeout_must_be_positive() -> None:
     with pytest.raises(InvalidProxyConfig, match="positive"):
         config(timeout=timedelta(0))
+
+
+class TestUrlSafety:
+    def test_userinfo_is_refused_rather_than_stripped(self) -> None:
+        with pytest.raises(InvalidProxyConfig, match="userinfo") as raised:
+            config(base_url=f"https://user:{KEY}@gateway.internal/v1")
+        assert KEY not in str(raised.value)
+
+    def test_a_query_or_fragment_is_refused(self) -> None:
+        with pytest.raises(InvalidProxyConfig, match="query or fragment"):
+            config(base_url=f"https://gateway.internal/v1?token={KEY}")
+
+    async def test_a_reflected_credential_is_redacted_from_the_error(self) -> None:
+        """The body is the remote end's text. A proxy that echoes the
+        Authorization header into its error message would otherwise put our key
+        inside an owned exception."""
+        handler = responding(
+            json.dumps({"error": {"message": f"bad key: Bearer {KEY}"}}), status=401
+        )
+        with pytest.raises(CompletionFailed) as raised:
+            await drain(transport_for(handler), call())
+        assert KEY not in str(raised.value)
+        assert "***" in str(raised.value)

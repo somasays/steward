@@ -39,6 +39,7 @@ from steward_llm import (
     Role,
     StubGateway,
     StubReply,
+    TokenPricing,
     ToolCall,
 )
 from steward_schemas import AgentSpec, RunBudget
@@ -74,7 +75,19 @@ def client(replies: list[StubReply]) -> tuple[LLMClient, StubGateway]:
     config = GatewayConfig(
         mode=DeploymentMode.DEVELOPMENT,
         source="test",
-        bindings=(ModelBinding(alias="steward-fast", model="openai/local", api_base=endpoint),),
+        bindings=(
+            ModelBinding(
+                alias="steward-fast",
+                model="openai/local",
+                api_base=endpoint,
+                # Priced, because an unpriced alias cannot be cost-bounded before
+                # a call and the loop refuses it -- see `_price`.
+                pricing=TokenPricing(
+                    input_cost_per_token=Decimal("0.000001"),
+                    output_cost_per_token=Decimal("0.000002"),
+                ),
+            ),
+        ),
         allowlist=EndpointAllowlist.from_urls((endpoint,)),
     )
     gateway = StubGateway({"steward-fast": replies})
@@ -666,3 +679,61 @@ async def test_submitting_alongside_other_calls_is_refused_not_guessed_at() -> N
     assert invoked == []  # the discarded echo was never silently run
     corrections = [m for m in stores.values["task-mixed"].messages if m.role is Role.TOOL]
     assert "must be the only call" in corrections[0].content
+
+
+@pytest.mark.asyncio
+async def test_an_unpriced_alias_cannot_start_a_step() -> None:
+    """I12 asks for a step that cannot fit to never be started, and cost is only
+    knowable before a call if the price of a token is. An alias whose bindings
+    carry no prices is refused rather than run against a declared figure that
+    nothing checks."""
+    endpoint = "http://127.0.0.1:8000/v1"
+    unpriced = GatewayConfig(
+        mode=DeploymentMode.DEVELOPMENT,
+        source="test",
+        bindings=(ModelBinding(alias="steward-fast", model="openai/local", api_base=endpoint),),
+        allowlist=EndpointAllowlist.from_urls((endpoint,)),
+    )
+    gateway = StubGateway({"steward-fast": [submits("never reached")]})
+    runtime = AgentRuntime(
+        client=LLMClient(unpriced, gateway),
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(),
+    )
+    with pytest.raises(BudgetExceeded, match="declares no token prices"):
+        await runtime.run(
+            key="task-unpriced",
+            spec=spec(tools=()),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="go"),),
+            output_model=FinalOutput,
+            trace=TRACE,
+        )
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_cost_bound_is_computed_from_prices_not_declared() -> None:
+    """The reserved cost is the bounded prompt at the input price plus the
+    bounded completion at the output price — so an expensive alias is refused
+    before it runs rather than after the bill arrives."""
+    llm, gateway = client([submits("too expensive")])
+    runtime = AgentRuntime(
+        client=llm,
+        tools=registry([]),
+        checkpoints=InMemoryCheckpointStore(),
+        reservation=reservation(tokens=4000),
+    )
+    # Prices are 1e-6 in / 2e-6 out; a 4000-token reservation cannot cost less
+    # than a few thousandths, so a cap of one ten-thousandth cannot fund it.
+    with pytest.raises(BudgetExceeded, match="cost_usd"):
+        await runtime.run(
+            key="task-dear",
+            spec=spec(tools=(), limits=budget(cost="0.0001")),
+            prompt_version="proof.v1",
+            messages=(Message(role=Role.USER, content="go"),),
+            output_model=FinalOutput,
+            trace=TRACE,
+        )
+    assert gateway.calls == []

@@ -179,7 +179,7 @@ class DurableCheckpointStore:
         # work nobody is supervising (N1, D7).
         guard_claim(conn, self._task_id, claimed_by=self._claimed_by, attempts=self._attempts)
         write_checkpoint(conn, self._task_id, step=CHECKPOINT_STEP, state=payload)
-        record_step_usage(
+        breach = record_step_usage(
             conn,
             run_id=self._run_id,
             task_id=self._task_id,
@@ -187,6 +187,13 @@ class DurableCheckpointStore:
         )
         conn.commit()
         self._charged = checkpoint.usage
+        if breach is not None:
+            # Committed first, and only then raised. The clamped balance, the
+            # task's own total and the audit row carrying requested/applied/
+            # overspend are durable before this exception exists; raising inside
+            # the transaction would have rolled all three back and left the
+            # breach with no record at all.
+            raise breach
 
 
 def _failed(

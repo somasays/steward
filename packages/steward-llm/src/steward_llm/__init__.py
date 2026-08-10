@@ -33,6 +33,7 @@ from steward_llm.config import (
     GatewayConfig,
     InvalidGatewayConfig,
     ModelBinding,
+    TokenPricing,
     committed_production_config,
     gateway_config_from_env,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "MalformedEndpoint",
     "Message",
     "ModelBinding",
+    "TokenPricing",
     "ModelUsage",
     "NonApprovedEndpoint",
     "Role",

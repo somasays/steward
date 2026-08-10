@@ -44,6 +44,7 @@ from steward_llm import (
     Role,
     StubGateway,
     StubReply,
+    TokenPricing,
     ToolCall,
 )
 from steward_llm.transport import CompletionChunk
@@ -222,7 +223,19 @@ def gateway() -> GatewayConfig:
     return GatewayConfig(
         mode=DeploymentMode.DEVELOPMENT,
         source="acceptance",
-        bindings=(ModelBinding(alias="steward-fast", model="openai/local", api_base=ENDPOINT),),
+        bindings=(
+            ModelBinding(
+                alias="steward-fast",
+                model="openai/local",
+                api_base=ENDPOINT,
+                # Priced: an alias whose bindings carry no token prices cannot
+                # be cost-bounded before a call, and the loop refuses it.
+                pricing=TokenPricing(
+                    input_cost_per_token=Decimal("0.00000001"),
+                    output_cost_per_token=Decimal("0.00000002"),
+                ),
+            ),
+        ),
         allowlist=EndpointAllowlist.from_urls((ENDPOINT,)),
     )
 
@@ -628,3 +641,69 @@ class TestStaleClaimFencing:
         run = get_run(conn, spec.run_id)
         assert run is not None and run.usage.tokens == 0
         assert stub.calls == []
+
+
+class TestBreachEvidence:
+    """A charge larger than the run had left (I12, SPEC §13 D12/D13).
+
+    The balance is capped where it is stored, so it never reads outside the
+    budget. The *fact* is not capped: what was requested, what was applied and
+    the difference are committed before the breach is announced. An earlier
+    version raised inside the transaction and rolled all of it back -- the
+    exception meant to report the overspend destroyed the record of it.
+    """
+
+    async def test_a_breach_is_terminal_capped_and_still_fully_recorded(
+        self, dsn: str, conn: QueueConnection
+    ) -> None:
+        tracer = RecordingTracer()
+        stub = register_agent(dsn, uses_the_tool_then_submits(), tracer)
+        spec = planned(conn)
+        # The run can afford almost nothing; the task's own cap is left wide, so
+        # what stops this is the *run's* balance rather than the agent's own
+        # preflight -- which is the path the clamp and this evidence exist for.
+        conn.execute(
+            "UPDATE runs SET budget_tokens = 5, budget_cost_usd = 0.000001 WHERE id = %s",
+            (spec.run_id,),
+        )
+        conn.commit()
+
+        await Worker(dsn, "w1", tracer=tracer, retry_base_delay=timedelta(0)).run_once()
+
+        # 1. The task reaches a terminal failure, and says why.
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state in {TaskState.DEAD, TaskState.FAILED}
+        recorded = conn.execute(
+            "SELECT last_error FROM tasks WHERE id = %s", (spec.task_id,)
+        ).fetchone()
+        assert recorded is not None and recorded[0]["title"] == "budget_exceeded"
+
+        # 2. The enforceable balance is at the cap and never past it.
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        assert run.usage.over(run.budget) == ()
+        assert run.usage.tokens == run.budget.tokens
+
+        # 3. The full attempt survives, queryable, in the audit trail.
+        audits = conn.execute(
+            "SELECT after FROM audit_log WHERE entity_id = %s AND action = 'run.usage_recorded'"
+            " ORDER BY id",
+            (str(spec.run_id),),
+        ).fetchall()
+        assert audits, "the breach committed no audit row, so the overspend is unrecoverable"
+        breaches = [row[0] for row in audits if row[0].get("overspend", {}).get("tokens", 0) > 0]
+        assert breaches, "no audit row records an overspend"
+        evidence = breaches[0]
+        assert evidence["requested"]["tokens"] > evidence["applied"]["tokens"]
+        assert (
+            evidence["requested"]["tokens"]
+            == evidence["applied"]["tokens"] + evidence["overspend"]["tokens"]
+        )
+
+        # 4. The task's own accounting and its checkpoint committed too.
+        used = conn.execute(
+            "SELECT used_tokens FROM tasks WHERE id = %s", (spec.task_id,)
+        ).fetchone()
+        assert used is not None and used[0] > 0
+        assert latest_checkpoint(conn, spec.task_id) is not None
+        assert stub.calls, "the model was never called, so nothing was overspent"

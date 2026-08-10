@@ -369,7 +369,7 @@ def record_step_usage(
     task_id: UUID,
     amount: RunBudget,
     actor: Actor = SYSTEM_ACTOR,
-) -> None:
+) -> RunBudgetBreached | None:
     """Charge one step's spend, durably, before the task it belongs to ends.
 
     The crash-safety half of I12. `record_usage` runs when an attempt settles,
@@ -382,6 +382,12 @@ def record_step_usage(
     The caller owns the transaction, as everywhere here. Committing the
     checkpoint and this together is the whole point: what the stored state says
     was done, the stored totals say was paid for.
+
+    Returns the breach when the charge was larger than the run had left, and
+    `None` otherwise. A **return** rather than a raise, because the caller has
+    not committed yet: an exception here would roll back the clamp and the audit
+    row along with everything else, and the evidence this function exists to
+    preserve would be the first casualty of announcing it.
     """
     amounts = {
         "steps": amount.steps,
@@ -414,8 +420,14 @@ def record_step_usage(
             "overspend": _usage_fields(overspend),
         },
     )
-    if overspend != NOTHING_SPENT:
-        raise RunBudgetBreached(run_id, amount, applied)
+    if overspend == NOTHING_SPENT:
+        return None
+    # Reported, not raised. Raising here would unwind the caller's transaction
+    # -- the one carrying the clamped balance, the task increment and the audit
+    # row that *are* the evidence -- so the exception meant to announce the
+    # breach would destroy the record of it. The caller commits, then decides
+    # what to do about the return value (SPEC.md §13 D13).
+    return RunBudgetBreached(run_id, amount, applied)
 
 
 def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, actor: Actor) -> None:
@@ -453,14 +465,28 @@ def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, act
         "cost_usd": result.usage.cost_usd,
         "wall_clock": result.usage.wall_clock,
     }
-    # The run's total moves first, and that ordering is load-bearing rather
-    # than incidental. `tasks.run_id` is a foreign key, so updating a task row
-    # takes a KEY SHARE lock on its `runs` row; doing that before this
-    # statement's FOR UPDATE leaves two workers settling two tasks of one run
-    # each holding KEY SHARE and each waiting for FOR UPDATE, which Postgres
-    # resolves by killing one of them (observed: `DeadlockDetected ... while
-    # locking tuple in relation "runs"`). Taking the exclusive lock first means
-    # they serialise on it instead.
+    # The run's total moves first. This ordering is load-bearing, and the
+    # evidence rather than the theory is what is written down here.
+    #
+    # *Observed:* with the two statements swapped, two workers settling two
+    # tasks of one run deadlock reliably --
+    # `test_two_workers_never_execute_a_task_twice` and
+    # `test_concurrent_workers_settle_a_run_exactly_once` fail within three
+    # runs, and Postgres reports both processes waiting `while locking tuple in
+    # relation "runs"`. Restoring the order makes them pass. Those two tests are
+    # the regression pin; there is no separate one.
+    #
+    # *Mechanism, stated as the reading it is:* both waiters are on the same
+    # `runs` tuple, which is the shape of two transactions each holding a weaker
+    # lock on it and each requesting an exclusive one -- the weaker lock being
+    # the `KEY SHARE` a child-row write takes on its parent through
+    # `tasks.run_id`'s foreign key. Taking the exclusive lock first serialises
+    # them instead. A review probe of a single `UPDATE tasks SET state = ...`
+    # in isolation did *not* acquire that parent lock (Postgres skips it when
+    # the key column is unchanged), so the trigger is something in the full
+    # transaction sequence rather than any one statement, and this comment does
+    # not claim to have isolated which. What is certain is the ordering and the
+    # tests that fail without it.
     row = conn.execute(_sql.ADD_RUN_USAGE, {"id": run_id, **amounts}).fetchone()
     # The task's own total moves with it, in the same transaction. Retry
     # admission projects what one more attempt at *this task* could still cost
