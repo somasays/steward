@@ -15,6 +15,16 @@ from steward_schemas.agent import AgentSpec
 from steward_schemas.asset import Asset, AssetLifecycle, AssetType
 from steward_schemas.budget import RunBudget
 from steward_schemas.catalog import AssetDetail, AssetPage
+from steward_schemas.classification import (
+    ClassificationProposal,
+    ColumnClassification,
+    EvidenceKind,
+    EvidenceRef,
+    ProposalStatus,
+    ReviewDecision,
+    ReviewOutcome,
+    SensitivityLabel,
+)
 from steward_schemas.column import Column
 from steward_schemas.errors import ProblemDetails
 from steward_schemas.profile import (
@@ -56,6 +66,14 @@ __all__ = [
     "Source",
     "SourceCreate",
     "SourceEngine",
+    "ClassificationProposal",
+    "ColumnClassification",
+    "EvidenceKind",
+    "EvidenceRef",
+    "ProposalStatus",
+    "ReviewDecision",
+    "ReviewOutcome",
+    "SensitivityLabel",
     "TableProfile",
     "TaskResult",
     "TaskSpec",
