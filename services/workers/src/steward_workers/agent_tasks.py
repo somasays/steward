@@ -25,7 +25,6 @@ import json
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
-from uuid import UUID
 
 from pydantic import BaseModel
 from steward_agents import (
@@ -41,6 +40,7 @@ from steward_llm import GatewayConfig, GatewayTransport, LLMClient, Message, Rol
 from steward_queue import (
     TaskContext,
     connect,
+    guard_claim,
     latest_checkpoint,
     record_step_usage,
     task_handler,
@@ -132,9 +132,11 @@ class DurableCheckpointStore:
     Satisfies the protocol structurally; `steward-agents` never learns it exists.
     """
 
-    def __init__(self, task_id: UUID, run_id: UUID, dsn: str) -> None:
-        self._task_id = task_id
-        self._run_id = run_id
+    def __init__(self, ctx: TaskContext, dsn: str) -> None:
+        self._task_id = ctx.spec.task_id
+        self._run_id = ctx.spec.run_id
+        self._claimed_by = ctx.claimed_by
+        self._attempts = ctx.attempts
         self._dsn = dsn
         self._conn: QueueConnection | None = None
         self._charged = NOTHING_SPENT
@@ -169,6 +171,12 @@ class DurableCheckpointStore:
         """
         payload: dict[str, Any] = json.loads(checkpoint.model_dump_json())
         conn = self._connection()
+        # Fenced, because this connection is not the worker's and nothing else
+        # stops it. A handler whose lease expired mid-step is still running: its
+        # task may already have been reaped and re-claimed, and without this it
+        # would overwrite the live attempt's checkpoint and charge that run for
+        # work nobody is supervising (N1, D7).
+        guard_claim(conn, self._task_id, claimed_by=self._claimed_by, attempts=self._attempts)
         write_checkpoint(conn, self._task_id, step=CHECKPOINT_STEP, state=payload)
         record_step_usage(
             conn,
@@ -215,7 +223,7 @@ def build_agent_echo(
     )
 
     async def agent_echo(ctx: TaskContext) -> TaskResult:
-        checkpoints = DurableCheckpointStore(ctx.spec.task_id, ctx.spec.run_id, dsn)
+        checkpoints = DurableCheckpointStore(ctx, dsn)
         runtime = AgentRuntime(
             client=LLMClient(gateway, transport),
             tools=echo_registry(),

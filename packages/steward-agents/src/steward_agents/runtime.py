@@ -52,6 +52,13 @@ from steward_telemetry import NoopTracer, SpanOutcome, Tracer
 
 from steward_agents.tools import DisallowedTool, ToolRegistry, ToolValidationError
 
+MAX_CORRECTIONS = 1
+"""How many validation errors one attempt may hand back before failing.
+
+SPEC §3.2 says "one retry", and this is that number in one place rather than a
+condition repeated at each site that can raise a validation error.
+"""
+
 SUBMIT_RESULT = "submit_result"
 """The tool a run ends by calling.
 
@@ -105,12 +112,18 @@ class AgentCheckpoint(BaseModel):
     """
 
     pending_tool_calls: tuple[ToolCall, ...] = ()
-    answered_with_feedback: tuple[str, ...] = ()
-    """Tool call ids already handed back to the model once for bad arguments.
+    corrections: int = 0
+    """How many times this attempt has handed a validation error back.
 
-    Kept on the checkpoint rather than in a local so the one-retry allowance
-    survives a resume; in a local, a worker restart would refill it and a model
-    looping on the same malformed call could do so indefinitely.
+    A **count**, not a set of call ids. Ids are chosen by the model, so a model
+    that reissues the same malformed call under a fresh id earns a fresh
+    correction every time -- the allowance keyed on ids was one the caller
+    being limited got to mint more of, which is no limit at all. What stopped
+    such a loop was the step budget, eventually, which is the audit fence
+    wearing a retry policy's clothes.
+
+    Kept on the checkpoint rather than in a local so the allowance survives a
+    resume; in a local, a restart would refill it.
     """
 
     output_json: str | None = None
@@ -500,13 +513,13 @@ class AgentRuntime:
             return base.model_copy(
                 update={"output_json": submitted.arguments, "pending_tool_calls": ()}
             )
-        if submitted.id in base.answered_with_feedback:
+        if base.corrections >= MAX_CORRECTIONS:
             raise AgentRuntimeError(f"{SUBMIT_RESULT} was rejected twice: {problem}")
         return base.model_copy(
             update={
                 "messages": base.messages
                 + (Message(role=Role.TOOL, content=problem, tool_call_id=submitted.id),),
-                "answered_with_feedback": base.answered_with_feedback + (submitted.id,),
+                "corrections": base.corrections + 1,
                 "pending_tool_calls": (),
             }
         )
@@ -544,7 +557,7 @@ class AgentRuntime:
         reserved = self._tools.reservation(call.name)
         self._preflight_tool(current.usage, cap, reserved)
         started = time.monotonic()
-        answered = current.answered_with_feedback
+        corrections = current.corrections
         try:
             # The reservation is only a bound if something enforces it. Without
             # this, a tool could be reserved for a second and run for an hour,
@@ -556,16 +569,17 @@ class AgentRuntime:
                 with self._tracer.tool_span(
                     trace_id=trace.trace_id, task_id=trace.task_id, tool_name=call.name
                 ) as tool:
-                    content = (
-                        await self._tools.invoke(call, allowlist=allowlist)
-                    ).model_dump_json()
+                    validated, result = await self._tools.invoke(call, allowlist=allowlist)
+                    content = result.model_dump_json()
                     # Both sides are the *validated* models' own JSON, so what
-                    # the trace shows is what the registry admitted, not what
-                    # the model happened to emit.
+                    # the trace shows is what the registry admitted, not the
+                    # arguments the model emitted -- which are the unchecked
+                    # thing, and would make "validated I/O" a label rather than
+                    # a description (I7).
                     tool.observe(
                         {
                             "latency_seconds": time.monotonic() - started,
-                            "input": call.arguments,
+                            "input": validated.model_dump_json(),
                             "output": content,
                         }
                     )
@@ -585,11 +599,11 @@ class AgentRuntime:
         except ToolValidationError as exc:
             # Bad arguments are the model's to fix, once (SPEC.md §3.2). A second
             # failure on the same call is not feedback any more, it is a loop.
-            if not exc.blames_model or call.id in current.answered_with_feedback:
+            if not exc.blames_model or current.corrections >= MAX_CORRECTIONS:
                 await self._charge_failed_step(key, current, self._elapsed_step(started))
                 raise
             content = str(exc)
-            answered = current.answered_with_feedback + (call.id,)
+            corrections = current.corrections + 1
         except Exception:
             # Anything else the tool raised still consumed the time it ran for.
             await self._charge_failed_step(key, current, self._elapsed_step(started))
@@ -608,7 +622,7 @@ class AgentRuntime:
                 + (Message(role=Role.TOOL, content=content, tool_call_id=call.id),),
                 "usage": _add(current.usage, spend),
                 "pending_tool_calls": current.pending_tool_calls[1:],
-                "answered_with_feedback": answered,
+                "corrections": corrections,
             }
         )
         await self._checkpoints.save(key, updated)

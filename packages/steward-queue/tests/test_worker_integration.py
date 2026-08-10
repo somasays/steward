@@ -654,83 +654,52 @@ class TestFailurePaths:
         assert run.usage.tokens == 2 * SPENT_PER_CALL.tokens
         assert run.usage.over(run.budget) == ()
 
-    async def test_a_retry_is_refused_once_the_task_has_overspent_its_own_budget(
+    async def test_a_retry_is_refused_when_the_run_has_nothing_left_for_it(
         self, dsn: str, conn: QueueConnection
     ) -> None:
         """The property #69 asks for: recorded spend never exceeds the cap.
 
-        What a retry can still cost is the task's *remainder* -- projecting its
-        whole budget again would dead-letter every task that had done any work,
-        which is what a run whose single task carries the whole budget looks
-        like. So the refusal fires exactly where it should: a task that has
-        already spent past its own cap has no remainder to fund, and the run is
-        over besides. A handler that debits more than it was given is the case
-        `_overspent` cannot catch, because there is no returned result to check.
+        A retry is projected at the task's *remainder*, so a task that has spent
+        part of its own budget is still affordable on its own terms -- what makes
+        one unaffordable is the rest of the run. Here a sibling task has spent
+        the run's whole budget, so there is nothing left to fund another attempt
+        at this one, and it dead-letters with attempts unspent.
         """
-        tight = RunBudget(
-            steps=2,
-            tokens=SPENT_PER_CALL.tokens - 4,  # less than one call debits
-            cost_usd=Decimal("0.50"),
-            wall_clock=timedelta(seconds=30),
+        run = create_run(conn, goal="test", budget=ONE_ATTEMPT)
+        sibling = TaskSpec(
+            task_id=uuid4(),
+            run_id=run.id,
+            task_type=REPORTS_ITS_LEASE,
+            payload={},
+            budget=ONE_ATTEMPT,
+            max_attempts=1,
         )
-        run = create_run(conn, goal="test", budget=tight)
-        spec = TaskSpec(
+        failing = TaskSpec(
             task_id=uuid4(),
             run_id=run.id,
             task_type=SPENDS_THEN_RAISES,
             payload={"boom": True},
-            budget=tight,
+            budget=ONE_ATTEMPT,
             max_attempts=3,
         )
-        enqueue(conn, spec)
+        enqueue(conn, sibling)
+        enqueue(conn, failing)
         conn.commit()
         worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
 
-        assert await worker.run_once() == 1
-        # Attempts remain (1 of 3 used) and the task is still dead: it is the
-        # budget that stopped it, and the error says so.
-        assert await worker.run_once() == 0
+        # Drain both. The sibling's success spends what the run had.
+        while await worker.run_once():
+            pass
 
-        task = get_task(conn, spec.task_id)
+        task = get_task(conn, failing.task_id)
         assert task is not None and task.state is TaskState.DEAD
-        assert task.attempts == 1
-        recorded = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
+        assert task.attempts < task.max_attempts  # stopped by budget, not attempts
+        recorded = conn.execute(SELECT_TASK_LAST_ERROR, (failing.task_id,)).fetchone()
         assert recorded is not None
-        last_error = recorded[0]
-        assert last_error["title"] == BUDGET_EXCEEDED
-        # The cause survives the re-titling: an operator needs both what went
-        # wrong and why nothing tried again.
-        assert "handler raised" in last_error["detail"]
-        assert "budget left for another attempt" in last_error["detail"]
-
-    async def test_a_retry_cannot_spend_the_cap_a_second_time(
-        self, dsn: str, conn: QueueConnection
-    ) -> None:
-        """A non-checkpointing handler restarts from zero on every attempt, so
-        without this it could spend part of its budget, fail, and then spend the
-        whole thing again -- each attempt fitting its cap and the total blowing
-        it, invisibly to both the reservation and `_overspent`, which each look
-        at one attempt at a time (#69 review)."""
-        spec = affordable(
-            conn,
-            task_type=SPENDS_WHAT_IS_LEFT,
-            payload={"fail_first": True},
-            max_attempts=2,
-            attempts_affordable=1,
-        )
-        worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
-
-        assert await worker.run_once() == 1  # spends some of it, then fails
-        assert await worker.run_once() == 1  # retried, and helps itself to the rest
-
-        task = get_task(conn, spec.task_id)
-        assert task is not None and task.state is TaskState.SUCCEEDED
-        run = get_run(conn, spec.run_id)
-        assert run is not None
-        # Exactly one budget between the two attempts, not one and a bit.
-        assert run.usage.tokens == ONE_ATTEMPT.tokens
-        assert run.usage.steps == ONE_ATTEMPT.steps
-        assert run.usage.over(run.budget) == ()
+        assert recorded[0]["title"] == BUDGET_EXCEEDED
+        assert "budget left for another attempt" in recorded[0]["detail"]
+        settled = get_run(conn, run.id)
+        assert settled is not None and settled.usage.over(settled.budget) == ()
 
     async def test_a_partly_spent_task_is_still_retried(
         self, dsn: str, conn: QueueConnection

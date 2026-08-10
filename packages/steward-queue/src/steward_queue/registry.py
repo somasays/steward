@@ -65,6 +65,15 @@ class TaskContext:
     connection: QueueConnection
     spec: TaskSpec
     attempts: int
+    claimed_by: str
+    """The worker holding this attempt -- its half of the fencing token.
+
+    A handler that writes outside its own transaction (an agent checkpointing
+    to survive a restart) must pass this and `attempts` to `guard_claim` first,
+    or a worker whose lease expired can keep writing about a task somebody else
+    is now running.
+    """
+
     trace_id: str
     """The run's trace, so work the handler starts lands on it too (I7).
 
