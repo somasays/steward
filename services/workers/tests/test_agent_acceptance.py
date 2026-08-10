@@ -28,10 +28,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
+from fastapi.testclient import TestClient
 from steward_agents import SUBMIT_RESULT, AgentCheckpoint, ModelReservation
+from steward_api.app import create_app
+from steward_api.store import PostgresRunStore
 from steward_llm import (
     DeploymentMode,
     EndpointAllowlist,
@@ -44,7 +47,7 @@ from steward_llm import (
     ToolCall,
 )
 from steward_llm.transport import CompletionChunk
-from steward_orchestration import GoalParams, PlannedTask, goal, plan_run
+from steward_orchestration import GoalParams, PlannedTask, goal
 from steward_orchestration.registry import REGISTRY as GOAL_REGISTRY
 from steward_queue import (
     REGISTRY,
@@ -54,8 +57,6 @@ from steward_queue import (
     UsageLedger,
     Worker,
     claim,
-    create_run,
-    enqueue,
     get_run,
     get_task,
     latest_checkpoint,
@@ -93,6 +94,13 @@ class StallsAfter:
 pytestmark = pytest.mark.acceptance
 
 ENDPOINT = "http://127.0.0.1:8000/v1"
+
+
+def dsn_of(conn: QueueConnection) -> str:
+    """The DSN behind an open connection, so the API and the worker share one
+    database rather than two that happen to be configured alike."""
+    info = conn.info
+    return f"postgresql://{info.user}@/{info.dbname}?host={info.host}&port={info.port}"
 
 AGENT_ECHO_GOAL = "agent_echo"
 AGENT_ECHO_TASK_TYPE = AGENT_ECHO
@@ -266,25 +274,42 @@ def planned(
     prompt: str = "echo the value 'steward'",
     max_attempts: int = 1,
 ) -> TaskSpec:
-    """Plan an `agent_echo` run the way the API does, and enqueue its task.
+    """Create the run **through the API**, and return the task it enqueued.
 
-    Through `GOALS` rather than by hand: the plan-time budget reservation (D9)
-    is part of what is being proven, and a hand-built `TaskSpec` would skip it.
+    `POST /v1/runs` against a `PostgresRunStore` on the same database the worker
+    claims from -- not `plan_run` and `enqueue` called directly, which is the
+    same code one layer down and proves nothing about the hop that carries a
+    client's request into the queue. #69 asks for the path through the API, so
+    the test takes it.
     """
-    expansion = plan_run(AGENT_ECHO_GOAL, {"prompt": prompt})
-    record = create_run(conn, goal=AGENT_ECHO_GOAL, budget=expansion.budget, payload={})
-    planned_task = expansion.tasks[0]
-    spec = TaskSpec(
-        task_id=uuid4(),
-        run_id=record.id,
-        task_type=planned_task.task_type,
-        payload=planned_task.payload,
-        budget=planned_task.budget,
+    with TestClient(create_app(run_store=PostgresRunStore(dsn_of(conn)))) as client:
+        response = client.post(
+            "/v1/runs", json={"goal": AGENT_ECHO_GOAL, "payload": {"prompt": prompt}}
+        )
+    assert response.status_code == 202, response.text
+    run_id = UUID(response.json()["id"])
+
+    row = conn.execute(
+        "SELECT id, task_type, payload, budget_steps, budget_tokens, budget_cost_usd, "
+        "budget_wall_clock FROM tasks WHERE run_id = %s",
+        (run_id,),
+    ).fetchone()
+    assert row is not None, "the API admitted a run but enqueued no task"
+    # Always set, never only when it differs from the default: the goal decides
+    # `max_attempts` and a test that silently inherited it would be asserting
+    # against a number it did not choose.
+    conn.execute("UPDATE tasks SET max_attempts = %s WHERE id = %s", (max_attempts, row[0]))
+    conn.commit()
+    return TaskSpec(
+        task_id=row[0],
+        run_id=run_id,
+        task_type=row[1],
+        payload=row[2],
+        budget=RunBudget(
+            steps=row[3], tokens=row[4], cost_usd=row[5], wall_clock=row[6]
+        ),
         max_attempts=max_attempts,
     )
-    enqueue(conn, spec)
-    conn.commit()
-    return spec
 
 
 class TestAgentEndToEnd:
@@ -358,21 +383,16 @@ class TestAgentEndToEnd:
         `BudgetExceeded` travel and be titled `handler raised`."""
         tracer = RecordingTracer()
         stub = register_agent(dsn, uses_the_tool_then_submits(), tracer)
-        expansion = plan_run(AGENT_ECHO_GOAL, {"prompt": "go"})
-        record = create_run(conn, goal=AGENT_ECHO_GOAL, budget=expansion.budget, payload={})
-        # One step and a cent: the first model call cannot fit.
-        impossible = RunBudget(
-            steps=1, tokens=10, cost_usd=Decimal("0.01"), wall_clock=timedelta(seconds=30)
+        spec = planned(conn)
+        # One step and a cent, applied to the task the API enqueued: the first
+        # model call cannot fit. Narrowed here rather than planned this way
+        # because a goal that advertises an unusable budget would be refused at
+        # registration, which is a different (and already tested) property.
+        conn.execute(
+            "UPDATE tasks SET budget_steps = 1, budget_tokens = 10, "
+            "budget_cost_usd = 0.01 WHERE id = %s",
+            (spec.task_id,),
         )
-        spec = TaskSpec(
-            task_id=uuid4(),
-            run_id=record.id,
-            task_type=AGENT_ECHO_TASK_TYPE,
-            payload={"prompt": "go"},
-            budget=impossible,
-            max_attempts=1,
-        )
-        enqueue(conn, spec)
         conn.commit()
 
         await Worker(dsn, "w1", tracer=tracer).run_once()
@@ -386,7 +406,7 @@ class TestAgentEndToEnd:
         assert recorded[0]["title"] == "budget_exceeded"
         # Never started, so nothing was spent on it.
         assert stub.calls == []
-        run = get_run(conn, record.id)
+        run = get_run(conn, spec.run_id)
         assert run is not None
         assert run.usage.over(run.budget) == ()
 

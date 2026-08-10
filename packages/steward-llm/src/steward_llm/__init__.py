@@ -44,6 +44,14 @@ from steward_llm.endpoints import (
     NonApprovedEndpoint,
 )
 from steward_llm.errors import CompletionFailed, CompletionTimedOut, LLMError, UnboundAlias
+from steward_llm.proxy import (
+    PROXY_KEY_ENV,
+    PROXY_URL_ENV,
+    InvalidProxyConfig,
+    LiteLLMProxyTransport,
+    ProxyConfig,
+    proxy_config_from_env,
+)
 from steward_llm.stub import StubGateway, StubReply
 from steward_llm.transport import CompletionChunk, GatewayCall, GatewayTransport
 
@@ -52,7 +60,13 @@ __all__ = [
     "CONFIG_PATH_ENV",
     "MODE_ENV",
     "PRODUCTION_ALIASES",
+    "PROXY_KEY_ENV",
+    "PROXY_URL_ENV",
     "CompletionChunk",
+    "InvalidProxyConfig",
+    "LiteLLMProxyTransport",
+    "ProxyConfig",
+    "proxy_config_from_env",
     "CompletionFailed",
     "CompletionRequest",
     "CompletionResult",

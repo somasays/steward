@@ -62,6 +62,7 @@ from steward_queue.registry import (
     task_handler,
 )
 from steward_queue.runs import (
+    RunBudgetBreached,
     bind_idempotency_key,
     claim_single_flight,
     create_run,
@@ -123,6 +124,7 @@ __all__ = [
     "enqueue",
     "fail",
     "get_handler",
+    "RunBudgetBreached",
     "get_run",
     "record_step_usage",
     "get_task",
