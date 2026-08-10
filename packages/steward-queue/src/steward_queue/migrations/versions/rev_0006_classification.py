@@ -88,8 +88,18 @@ CREATE TABLE classification_reviews (
     actor text NOT NULL,
     reason text NOT NULL,
     policy_id text,
+    idempotency_key text,
     decided_at timestamptz NOT NULL DEFAULT now()
 )
+"""
+
+# A repeated decision under one key returns the original outcome rather than
+# recording a second event or racing to a different one. Partial, because most
+# decisions carry no key and must not collide with each other on NULL -- the
+# same shape `runs.idempotency_key` uses.
+CREATE_REVIEWS_IDEMPOTENCY = """
+CREATE UNIQUE INDEX classification_reviews_idempotency_key
+    ON classification_reviews (idempotency_key) WHERE idempotency_key IS NOT NULL
 """
 
 CREATE_REVIEWS_BY_PROPOSAL = """
@@ -103,6 +113,7 @@ UPGRADE: tuple[str, ...] = (
     CREATE_ONE_APPROVED,
     CREATE_REVIEWS,
     CREATE_REVIEWS_BY_PROPOSAL,
+    CREATE_REVIEWS_IDEMPOTENCY,
 )
 
 DOWNGRADE: tuple[str, ...] = (
