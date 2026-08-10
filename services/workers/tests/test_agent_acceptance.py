@@ -233,6 +233,7 @@ def gateway() -> GatewayConfig:
                 pricing=TokenPricing(
                     input_cost_per_token=Decimal("0.00000001"),
                     output_cost_per_token=Decimal("0.00000002"),
+                    chat_template_tokens_per_message=8,
                 ),
             ),
         ),

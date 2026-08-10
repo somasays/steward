@@ -24,7 +24,6 @@ have been nominal rather than real:
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -44,7 +43,6 @@ from steward_llm import (
     Message,
     ModelUsage,
     Role,
-    TokenPricing,
     ToolCall,
     ToolSchema,
 )
@@ -182,54 +180,6 @@ class _State(TypedDict):
 
 def _add(left: RunBudget, right: RunBudget) -> RunBudget:
     return RunBudget.total((left, right))
-
-
-PER_MESSAGE_TOKEN_OVERHEAD = 8
-"""Tokens a chat template spends per message on role markers and separators.
-
-Additive and generous, so it only ever makes the ceiling below more
-conservative. The exact number is the gateway's business and differs per
-template; what matters here is that it is never negative.
-"""
-
-
-def _prompt_token_ceiling(messages: tuple[Message, ...], tools: tuple[ToolSchema, ...]) -> int:
-    """An upper bound -- not an estimate -- on what this request's prompt costs.
-
-    The bound is the UTF-8 **byte** length of everything sent. Byte-level BPE,
-    which every model behind our aliases uses (Qwen, Llama and the GPT family
-    all tokenize bytes), builds each token from one or more bytes, so a token
-    can never be cheaper than a byte and `tokens <= bytes` holds for any input
-    -- including the identifiers, JSON, and non-ASCII text a
-    characters-divided-by-three estimate under-counts.
-
-    Tool schemas are counted because they are part of the prompt: a request
-    offering four tools sends their JSON Schema every time, and leaving it out
-    made the reservation wrong by however many tools an agent had.
-
-    So is everything else a message carries. An assistant turn's `tool_calls`
-    are preserved precisely so they are sent again on the next request, and
-    their `arguments` are unbounded JSON -- a single large call could push the
-    real prompt past a ceiling computed from `content` alone, which is a ceiling
-    that does not hold. `tool_call_id` is counted for the same reason: small,
-    but sent.
-
-    Loose, deliberately. A ceiling that is never exceeded is worth more here
-    than a closer figure that sometimes is: this is what makes "a step that
-    cannot fit is never started" a bound rather than a hope (I12). The one
-    assumption is stated above and is a property of the tokenizer family, not
-    of this code -- a model tokenizing something other than bytes would need
-    this revisited, and the gateway is where that would be known (D11).
-    """
-    prompt = sum(_message_bytes(message) for message in messages)
-    overhead = PER_MESSAGE_TOKEN_OVERHEAD * len(messages)
-    schemas = sum(
-        len(tool.name.encode("utf-8"))
-        + len(tool.description.encode("utf-8"))
-        + len(json.dumps(tool.parameters).encode("utf-8"))
-        for tool in tools
-    )
-    return prompt + overhead + schemas
 
 
 def _usage_fields(usage: ModelUsage) -> dict[str, object]:
@@ -388,7 +338,12 @@ class AgentRuntime:
         trace: TraceContext,
     ) -> AgentCheckpoint:
         self._preflight_model(
-            current.usage, spec.limits, current.messages, schemas, spec.model_alias
+            current.usage,
+            spec.limits,
+            current.messages,
+            schemas,
+            spec.model_alias,
+            prompt_version,
         )
         request = CompletionRequest(
             alias=spec.model_alias,
@@ -398,7 +353,7 @@ class AgentRuntime:
             # `max_tokens` bounds the *completion*, while the reservation is a
             # total. Sending the reservation here would let a call cost the
             # prompt on top of everything that was checked for.
-            max_tokens=self._completion_allowance(current.messages, schemas),
+            max_tokens=self._completion_allowance(current.messages, schemas, spec.model_alias),
         )
         span = self._tracer.generation_span(
             trace_id=trace.trace_id,
@@ -658,23 +613,6 @@ class AgentRuntime:
             key, current.model_copy(update={"usage": _add(current.usage, spend)})
         )
 
-    def _price(self, alias: str) -> TokenPricing:
-        """What a token costs on this alias, or a refusal.
-
-        An alias whose bindings carry no prices cannot be cost-bounded before a
-        call, and I12 asks for a step that cannot fit to never be *started* --
-        so it is refused rather than run against a declared figure nothing
-        checks. The prices are validated configuration (`steward_llm.config`),
-        which is why this can trust them.
-        """
-        pricing = self._client.pricing_for(alias)
-        if pricing is None:
-            raise BudgetExceeded(
-                f"{alias!r} declares no token prices, so this step cannot be bounded "
-                "in dollars before it runs"
-            )
-        return pricing
-
     def _preflight_model(
         self,
         used: RunBudget,
@@ -682,6 +620,7 @@ class AgentRuntime:
         messages: tuple[Message, ...],
         tools: tuple[ToolSchema, ...],
         alias: str,
+        prompt_version: str,
     ) -> None:
         """Refuse a model step whose worst case does not fit what is left.
 
@@ -691,17 +630,36 @@ class AgentRuntime:
         request carries. A step is started only when the two together fit, so
         the call cannot come back having spent more than was checked for.
         """
-        ceiling = _prompt_token_ceiling(messages, tools)
-        allowance = self._completion_allowance(messages, tools)
+        request = CompletionRequest(
+            alias=alias,
+            messages=messages,
+            prompt_version=prompt_version,
+            tools=tools,
+            max_tokens=self._reservation.tokens,
+        )
+        # Bounded by the client, over the body the transport will send and the
+        # template allowance the alias's configuration declares. The runtime does
+        # not invent either number: a bound this package made up for a model it
+        # has never seen would be a guess (I12, I14).
+        bound = self._client.prompt_ceiling(request, max_tokens=self._reservation.tokens)
+        if bound is None:
+            raise BudgetExceeded(
+                f"{alias!r} declares no model_info, so this step can be bounded neither "
+                "in tokens nor in dollars before it runs"
+            )
+        ceiling = bound
+        allowance = max(1, self._reservation.tokens - ceiling)
         # The cost bound is computed, not declared: the most this call can cost
         # is its bounded prompt at the input price plus its bounded completion
         # at the output price. `ModelReservation.cost_usd` is the *ceiling a
         # caller is willing to pay* and the larger of the two is reserved, so a
         # cheap alias does not get charged an expensive caller's guess and an
         # expensive one is not started on an optimistic one.
-        priced = self._price(alias).ceiling(
-            prompt_tokens=ceiling, completion_tokens=allowance
+        priced = self._client.cost_ceiling(
+            alias, prompt_tokens=ceiling, completion_tokens=allowance
         )
+        if priced is None:  # pragma: no cover -- prompt_ceiling already refused
+            raise BudgetExceeded(f"{alias!r} declares no token prices")
         reserved = RunBudget(
             steps=1,
             tokens=max(self._reservation.tokens, ceiling),
@@ -717,7 +675,7 @@ class AgentRuntime:
             )
 
     def _completion_allowance(
-        self, messages: tuple[Message, ...], tools: tuple[ToolSchema, ...]
+        self, messages: tuple[Message, ...], tools: tuple[ToolSchema, ...], alias: str
     ) -> int:
         """What is left of the reservation once the prompt's ceiling is paid for.
 
@@ -725,7 +683,15 @@ class AgentRuntime:
         the prompt bounded above and the completion bounded here, the call's
         total cannot exceed the reservation the preflight approved.
         """
-        return max(1, self._reservation.tokens - _prompt_token_ceiling(messages, tools))
+        request = CompletionRequest(
+            alias=alias,
+            messages=messages,
+            prompt_version="preflight",
+            tools=tools,
+            max_tokens=self._reservation.tokens,
+        )
+        bound = self._client.prompt_ceiling(request, max_tokens=self._reservation.tokens)
+        return max(1, self._reservation.tokens - (bound or 0))
 
     @staticmethod
     def _preflight_tool(used: RunBudget, cap: RunBudget, wall_clock: timedelta) -> None:

@@ -28,9 +28,15 @@ from steward_llm.config import (
 from steward_llm.endpoints import EndpointAllowlist, NonApprovedEndpoint
 from steward_llm.validate import main as validate_main
 
-PRICES = {"input_cost_per_token": "0.0000001", "output_cost_per_token": "0.0000003"}
+PRICES = {
+    "input_cost_per_token": "0.0000001",
+    "output_cost_per_token": "0.0000003",
+    "chat_template_tokens_per_message": 8,
+}
 PRICING = TokenPricing(
-    input_cost_per_token=Decimal("0.0000001"), output_cost_per_token=Decimal("0.0000003")
+    input_cost_per_token=Decimal("0.0000001"),
+    output_cost_per_token=Decimal("0.0000003"),
+    chat_template_tokens_per_message=8,
 )
 
 APPROVED = "http://vllm-reasoning-a.steward-inference.svc.cluster.local:8000/v1"
@@ -341,6 +347,7 @@ def yaml_config(api_base: str | None) -> str:
             "    model_info:",
             "      input_cost_per_token: 0.0000001",
             "      output_cost_per_token: 0.0000003",
+            "      chat_template_tokens_per_message: 8",
         ]
     return "\n".join(lines) + "\n"
 

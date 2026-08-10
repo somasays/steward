@@ -28,6 +28,7 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000010
       output_cost_per_token: 0.00000030
+      chat_template_tokens_per_message: 8
   - model_name: steward-reasoning
     litellm_params:
       model: hosted_vllm/qwen3-32b-instruct
@@ -36,6 +37,7 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000010
       output_cost_per_token: 0.00000030
+      chat_template_tokens_per_message: 8
 
   - model_name: steward-fast
     litellm_params:
@@ -45,6 +47,7 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000010
       output_cost_per_token: 0.00000030
+      chat_template_tokens_per_message: 8
   - model_name: steward-fast
     litellm_params:
       model: hosted_vllm/qwen3-8b-instruct
@@ -53,6 +56,7 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000010
       output_cost_per_token: 0.00000030
+      chat_template_tokens_per_message: 8
 
   - model_name: steward-classify
     litellm_params:
@@ -62,6 +66,7 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000010
       output_cost_per_token: 0.00000030
+      chat_template_tokens_per_message: 8
   - model_name: steward-classify
     litellm_params:
       model: hosted_vllm/qwen3-7b-classify
@@ -70,6 +75,7 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000010
       output_cost_per_token: 0.00000030
+      chat_template_tokens_per_message: 8
 
   - model_name: steward-embed
     litellm_params:
@@ -79,6 +85,7 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000010
       output_cost_per_token: 0.00000030
+      chat_template_tokens_per_message: 8
   - model_name: steward-embed
     litellm_params:
       model: hosted_vllm/bge-m3
@@ -87,6 +94,7 @@ model_list:
     model_info:
       input_cost_per_token: 0.00000010
       output_cost_per_token: 0.00000030
+      chat_template_tokens_per_message: 8
 
 router_settings:
   routing_strategy: latency-based-routing

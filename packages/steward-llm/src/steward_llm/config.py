@@ -115,6 +115,30 @@ class TokenPricing:
 
     input_cost_per_token: Decimal
     output_cost_per_token: Decimal
+    chat_template_tokens_per_message: int
+    """What this model's chat template adds per message, as a ceiling.
+
+    Model-specific and configured rather than a constant in the code, because it
+    is a property of the deployed model's template and differs between them. It
+    was an undocumented `8` in the agent runtime, which could not establish
+    anything: a bound the code invents for a model it has never seen is a guess
+    wearing a ceiling's name. Declared here, it is validated at startup and
+    changes with a values file rather than a release (I14, G5).
+    """
+
+    def __post_init__(self) -> None:
+        for name, price in (
+            ("input_cost_per_token", self.input_cost_per_token),
+            ("output_cost_per_token", self.output_cost_per_token),
+        ):
+            # A NaN price makes every comparison below false, so an alias priced
+            # with one would pass any budget check ever made against it; an
+            # infinite one refuses every call; a negative one *funds* a run by
+            # being used. None of the three is a price.
+            if not price.is_finite() or price < 0:
+                raise InvalidGatewayConfig(f"{name} must be a finite, non-negative price")
+        if self.chat_template_tokens_per_message < 0:
+            raise InvalidGatewayConfig("chat_template_tokens_per_message cannot be negative")
 
     def ceiling(self, *, prompt_tokens: int, completion_tokens: int) -> Decimal:
         """The most this call can cost, given bounds on both halves."""
@@ -199,8 +223,8 @@ def _validate_binding(binding: ModelBinding, allowlist: EndpointAllowlist) -> No
     # one that breaches I15.
     if binding.pricing is None and binding.model != PASS_THROUGH_MODEL:
         raise InvalidGatewayConfig(
-            f"{binding.alias!r} declares no model_info prices, so a call on it cannot be "
-            "bounded in dollars before it is made (I12)"
+            f"{binding.alias!r} declares no model_info, so a call on it can be bounded "
+            "neither in tokens nor in dollars before it is made (I12)"
         )
 
 
@@ -289,6 +313,7 @@ def _pricing(info: object, where: str) -> TokenPricing | None:
         return TokenPricing(
             input_cost_per_token=Decimal(str(info["input_cost_per_token"])),
             output_cost_per_token=Decimal(str(info["output_cost_per_token"])),
+            chat_template_tokens_per_message=int(info["chat_template_tokens_per_message"]),
         )
     except KeyError as exc:
         raise InvalidGatewayConfig(f"{where}: model_info has no {exc.args[0]}") from exc
