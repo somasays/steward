@@ -92,6 +92,25 @@ type = "forbidden"
 source_modules = ["steward_agents", "steward_catalog", "steward_llm", "steward_orchestration", "steward_queue", "steward_retrieval", "steward_schemas", "steward_sdk", "steward_telemetry"]
 forbidden_modules = ["steward_api", "steward_workers"]
 
+# Services are siblings, not layers: ARCHITECTURE.md's flow is `services ->
+# packages`, and one service reaching into another's internals is not a
+# direction the architecture contemplates. The API and the worker share
+# everything they legitimately share through `packages/`. Their *test* trees are
+# a different matter and outside import-linter's reach entirely -- #69's
+# acceptance proof enters through the API on purpose -- so that edge is declared
+# by hand in `services/workers/pyproject.toml` instead.
+[[tool.importlinter.contracts]]
+name = "services do not import each other (I4)"
+type = "forbidden"
+source_modules = ["steward_api"]
+forbidden_modules = ["steward_workers"]
+
+[[tool.importlinter.contracts]]
+name = "the worker does not import the API service (I4)"
+type = "forbidden"
+source_modules = ["steward_workers"]
+forbidden_modules = ["steward_api"]
+
 [[tool.importlinter.contracts]]
 name = "steward-agents depends only on its declared edges (I4)"
 type = "forbidden"

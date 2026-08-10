@@ -1201,6 +1201,14 @@ class TestNothingOnTheHandlerThreadIsFatal:
 
 
 class TestConcurrency:
+    """Also the regression pin for `runs.record_usage`'s lock ordering.
+
+    These two tests are what fails -- reliably, within three runs -- if the run
+    and task usage updates are swapped back: two workers settling two tasks of
+    one run deadlock on the `runs` tuple. They are named in that function's
+    comment so a future change that reorders it knows what will catch it.
+    """
+
     async def test_two_workers_never_execute_a_task_twice(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]
     ) -> None:

@@ -106,6 +106,21 @@ class ProxyConfig:
         parsed = urlparse(self.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise InvalidProxyConfig(f"{self.base_url!r} is not an http(s) URL")
+        if parsed.username or parsed.password:
+            # Refused rather than stripped, and the message never quotes the
+            # URL: userinfo is a credential, and this object's whole promise is
+            # that the credential is in one field that no representation
+            # reaches. A URL carrying one would put it in `base_url` -- which
+            # *is* in the repr, the startup log line, and every error below.
+            raise InvalidProxyConfig(
+                "the proxy URL carries userinfo; put the credential in "
+                f"{PROXY_KEY_ENV} instead, where it is kept out of logs"
+            )
+        if parsed.query or parsed.fragment:
+            raise InvalidProxyConfig(
+                f"the proxy URL must be a base address; {self.base_url.split('?')[0]!r} "
+                "with a query or fragment is not one, and either can carry a token"
+            )
         if parsed.scheme == "http" and parsed.hostname not in INSECURE_HOSTS:
             raise InvalidProxyConfig(
                 f"{self.base_url} is plaintext and {parsed.hostname} is not a loopback "
@@ -190,6 +205,7 @@ class LiteLLMProxyTransport:
         connection.
         """
         counted = 0
+        calls = _ToolCallBuffer()
         try:
             async with self._client.stream(
                 "POST",
@@ -201,7 +217,7 @@ class LiteLLMProxyTransport:
                     await response.aread()
                     raise CompletionFailed(
                         f"gateway returned {response.status_code} for "
-                        f"{call.request.alias!r}: {_detail(response)}",
+                        f"{call.request.alias!r}: {_detail(response, self._config.api_key)}",
                         alias=call.request.alias,
                         usage=ModelUsage.nothing(),
                     )
@@ -209,7 +225,7 @@ class LiteLLMProxyTransport:
                     frame = _frame(line)
                     if frame is None:
                         continue
-                    for chunk in _chunks(frame, counted):
+                    for chunk in _chunks(frame, counted, calls):
                         counted += chunk.usage.completion_tokens
                         yield chunk
         except httpx.TimeoutException as exc:
@@ -230,16 +246,26 @@ class LiteLLMProxyTransport:
             ) from exc
 
 
-def _detail(response: httpx.Response) -> str:
-    """A non-2xx body, trimmed, and never the request that caused it."""
+def _detail(response: httpx.Response, secret: str) -> str:
+    """A non-2xx body, trimmed, redacted, and never the request that caused it.
+
+    Redacted because the body is the *remote* end's text and we do not control
+    it: a proxy that echoes the Authorization header into an error message --
+    some do, when reporting an auth failure -- would otherwise put our key
+    inside an owned exception, which is a traceback away from a log aggregator.
+    """
     try:
         payload = response.json()
     except ValueError:
-        return response.text[:200]
+        return _redact(response.text, secret)
     error = payload.get("error") if isinstance(payload, dict) else None
     if isinstance(error, dict):
-        return str(error.get("message", ""))[:200]
-    return str(payload)[:200]
+        return _redact(str(error.get("message", "")), secret)
+    return _redact(str(payload), secret)
+
+
+def _redact(text: str, secret: str) -> str:
+    return text.replace(secret, REDACTED)[:200] if secret else text[:200]
 
 
 def _message(message: Any) -> dict[str, Any]:
@@ -289,7 +315,57 @@ def _frame(line: str) -> dict[str, Any] | None:
     return frame
 
 
-def _chunks(frame: dict[str, Any], counted: int) -> list[CompletionChunk]:
+@dataclass
+class _ToolCallBuffer:
+    """Tool-call fragments, assembled by choice and index.
+
+    The streaming protocol splits a tool call across deltas: the first carries
+    `id` and `function.name`, the rest carry slices of `function.arguments` and
+    commonly omit both. They are correlated by `index` within a choice, not by
+    id, because most of the fragments do not have one.
+
+    Emitting one `ToolCall` per delta -- which is what this replaced -- produced
+    a call per fragment with an empty id and name and a fragment of JSON for
+    arguments, and the client above appends rather than merges, so a run would
+    have seen three malformed calls instead of one good one. The test that
+    passed did so by putting the whole call in a single delta, which is not how
+    a gateway streams.
+    """
+
+    parts: dict[tuple[int, int], dict[str, str]] = field(default_factory=dict)
+
+    def absorb(self, choice: int, delta: Mapping[str, Any]) -> None:
+        for position, call in enumerate(delta.get("tool_calls") or ()):
+            index = int(call.get("index", position))
+            function = call.get("function") or {}
+            part = self.parts.setdefault(
+                (choice, index), {"id": "", "name": "", "arguments": ""}
+            )
+            # First non-empty wins for identity, and arguments accumulate: a
+            # later fragment that omits the id must not erase the one that had
+            # it.
+            part["id"] = part["id"] or str(call.get("id") or "")
+            part["name"] = part["name"] or str(function.get("name") or "")
+            part["arguments"] += str(function.get("arguments") or "")
+
+    def complete(self) -> list[ToolCall]:
+        """The assembled calls, in the order the stream introduced them.
+
+        Called when a choice finishes, because that is the first moment a call
+        is known to be whole -- there is no per-call terminator in the protocol.
+        """
+        assembled = [
+            ToolCall(id=part["id"], name=part["name"], arguments=part["arguments"])
+            for _, part in sorted(self.parts.items())
+            if part["name"]
+        ]
+        self.parts.clear()
+        return assembled
+
+
+def _chunks(
+    frame: dict[str, Any], counted: int, calls: _ToolCallBuffer
+) -> list[CompletionChunk]:
     """The increments one frame carries.
 
     A frame is either a delta (content, or part of a tool call) or the usage
@@ -316,18 +392,12 @@ def _chunks(frame: dict[str, Any], counted: int) -> list[CompletionChunk]:
                     ),
                 )
             )
-        for call in delta.get("tool_calls") or ():
-            function = call.get("function") or {}
-            chunks.append(
-                CompletionChunk(
-                    tool_call=ToolCall(
-                        id=str(call.get("id") or ""),
-                        name=str(function.get("name") or ""),
-                        arguments=str(function.get("arguments") or ""),
-                    )
-                )
-            )
+        calls.absorb(int(choice.get("index", 0)), delta)
         if finish:
+            # Assembled first, then the terminator: the client reads chunks in
+            # order, so a finish reason arriving before the calls it belongs to
+            # would end the answer without them.
+            chunks.extend(CompletionChunk(tool_call=call) for call in calls.complete())
             chunks.append(CompletionChunk(finish_reason=_finish(finish)))
     if isinstance(usage, dict):
         chunks.append(

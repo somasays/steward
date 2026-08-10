@@ -44,6 +44,7 @@ from steward_llm import (
     Message,
     ModelUsage,
     Role,
+    TokenPricing,
     ToolCall,
     ToolSchema,
 )
@@ -386,7 +387,9 @@ class AgentRuntime:
         output_model: type[BaseModel],
         trace: TraceContext,
     ) -> AgentCheckpoint:
-        self._preflight_model(current.usage, spec.limits, current.messages, schemas)
+        self._preflight_model(
+            current.usage, spec.limits, current.messages, schemas, spec.model_alias
+        )
         request = CompletionRequest(
             alias=spec.model_alias,
             messages=current.messages,
@@ -655,12 +658,30 @@ class AgentRuntime:
             key, current.model_copy(update={"usage": _add(current.usage, spend)})
         )
 
+    def _price(self, alias: str) -> TokenPricing:
+        """What a token costs on this alias, or a refusal.
+
+        An alias whose bindings carry no prices cannot be cost-bounded before a
+        call, and I12 asks for a step that cannot fit to never be *started* --
+        so it is refused rather than run against a declared figure nothing
+        checks. The prices are validated configuration (`steward_llm.config`),
+        which is why this can trust them.
+        """
+        pricing = self._client.pricing_for(alias)
+        if pricing is None:
+            raise BudgetExceeded(
+                f"{alias!r} declares no token prices, so this step cannot be bounded "
+                "in dollars before it runs"
+            )
+        return pricing
+
     def _preflight_model(
         self,
         used: RunBudget,
         cap: RunBudget,
         messages: tuple[Message, ...],
         tools: tuple[ToolSchema, ...],
+        alias: str,
     ) -> None:
         """Refuse a model step whose worst case does not fit what is left.
 
@@ -671,10 +692,20 @@ class AgentRuntime:
         the call cannot come back having spent more than was checked for.
         """
         ceiling = _prompt_token_ceiling(messages, tools)
+        allowance = self._completion_allowance(messages, tools)
+        # The cost bound is computed, not declared: the most this call can cost
+        # is its bounded prompt at the input price plus its bounded completion
+        # at the output price. `ModelReservation.cost_usd` is the *ceiling a
+        # caller is willing to pay* and the larger of the two is reserved, so a
+        # cheap alias does not get charged an expensive caller's guess and an
+        # expensive one is not started on an optimistic one.
+        priced = self._price(alias).ceiling(
+            prompt_tokens=ceiling, completion_tokens=allowance
+        )
         reserved = RunBudget(
             steps=1,
             tokens=max(self._reservation.tokens, ceiling),
-            cost_usd=self._reservation.cost_usd,
+            cost_usd=max(self._reservation.cost_usd, priced),
             wall_clock=self._reservation.wall_clock,
         )
         self._require_fit(_add(used, reserved), cap, "model")

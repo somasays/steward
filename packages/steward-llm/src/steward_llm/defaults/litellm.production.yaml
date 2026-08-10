@@ -10,6 +10,14 @@
 # api_base is mandatory on every entry: an entry without one resolves to its
 # provider's hosted API, which is the quietest way to breach I15. The startup
 # check refuses a config where any entry omits it.
+#
+# model_info is mandatory too, and for a different guarantee. I12 requires a
+# step that cannot fit its budget never to be *started*, and cost is only
+# knowable before a call if the price of a token is known before it: these
+# figures are what turn `max_tokens` and the prompt ceiling into a dollar bound
+# the agent loop can check. An alias whose entries do not carry them cannot be
+# used by a model-backed handler at all -- refused at startup rather than
+# discovered when the bill arrives (`steward_llm.pricing`).
 
 model_list:
   - model_name: steward-reasoning
@@ -17,44 +25,68 @@ model_list:
       model: hosted_vllm/qwen3-32b-instruct
       api_base: http://vllm-reasoning-a.steward-inference.svc.cluster.local:8000/v1
       api_key: os.environ/VLLM_API_KEY
+    model_info:
+      input_cost_per_token: 0.00000010
+      output_cost_per_token: 0.00000030
   - model_name: steward-reasoning
     litellm_params:
       model: hosted_vllm/qwen3-32b-instruct
       api_base: http://vllm-reasoning-b.steward-inference.svc.cluster.local:8000/v1
       api_key: os.environ/VLLM_API_KEY
+    model_info:
+      input_cost_per_token: 0.00000010
+      output_cost_per_token: 0.00000030
 
   - model_name: steward-fast
     litellm_params:
       model: hosted_vllm/qwen3-8b-instruct
       api_base: http://vllm-fast-a.steward-inference.svc.cluster.local:8000/v1
       api_key: os.environ/VLLM_API_KEY
+    model_info:
+      input_cost_per_token: 0.00000010
+      output_cost_per_token: 0.00000030
   - model_name: steward-fast
     litellm_params:
       model: hosted_vllm/qwen3-8b-instruct
       api_base: http://vllm-fast-b.steward-inference.svc.cluster.local:8000/v1
       api_key: os.environ/VLLM_API_KEY
+    model_info:
+      input_cost_per_token: 0.00000010
+      output_cost_per_token: 0.00000030
 
   - model_name: steward-classify
     litellm_params:
       model: hosted_vllm/qwen3-7b-classify
       api_base: http://vllm-classify-a.steward-inference.svc.cluster.local:8000/v1
       api_key: os.environ/VLLM_API_KEY
+    model_info:
+      input_cost_per_token: 0.00000010
+      output_cost_per_token: 0.00000030
   - model_name: steward-classify
     litellm_params:
       model: hosted_vllm/qwen3-7b-classify
       api_base: http://vllm-classify-b.steward-inference.svc.cluster.local:8000/v1
       api_key: os.environ/VLLM_API_KEY
+    model_info:
+      input_cost_per_token: 0.00000010
+      output_cost_per_token: 0.00000030
 
   - model_name: steward-embed
     litellm_params:
       model: hosted_vllm/bge-m3
       api_base: http://vllm-embed-a.steward-inference.svc.cluster.local:8000/v1
       api_key: os.environ/VLLM_API_KEY
+    model_info:
+      input_cost_per_token: 0.00000010
+      output_cost_per_token: 0.00000030
   - model_name: steward-embed
     litellm_params:
       model: hosted_vllm/bge-m3
       api_base: http://vllm-embed-b.steward-inference.svc.cluster.local:8000/v1
       api_key: os.environ/VLLM_API_KEY
+    model_info:
+      input_cost_per_token: 0.00000010
+      output_cost_per_token: 0.00000030
 
 router_settings:
   routing_strategy: latency-based-routing

@@ -78,6 +78,7 @@ class _LangfuseSpan:
     def __init__(self, observation: _Observation) -> None:
         self._observation = observation
         self._recorded = False
+        self._measurements: dict[str, object] = {}
 
     def record(self, outcome: SpanOutcome, detail: str | None = None) -> None:
         if self._recorded:
@@ -93,7 +94,11 @@ class _LangfuseSpan:
         number. Metadata is where Langfuse expects per-observation detail, and
         it survives a later `record`.
         """
-        self._observation.update(metadata=dict(measurements))
+        # Merged, because `Span.observe` promises "later keys win" -- and
+        # `update(metadata=...)` *replaces* the dict, so a second call with
+        # partial information would silently drop the first call's keys.
+        self._measurements.update(measurements)
+        self._observation.update(metadata=dict(self._measurements))
 
 
 class LangfuseTracer:

@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 
@@ -102,6 +103,28 @@ class InvalidGatewayConfig(GatewayConfigError):
 
 
 @dataclass(frozen=True, slots=True)
+class TokenPricing:
+    """What a token costs on this binding, in dollars.
+
+    Configuration rather than code (I14), and required on production entries
+    because I12's "a step that cannot fit is never started" is unenforceable in
+    the cost dimension without it: a cost cap you can only evaluate after the
+    call is an audit fence. With these two numbers the agent loop can bound a
+    call at `prompt_ceiling x input + max_tokens x output` *before* sending it.
+    """
+
+    input_cost_per_token: Decimal
+    output_cost_per_token: Decimal
+
+    def ceiling(self, *, prompt_tokens: int, completion_tokens: int) -> Decimal:
+        """The most this call can cost, given bounds on both halves."""
+        return (
+            self.input_cost_per_token * prompt_tokens
+            + self.output_cost_per_token * completion_tokens
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ModelBinding:
     """One destination the gateway can reach: the alias callers use, the model LiteLLM
     routes to, and the base URL it is sent to (absent when the provider decides). A
@@ -110,6 +133,9 @@ class ModelBinding:
     alias: str
     model: str
     api_base: str | None
+    pricing: TokenPricing | None = None
+    """Absent only where it cannot be known -- a pass-through route names no
+    model. A production `model_list` entry without it is refused."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +193,14 @@ def _validate_binding(binding: ModelBinding, allowlist: EndpointAllowlist) -> No
         raise NonApprovedEndpoint(
             f"{binding.alias!r} resolves to {binding.api_base}, which is not an approved "
             "self-hosted endpoint (I15)"
+        )
+    # Last, deliberately: a config that is both off-allowlist and unpriced has a
+    # more urgent problem than its prices, and an operator should be told the
+    # one that breaches I15.
+    if binding.pricing is None and binding.model != PASS_THROUGH_MODEL:
+        raise InvalidGatewayConfig(
+            f"{binding.alias!r} declares no model_info prices, so a call on it cannot be "
+            "bounded in dollars before it is made (I12)"
         )
 
 
@@ -234,7 +268,32 @@ def _binding(entry: object, source: str, index: int) -> ModelBinding:
     api_base = params.get("api_base")
     if api_base is not None and not isinstance(api_base, str):
         raise InvalidGatewayConfig(f"{where} has a non-string api_base")
-    return ModelBinding(alias=alias, model=model, api_base=api_base)
+    return ModelBinding(
+        alias=alias, model=model, api_base=api_base, pricing=_pricing(entry.get("model_info"), where)
+    )
+
+
+def _pricing(info: object, where: str) -> TokenPricing | None:
+    """The entry's token prices, or None when it declares none.
+
+    Parsed as `Decimal` from the *string form* of whatever YAML produced: a
+    price read as a float and multiplied by a token count accumulates the error
+    that makes a cost cap approximate, and this is the one number a budget is
+    checked against.
+    """
+    if info is None:
+        return None
+    if not isinstance(info, dict):
+        raise InvalidGatewayConfig(f"{where}: model_info is not a mapping")
+    try:
+        return TokenPricing(
+            input_cost_per_token=Decimal(str(info["input_cost_per_token"])),
+            output_cost_per_token=Decimal(str(info["output_cost_per_token"])),
+        )
+    except KeyError as exc:
+        raise InvalidGatewayConfig(f"{where}: model_info has no {exc.args[0]}") from exc
+    except (ArithmeticError, ValueError) as exc:
+        raise InvalidGatewayConfig(f"{where}: model_info prices are not numbers ({exc})") from exc
 
 
 def load_litellm_config(path: Path) -> tuple[ModelBinding, ...]:

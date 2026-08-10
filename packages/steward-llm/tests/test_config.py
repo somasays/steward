@@ -5,6 +5,7 @@ reaching a hosted API fails, so "approved is accepted" and "non-approved is refu
 are proved against the file this repo actually ships.
 """
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from steward_llm.config import (
     GatewayConfig,
     InvalidGatewayConfig,
     ModelBinding,
+    TokenPricing,
     committed_production_config,
     gateway_config_from_env,
     load_approved_endpoints,
@@ -26,6 +28,11 @@ from steward_llm.config import (
 from steward_llm.endpoints import EndpointAllowlist, NonApprovedEndpoint
 from steward_llm.validate import main as validate_main
 
+PRICES = {"input_cost_per_token": "0.0000001", "output_cost_per_token": "0.0000003"}
+PRICING = TokenPricing(
+    input_cost_per_token=Decimal("0.0000001"), output_cost_per_token=Decimal("0.0000003")
+)
+
 APPROVED = "http://vllm-reasoning-a.steward-inference.svc.cluster.local:8000/v1"
 ALLOWLIST = EndpointAllowlist.from_urls([APPROVED])
 
@@ -33,7 +40,12 @@ ALLOWLIST = EndpointAllowlist.from_urls([APPROVED])
 def bindings(**overrides: ModelBinding) -> tuple[ModelBinding, ...]:
     """A complete production routing table, with named aliases replaced."""
     table = {
-        alias: ModelBinding(alias=alias, model="hosted_vllm/qwen3-32b-instruct", api_base=APPROVED)
+        alias: ModelBinding(
+            alias=alias,
+            model="hosted_vllm/qwen3-32b-instruct",
+            api_base=APPROVED,
+            pricing=PRICING,
+        )
         for alias in sorted(PRODUCTION_ALIASES)
     }
     table.update({binding.alias: binding for binding in overrides.values()})
@@ -79,6 +91,7 @@ class TestProductionRefusals:
                     alias="steward-reasoning",
                     model="hosted_vllm/qwen3-32b-instruct",
                     api_base="https://api.openai.com/v1",
+                    pricing=PRICING,
                 )
             )
 
@@ -89,18 +102,31 @@ class TestProductionRefusals:
                     alias="steward-fast",
                     model="hosted_vllm/qwen3-8b-instruct",
                     api_base="http://vllm-rogue.other.svc.cluster.local:8000/v1",
+                    pricing=PRICING,
                 )
             )
 
     def test_a_missing_api_base_refuses(self) -> None:
         """No URL at all is the quietest breach: the provider's own API is the default."""
         with pytest.raises(NonApprovedEndpoint, match="no api_base"):
-            config(fast=ModelBinding(alias="steward-fast", model="claude-sonnet-5", api_base=None))
+            config(
+                fast=ModelBinding(
+                    alias="steward-fast",
+                    model="claude-sonnet-5",
+                    api_base=None,
+                    pricing=PRICING,
+                )
+            )
 
     def test_a_provider_routed_model_refuses_even_on_an_approved_url(self) -> None:
         with pytest.raises(NonApprovedEndpoint, match="chooses the destination"):
             config(
-                fast=ModelBinding(alias="steward-fast", model="anthropic/claude-sonnet-5", api_base=APPROVED)
+                fast=ModelBinding(
+                    alias="steward-fast",
+                    model="anthropic/claude-sonnet-5",
+                    api_base=APPROVED,
+                    pricing=PRICING,
+                )
             )
 
     def test_an_empty_allowlist_refuses(self) -> None:
@@ -121,7 +147,12 @@ class TestProductionRefusals:
         """Every model_list entry is validated, not only the named aliases — LiteLLM can
         route to anything in the file through a fallback chain."""
         table = bindings() + (
-            ModelBinding(alias="scratch", model="openai/gpt-5", api_base="https://api.openai.com/v1"),
+            ModelBinding(
+                alias="scratch",
+                model="openai/gpt-5",
+                api_base="https://api.openai.com/v1",
+                pricing=PRICING,
+            ),
         )
         with pytest.raises(NonApprovedEndpoint):
             GatewayConfig(mode=DeploymentMode.PRODUCTION, source="test", bindings=table, allowlist=ALLOWLIST)
@@ -133,7 +164,12 @@ class TestDevelopmentMode:
             mode=DeploymentMode.DEVELOPMENT,
             source="test",
             allowlist=EndpointAllowlist.from_urls([]),
-            bindings=(ModelBinding(alias="steward-fast", model="claude-haiku-4-5", api_base=None),),
+            bindings=(ModelBinding(
+                alias="steward-fast",
+                model="claude-haiku-4-5",
+                api_base=None,
+                pricing=PRICING,
+            ),),
         )
         assert validated.mode is DeploymentMode.DEVELOPMENT
 
@@ -160,6 +196,7 @@ class TestPassThroughRoutes:
                 {
                     "model_name": alias,
                     "litellm_params": {"model": "hosted_vllm/qwen3-8b", "api_base": APPROVED},
+                    "model_info": PRICES,
                 }
                 for alias in sorted(PRODUCTION_ALIASES)
             ]
@@ -208,6 +245,7 @@ class TestPassThroughRoutes:
                         {
                             "model_name": "steward-fast",
                             "litellm_params": {"model": "hosted_vllm/x", "api_base": APPROVED},
+                            "model_info": PRICES,
                         }
                     ],
                     "general_settings": settings,
@@ -221,6 +259,7 @@ class TestPassThroughRoutes:
                 {
                     "model_name": "steward-fast",
                     "litellm_params": {"model": "hosted_vllm/x", "api_base": APPROVED},
+                    "model_info": PRICES,
                 }
             ]
         }
@@ -235,11 +274,17 @@ class TestParsing:
                 {
                     "model_name": "steward-fast",
                     "litellm_params": {"model": "hosted_vllm/qwen3-8b", "api_base": APPROVED},
+                    "model_info": PRICES,
                 }
             ]
         }
         assert parse_litellm_config(document, "test") == (
-            ModelBinding(alias="steward-fast", model="hosted_vllm/qwen3-8b", api_base=APPROVED),
+            ModelBinding(
+                alias="steward-fast",
+                model="hosted_vllm/qwen3-8b",
+                api_base=APPROVED,
+                pricing=PRICING,
+            ),
         )
 
     @pytest.mark.parametrize(
@@ -292,6 +337,11 @@ def yaml_config(api_base: str | None) -> str:
         lines.append("      model: hosted_vllm/qwen3-8b" if api_base else "      model: claude-sonnet-5")
         if api_base is not None:
             lines.append(f"      api_base: {api_base}")
+        lines += [
+            "    model_info:",
+            "      input_cost_per_token: 0.0000001",
+            "      output_cost_per_token: 0.0000003",
+        ]
     return "\n".join(lines) + "\n"
 
 

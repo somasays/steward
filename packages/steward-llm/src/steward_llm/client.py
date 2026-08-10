@@ -40,7 +40,7 @@ from steward_llm.completion import (
     ModelUsage,
     ToolCall,
 )
-from steward_llm.config import PASS_THROUGH_MODEL, GatewayConfig, ModelBinding
+from steward_llm.config import PASS_THROUGH_MODEL, GatewayConfig, ModelBinding, TokenPricing
 from steward_llm.errors import CompletionFailed, CompletionTimedOut, UnboundAlias
 from steward_llm.transport import GatewayCall, GatewayTransport
 
@@ -83,6 +83,18 @@ class LLMClient:
         self._config = config
         self._transport = transport
         self._bindings = _alias_index(config.bindings)
+
+    def pricing_for(self, alias: str) -> TokenPricing | None:
+        """What a token costs on `alias`, or None if its bindings do not say.
+
+        The most expensive binding wins: an alias is served by two endpoints
+        (SPEC §6) and the client does not choose between them, so a bound that
+        holds must assume the dearer one answered.
+        """
+        prices = [b.pricing for b in self._bindings.get(alias, ()) if b.pricing is not None]
+        if not prices:
+            return None
+        return max(prices, key=lambda p: p.input_cost_per_token + p.output_cost_per_token)
 
     @property
     def aliases(self) -> tuple[str, ...]:

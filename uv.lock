@@ -1859,6 +1859,11 @@ dependencies = [
     { name = "steward-telemetry" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "steward-api" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "steward-catalog", editable = "packages/steward-catalog" },
@@ -1866,6 +1871,9 @@ requires-dist = [
     { name = "steward-queue", editable = "packages/steward-queue" },
     { name = "steward-telemetry", editable = "packages/steward-telemetry" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "steward-api", editable = "services/api" }]
 
 [[package]]
 name = "tenacity"
