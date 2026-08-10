@@ -1546,7 +1546,14 @@ class TestWorkerStaysResponsive:
         worker = Worker(dsn, "w1", poll_interval=timedelta(milliseconds=50))
         loop_task = asyncio.create_task(worker.run_forever(stop))
 
-        await until(lambda: state_of(conn, spec.task_id) is TaskState.RUNNING)
+        # Wait for the *handler* to be in flight, not just for the row to say
+        # `running`: `mark_running` commits before the thread is spawned, so
+        # stopping on that signal can beat the handler to its first statement --
+        # and this test's premise is that a handler is running when the shutdown
+        # arrives. Same wait its sibling above uses; without it the sighting read
+        # below is a race that a slower machine loses (observed in CI, KeyError).
+        await until(lambda: spec.task_id in _sightings)
+        assert state_of(conn, spec.task_id) is TaskState.RUNNING
         stop.set()
         started = time.monotonic()
         await asyncio.wait_for(loop_task, timeout=5)
