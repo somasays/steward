@@ -179,15 +179,33 @@ WHERE id = %(id)s
 RETURNING used_steps, used_tokens, used_cost_usd, used_wall_clock
 """
 
+# The cap, enforced where the number is stored. Every path that charges a run
+# goes through this statement, so `LEAST` here is what makes "a run's recorded
+# spend cannot exceed its cap" a property of the database rather than of the
+# arithmetic each caller happened to do first (I12).
+#
+# Clamped rather than refused, and the difference matters. Refusing the write
+# would also refuse the transaction carrying it -- which is the one recording
+# the task as failed -- so an overspending handler would end with no terminal
+# state at all, left to lease recovery, and the operator would see a stuck task
+# instead of a budget failure. Clamping keeps the totals true to the cap and
+# keeps the failure loud. What it costs is that `used_*` under-reports a handler
+# that spent past its cap; the audit row says how much was asked for, so the
+# difference is visible rather than lost.
+#
+# Wall clock is deliberately unclamped. It is summed aggregate task time
+# (`RunBudget.wall_clock`), an over-estimate for anything running in parallel,
+# so capping it here would misreport runs that exceeded nothing an operator
+# would recognise as a duration.
 ADD_RUN_USAGE = """
 WITH previous AS (
     SELECT id, used_steps, used_tokens, used_cost_usd, used_wall_clock
     FROM runs WHERE id = %(id)s FOR UPDATE
 )
 UPDATE runs AS r
-SET used_steps = r.used_steps + %(steps)s,
-    used_tokens = r.used_tokens + %(tokens)s,
-    used_cost_usd = r.used_cost_usd + %(cost_usd)s,
+SET used_steps = LEAST(r.used_steps + %(steps)s, r.budget_steps),
+    used_tokens = LEAST(r.used_tokens + %(tokens)s, r.budget_tokens),
+    used_cost_usd = LEAST(r.used_cost_usd + %(cost_usd)s, r.budget_cost_usd),
     used_wall_clock = r.used_wall_clock + %(wall_clock)s,
     updated_at = now()
 FROM previous AS p
@@ -233,6 +251,16 @@ SELECT result FROM tasks WHERE id = %(id)s
 
 SELECT_CHECKPOINTS = """
 SELECT step, state FROM checkpoints WHERE task_id = %(task_id)s ORDER BY step
+"""
+
+# The fence. A handler runs on a thread the worker may already have walked away
+# from -- an expired lease, a reaped task, a retry now held by someone else --
+# and its connection is its own, so nothing stops it committing. Reading the
+# claim FOR UPDATE inside the writer's transaction is what makes "this attempt
+# still holds this task" true at the moment of the write rather than when the
+# handler started (I8, N1).
+SELECT_CLAIM_FOR_UPDATE = """
+SELECT claimed_by, attempts, state FROM tasks WHERE id = %(id)s FOR UPDATE
 """
 
 SELECT_LATEST_CHECKPOINT = """

@@ -358,8 +358,8 @@ def record_step_usage(
     }
     # Run first, then task -- the lock order `record_usage` documents.
     row = conn.execute(_sql.ADD_RUN_USAGE, {"id": run_id, **amounts}).fetchone()
-    conn.execute(_sql.ADD_TASK_USAGE, {"id": task_id, **amounts})
     before = require_row(row, "run usage update returned no row")
+    conn.execute(_sql.ADD_TASK_USAGE, {"id": task_id, **amounts})
     write_audit(
         conn,
         actor=actor,
@@ -368,7 +368,7 @@ def record_step_usage(
         entity_id=str(run_id),
         before=_usage_fields(budget_from(before[0], before[1], before[2], before[3])),
         after=_usage_fields(budget_from(before[4], before[5], before[6], before[7]))
-        | {"task_id": str(task_id), "step": True},
+        | {"task_id": str(task_id), "step": True, "requested": _usage_fields(amount)},
     )
 
 

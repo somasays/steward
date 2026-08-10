@@ -31,12 +31,14 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
-from steward_agents import SUBMIT_RESULT, ModelReservation
+from steward_agents import SUBMIT_RESULT, AgentCheckpoint, ModelReservation
 from steward_llm import (
     DeploymentMode,
     EndpointAllowlist,
     GatewayConfig,
+    Message,
     ModelBinding,
+    Role,
     StubGateway,
     StubReply,
     ToolCall,
@@ -46,8 +48,12 @@ from steward_orchestration import GoalParams, PlannedTask, goal, plan_run
 from steward_orchestration.registry import REGISTRY as GOAL_REGISTRY
 from steward_queue import (
     REGISTRY,
+    StaleClaim,
+    TaskContext,
     TaskState,
+    UsageLedger,
     Worker,
+    claim,
     create_run,
     enqueue,
     get_run,
@@ -59,7 +65,7 @@ from steward_queue import (
 from steward_queue.db import QueueConnection
 from steward_schemas import RunBudget, TaskSpec
 from steward_telemetry import Span, SpanOutcome
-from steward_workers.agent_tasks import AGENT_ECHO, build_agent_echo
+from steward_workers.agent_tasks import AGENT_ECHO, DurableCheckpointStore, build_agent_echo
 
 
 class StallsAfter:
@@ -544,3 +550,61 @@ async def _until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
             return
         await asyncio.sleep(0.02)
     raise AssertionError("condition never held")
+
+
+class TestStaleClaimFencing:
+    """A worker that lost its task must not keep writing about it (N1, D7)."""
+
+    async def test_a_stale_attempt_cannot_overwrite_a_live_one(
+        self, dsn: str, conn: QueueConnection
+    ) -> None:
+        """The race the recovery proof cannot see, because there the stalled
+        call never returns. Here it does: the lease expires, the task is reaped
+        and re-claimed, and only then does the old handler try to save."""
+        tracer = RecordingTracer()
+        stub = StubGateway({"steward-fast": uses_the_tool_then_submits()})
+        register_agent(dsn, uses_the_tool_then_submits(), tracer)
+        spec = planned(conn, max_attempts=2)
+
+        claimed = claim(conn, worker_id="w-stale")
+        conn.commit()
+        assert [task.spec.task_id for task in claimed] == [spec.task_id]
+        stale = DurableCheckpointStore(
+            TaskContext(
+                connection=conn,
+                spec=claimed[0].spec,
+                attempts=claimed[0].attempts,
+                claimed_by="w-stale",
+                trace_id=claimed[0].trace_id,
+                usage=UsageLedger(),
+            ),
+            dsn,
+        )
+        checkpoint = AgentCheckpoint(
+            messages=(Message(role=Role.USER, content="from the stale attempt"),),
+            usage=RunBudget(
+                steps=1, tokens=99, cost_usd=Decimal("0.09"), wall_clock=timedelta(0)
+            ),
+        )
+
+        # The lease expires and someone else takes the task.
+        conn.execute(
+            "UPDATE tasks SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+            (spec.task_id,),
+        )
+        conn.commit()
+        assert requeue_stale(conn)
+        conn.commit()
+        live = claim(conn, worker_id="w-live")
+        conn.commit()
+        assert [task.spec.task_id for task in live] == [spec.task_id]
+
+        with pytest.raises(StaleClaim):
+            await stale.save("k", checkpoint)
+        stale.close()
+
+        # Nothing of the stale attempt reached the database.
+        assert latest_checkpoint(conn, spec.task_id) is None
+        run = get_run(conn, spec.run_id)
+        assert run is not None and run.usage.tokens == 0
+        assert stub.calls == []

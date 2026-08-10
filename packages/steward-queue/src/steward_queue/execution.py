@@ -481,6 +481,7 @@ def _run_handler(
             connection=conn,
             spec=task.spec,
             attempts=task.attempts,
+            claimed_by=task.claimed_by,
             trace_id=task.trace_id,
             usage=usage,
         )

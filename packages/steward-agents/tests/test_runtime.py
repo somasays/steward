@@ -319,14 +319,18 @@ async def test_bad_tool_arguments_are_fed_back_once_then_fail() -> None:
     assert invoked == []
     fed_back = [m for m in stores.values["task-feedback"].messages if m.role is Role.TOOL]
     assert "invalid input" in fed_back[0].content
-    assert stores.values["task-feedback"].answered_with_feedback == ("call-bad",)
+    assert stores.values["task-feedback"].corrections == 1
 
 
 @pytest.mark.asyncio
-async def test_the_same_bad_call_twice_is_not_fed_back_again() -> None:
+async def test_a_second_bad_call_is_not_fed_back_even_under_a_fresh_id() -> None:
+    """The allowance is a count, not a set of ids. Keyed on ids, a model could
+    mint itself another correction by reissuing the same malformed call under a
+    new one -- a limit the party being limited controls."""
     bad = ToolCall(id="call-bad", name="echo", arguments='{"wrong":"shape"}')
+    renamed = ToolCall(id="call-bad-again", name="echo", arguments='{"wrong":"shape"}')
     llm, _ = client([
-        StubReply.completed("", tool_calls=(bad, bad), prompt_tokens=1, completion_tokens=1),
+        StubReply.completed("", tool_calls=(bad, renamed), prompt_tokens=1, completion_tokens=1),
     ])
     runtime = AgentRuntime(
         client=llm,

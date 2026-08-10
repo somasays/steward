@@ -39,7 +39,12 @@ def _ctx(conn: QueueConnection, spec: TaskSpec, attempts: int = 1) -> TaskContex
     """A handler context for a test: a trace to hang spans on, and a fresh
     per-attempt usage ledger (`steward_queue.usage`)."""
     return TaskContext(
-        connection=conn, spec=spec, attempts=attempts, trace_id="trace-test", usage=UsageLedger()
+        connection=conn,
+        spec=spec,
+        attempts=attempts,
+        claimed_by="w-test",
+        trace_id="trace-test",
+        usage=UsageLedger(),
     )
 
 

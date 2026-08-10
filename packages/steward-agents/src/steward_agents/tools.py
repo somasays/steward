@@ -98,7 +98,16 @@ class ToolRegistry:
         """Whether this agent may call `name` at all -- asked before execution."""
         return name in allowlist and name in self._tools
 
-    async def invoke(self, call: ToolCall, *, allowlist: frozenset[str]) -> BaseModel:
+    async def invoke(
+        self, call: ToolCall, *, allowlist: frozenset[str]
+    ) -> tuple[BaseModel, BaseModel]:
+        """Run one tool, returning what it was *given* and what it returned.
+
+        Both validated. The request is handed back because a trace of the raw
+        `call.arguments` shows what the model emitted, which is precisely what
+        has not been checked yet -- I7 asks for validated I/O, and the validated
+        input only exists here.
+        """
         if call.name not in allowlist:
             raise DisallowedTool(f"tool {call.name!r} is not allowed for this agent")
         tool = self._resolve(call.name)
@@ -110,7 +119,7 @@ class ToolRegistry:
             ) from exc
         response = await tool.handler(request)
         try:
-            return tool.output_model.model_validate(response)
+            return request, tool.output_model.model_validate(response)
         except ValidationError as exc:
             raise ToolValidationError(
                 f"invalid output from tool {call.name!r}: {exc}", blames_model=False
