@@ -442,6 +442,18 @@ class Worker:
             await self._record_failure(conn, task, unknown, span, NOTHING_SPENT)
             return True
 
+        if task.spec.budget.wall_clock <= timedelta(0):
+            # Nothing left of the cap, so there is nothing to run under it.
+            # `fail`'s admission refuses most of these an attempt earlier; this
+            # covers the ones it never saw (lease recovery, an operator
+            # requeue) -- and it has to exist, because `statement_timeout = 0`
+            # means *no limit* to Postgres, so an exhausted budget reaching the
+            # driver would remove the bound instead of enforcing it.
+            await self._record_failure(
+                conn, task, budget_exceeded(task.spec.budget), span, NOTHING_SPENT
+            )
+            return True
+
         handoff = Handoff()
         ledger = UsageLedger()
         finished = self._spawn(task, registration, handoff, ledger)

@@ -27,6 +27,7 @@ from steward_agents import (
     ToolRegistry,
     TraceContext,
 )
+from steward_agents.runtime import _prompt_token_ceiling
 from steward_llm import (
     DeploymentMode,
     EndpointAllowlist,
@@ -58,7 +59,7 @@ class FinalOutput(BaseModel):
 
 
 def budget(
-    *, steps: int = 5, tokens: int = 2000, cost: str = "1", wall_clock: timedelta | None = None
+    *, steps: int = 5, tokens: int = 40000, cost: str = "1", wall_clock: timedelta | None = None
 ) -> RunBudget:
     return RunBudget(
         steps=steps,
@@ -89,9 +90,11 @@ def spec(*, tools: tuple[str, ...] = ("echo",), limits: RunBudget | None = None)
     )
 
 
-def reservation(tokens: int = 400) -> ModelReservation:
+def reservation(tokens: int = 4000) -> ModelReservation:
     """The per-call worst case. `tokens` is a *total* — prompt plus completion —
-    so it has to be big enough to hold a realistic history, not just an answer."""
+    and the prompt is bounded by its UTF-8 byte length (a real ceiling, not an
+    estimate), so it has to be big enough to hold the history *and every tool
+    schema sent with it*, not just an answer."""
     return ModelReservation(
         tokens=tokens, cost_usd=Decimal("0.20"), wall_clock=timedelta(seconds=10)
     )
@@ -472,9 +475,13 @@ async def test_failed_model_usage_is_checkpointed_and_debited_before_resume() ->
     assert stores.values["task-4"].usage.cost_usd == Decimal("0.02")
     result = await execute()
     assert result.output == FinalOutput(answer="resumed")
-    assert result.usage.steps == 2
-    assert result.usage.tokens == 10
-    assert result.usage.cost_usd == Decimal("0.05")
+    # The resumed attempt reports *its own* spend, not the failed attempt's as
+    # well: the queue has already charged that one and already subtracted it
+    # from the cap this attempt was handed (`tasks.used_*`). Counting it here
+    # too would bill it twice and refuse resumes that are affordable.
+    assert result.usage.steps == 1
+    assert result.usage.tokens == 4
+    assert result.usage.cost_usd == Decimal("0.03")
     assert len(gateway.calls) == 2
 
 
@@ -507,7 +514,7 @@ async def test_a_prompt_that_fills_the_reservation_is_refused_before_the_call() 
         checkpoints=InMemoryCheckpointStore(),
         reservation=reservation(tokens=30),
     )
-    with pytest.raises(BudgetExceeded, match="prompt alone"):
+    with pytest.raises(BudgetExceeded, match="the prompt is at most"):
         await runtime.run(
             key="task-bloated",
             spec=spec(tools=()),
@@ -526,17 +533,24 @@ async def test_the_completion_allowance_is_the_reservation_minus_the_prompt() ->
         client=llm,
         tools=registry([]),
         checkpoints=InMemoryCheckpointStore(),
-        reservation=reservation(tokens=100),
+        reservation=reservation(tokens=1000),
     )
+    messages = (Message(role=Role.USER, content="x" * 90),)
     await runtime.run(
         key="task-allowance",
         spec=spec(tools=()),
         prompt_version="proof.v1",
-        messages=(Message(role=Role.USER, content="x" * 90),),  # ~30 tokens
+        messages=messages,
         output_model=FinalOutput,
         trace=TRACE,
     )
-    assert gateway.calls[0].request.max_tokens == 70
+    sent = gateway.calls[0].request
+    ceiling = _prompt_token_ceiling(messages, sent.tools)
+    assert sent.max_tokens == 1000 - ceiling
+    # The bound is what makes this a guarantee: the prompt cannot cost more
+    # than `ceiling`, the completion cannot cost more than `max_tokens`, so the
+    # call cannot cost more than the reservation the preflight approved.
+    assert ceiling + sent.max_tokens == 1000
 
 
 @pytest.mark.asyncio
