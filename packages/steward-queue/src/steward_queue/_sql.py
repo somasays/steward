@@ -164,6 +164,21 @@ WHERE r.id = p.id
 RETURNING p.status, r.status
 """
 
+# A task accumulates its own spend for the same reason a run does, and it is
+# what retry admission projects the *remainder* of: a resumed task continues
+# against this total, so what another attempt may still cost is `budget - used`,
+# not `budget` (#69, SPEC.md §13 D12).
+ADD_TASK_USAGE = """
+UPDATE tasks
+SET used_steps = used_steps + %(steps)s,
+    used_tokens = used_tokens + %(tokens)s,
+    used_cost_usd = used_cost_usd + %(cost_usd)s,
+    used_wall_clock = used_wall_clock + %(wall_clock)s,
+    updated_at = now()
+WHERE id = %(id)s
+RETURNING used_steps, used_tokens, used_cost_usd, used_wall_clock
+"""
+
 ADD_RUN_USAGE = """
 WITH previous AS (
     SELECT id, used_steps, used_tokens, used_cost_usd, used_wall_clock
@@ -204,7 +219,8 @@ WHERE id = %(id)s
 
 SELECT_TASK_ATTEMPTS_FOR_UPDATE = """
 SELECT state, attempts, max_attempts, claimed_by, run_id,
-       budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock
+       budget_steps, budget_tokens, budget_cost_usd, budget_wall_clock,
+       used_steps, used_tokens, used_cost_usd, used_wall_clock
 FROM tasks WHERE id = %(id)s FOR UPDATE
 """
 """The run and the caps come back with the attempt counters because `fail` has

@@ -357,16 +357,26 @@ def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, act
     rather than the run's elapsed duration, which is the conservative reading
     (`RunBudget.wall_clock`).
     """
-    row = conn.execute(
-        _sql.ADD_RUN_USAGE,
-        {
-            "id": run_id,
-            "steps": result.usage.steps,
-            "tokens": result.usage.tokens,
-            "cost_usd": result.usage.cost_usd,
-            "wall_clock": result.usage.wall_clock,
-        },
-    ).fetchone()
+    amounts = {
+        "steps": result.usage.steps,
+        "tokens": result.usage.tokens,
+        "cost_usd": result.usage.cost_usd,
+        "wall_clock": result.usage.wall_clock,
+    }
+    # The run's total moves first, and that ordering is load-bearing rather
+    # than incidental. `tasks.run_id` is a foreign key, so updating a task row
+    # takes a KEY SHARE lock on its `runs` row; doing that before this
+    # statement's FOR UPDATE leaves two workers settling two tasks of one run
+    # each holding KEY SHARE and each waiting for FOR UPDATE, which Postgres
+    # resolves by killing one of them (observed: `DeadlockDetected ... while
+    # locking tuple in relation "runs"`). Taking the exclusive lock first means
+    # they serialise on it instead.
+    row = conn.execute(_sql.ADD_RUN_USAGE, {"id": run_id, **amounts}).fetchone()
+    # The task's own total moves with it, in the same transaction. Retry
+    # admission projects what one more attempt at *this task* could still cost
+    # (`budget - used`), so a task accumulator that lagged the run's would let a
+    # retry be admitted against spend already incurred (#69, D12).
+    conn.execute(_sql.ADD_TASK_USAGE, {"id": result.task_id, **amounts})
     before = require_row(row, "run usage update returned no row")
     write_audit(
         conn,

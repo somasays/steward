@@ -69,6 +69,25 @@ class RunBudget(SchemaModel):
         )
         return tuple(dimension for dimension, exceeded in breached if exceeded)
 
+    def remaining(self, spent: RunBudget) -> RunBudget:
+        """What is left of this budget after `spent`, floored at zero.
+
+        The third question asked of these four dimensions, alongside `over` and
+        `total`, and it lives here for the same reason they do: a caller that
+        subtracted field by field would be a second place a fifth dimension has
+        to be remembered.
+
+        Flooring matters. A dimension already overspent has *nothing* left, not
+        a negative allowance that would quietly fund an overrun somewhere else
+        when this value is summed with another (I12).
+        """
+        return RunBudget(
+            steps=max(0, self.steps - spent.steps),
+            tokens=max(0, self.tokens - spent.tokens),
+            cost_usd=max(Decimal(0), self.cost_usd - spent.cost_usd),
+            wall_clock=max(timedelta(0), self.wall_clock - spent.wall_clock),
+        )
+
     @classmethod
     def total(cls, budgets: Iterable[RunBudget]) -> RunBudget:
         """The dimension-wise sum of `budgets` — an empty one sums to zero.

@@ -267,20 +267,34 @@ overrun uses, because to an operator it is the same fact: the run's cap is what
 stopped the work."""
 
 
-def _retry_unaffordable(conn: QueueConnection, run_id: UUID, task_budget: RunBudget) -> tuple[str, ...]:
+def _retry_unaffordable(
+    conn: QueueConnection, run_id: UUID, task_budget: RunBudget, task_used: RunBudget
+) -> tuple[str, ...]:
     """The dimensions in which one more attempt would carry the run past its cap.
 
-    Asked *after* this attempt's usage is debited, so it projects onto the
-    run's real totals rather than the ones it had before this failure. Empty
-    means the retry is affordable. `RunBudget.over` is the same comparison the
-    plan-time reservation uses -- there is one arithmetic for "does this fit",
-    and a second one written here is how a dimension gets left unenforced
-    (`steward_schemas.budget`).
+    What a retry can still cost is the task's **remainder**, `budget - used`,
+    not its whole budget. A task that checkpoints resumes against its own
+    cumulative total, so a second attempt cannot spend the cap again -- and
+    projecting as if it could made every failure that spent anything
+    unaffordable the moment it was recorded. For a goal whose one task carries
+    the run's entire budget (the degenerate reservation, D9) that meant retries
+    stopped existing, silently, for every task that had done any work.
+
+    A task that does *not* checkpoint gets the same projection and a weaker
+    guarantee: its next attempt genuinely may spend a full budget, and what
+    bounds it is the same per-attempt cap every attempt has had. What this
+    check prevents either way is a run funding an attempt it cannot pay for.
+
+    Asked *after* this attempt's usage is debited, so it projects onto real
+    totals rather than the ones held before this failure. Empty means the retry
+    is affordable. The comparison is `RunBudget.over`, the same one plan-time
+    reservation uses: one arithmetic for "does this fit", because a second one
+    written here is how a dimension gets left unenforced.
     """
     run = get_run(conn, run_id)
     if run is None:  # pragma: no cover -- the task's own FK guarantees the run
         return ()
-    return RunBudget.total((run.usage, task_budget)).over(run.budget)
+    return RunBudget.total((run.usage, task_budget.remaining(task_used))).over(run.budget)
 
 
 def _retry_refused(error: ProblemDetails, dimensions: tuple[str, ...]) -> ProblemDetails:
@@ -342,6 +356,7 @@ def fail(
     state, attempts, max_attempts, holder = TaskState(row[0]), row[1], row[2], row[3]
     run_id: UUID = row[4]
     task_budget = budget_from(row[5], row[6], row[7], row[8])
+    task_used = budget_from(row[9], row[10], row[11], row[12])
     if state not in (TaskState.CLAIMED, TaskState.RUNNING):
         raise TaskNotClaimable(f"task {task_id} is not claimed or running")
     if claimed_by is not None and holder != claimed_by:
@@ -354,8 +369,12 @@ def fail(
             TaskResult(task_id=task_id, status=TaskStatus.FAILED, usage=usage, error=error),
             actor=actor,
         )
+    # The row was read before the debit above, so the task's stored total is one
+    # attempt stale here; adding what was just recorded is exact rather than
+    # re-reading, because this transaction holds the row lock throughout.
+    spent_by_task = RunBudget.total((task_used, usage)) if usage is not None else task_used
     unaffordable = (
-        _retry_unaffordable(conn, run_id, task_budget)
+        _retry_unaffordable(conn, run_id, task_budget, spent_by_task)
         if retryable and attempts < max_attempts
         else ()
     )

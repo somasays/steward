@@ -220,7 +220,12 @@ def build_agent_echo(
         return TaskResult(
             task_id=ctx.spec.task_id,
             status=TaskStatus.SUCCEEDED,
-            usage=result.usage,
+            # This attempt's spend, not the checkpoint's. `AgentResult.usage` is
+            # cumulative across attempts so the loop can bound the whole task
+            # against one cap -- reporting it here would charge the run again
+            # for everything the failed attempts were already charged for
+            # (`steward_queue.usage`, SPEC §13 D12).
+            usage=ctx.usage.total(),
             output=result.output.model_dump(),
         )
 

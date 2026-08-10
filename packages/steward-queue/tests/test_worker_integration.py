@@ -638,27 +638,46 @@ class TestFailurePaths:
         assert run.usage.tokens == 2 * SPENT_PER_CALL.tokens
         assert run.usage.over(run.budget) == ()
 
-    async def test_a_retry_the_run_cannot_afford_is_refused_not_scheduled(
+    async def test_a_retry_is_refused_once_the_task_has_overspent_its_own_budget(
         self, dsn: str, conn: QueueConnection
     ) -> None:
-        """The property #69 actually asks for: recorded spend never exceeds the
-        cap. Recording retry spend without this check would only document a run
-        walking past its budget one attempt at a time."""
-        spec = affordable(
-            conn,
+        """The property #69 asks for: recorded spend never exceeds the cap.
+
+        What a retry can still cost is the task's *remainder* -- projecting its
+        whole budget again would dead-letter every task that had done any work,
+        which is what a run whose single task carries the whole budget looks
+        like. So the refusal fires exactly where it should: a task that has
+        already spent past its own cap has no remainder to fund, and the run is
+        over besides. A handler that debits more than it was given is the case
+        `_overspent` cannot catch, because there is no returned result to check.
+        """
+        tight = RunBudget(
+            steps=2,
+            tokens=SPENT_PER_CALL.tokens - 4,  # less than one call debits
+            cost_usd=Decimal("0.50"),
+            wall_clock=timedelta(seconds=30),
+        )
+        run = create_run(conn, goal="test", budget=tight)
+        spec = TaskSpec(
+            task_id=uuid4(),
+            run_id=run.id,
             task_type=SPENDS_THEN_RAISES,
             payload={"boom": True},
+            budget=tight,
             max_attempts=3,
-            attempts_affordable=1,
         )
+        enqueue(conn, spec)
+        conn.commit()
         worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
 
         assert await worker.run_once() == 1
-        # Attempts remain (1 of 3 used) but the run cannot fund another.
+        # Attempts remain (1 of 3 used) and the task is still dead: it is the
+        # budget that stopped it, and the error says so.
         assert await worker.run_once() == 0
 
         task = get_task(conn, spec.task_id)
         assert task is not None and task.state is TaskState.DEAD
+        assert task.attempts == 1
         recorded = conn.execute(SELECT_TASK_LAST_ERROR, (spec.task_id,)).fetchone()
         assert recorded is not None
         last_error = recorded[0]
@@ -667,9 +686,27 @@ class TestFailurePaths:
         # wrong and why nothing tried again.
         assert "handler raised" in last_error["detail"]
         assert "budget left for another attempt" in last_error["detail"]
+
+    async def test_a_partly_spent_task_is_still_retried(
+        self, dsn: str, conn: QueueConnection
+    ) -> None:
+        """The inverse, and the regression that made this projection necessary:
+        a task that spent part of its budget and failed must still retry."""
+        spec = affordable(
+            conn,
+            task_type=SPENDS_THEN_RAISES,
+            payload={"boom": True},
+            max_attempts=2,
+            attempts_affordable=1,
+        )
+        worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
+
+        assert await worker.run_once() == 1
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.PENDING
+        # And the run is still inside its cap while that retry is pending.
         run = get_run(conn, spec.run_id)
-        assert run is not None
-        assert run.usage.over(run.budget) == ()
+        assert run is not None and run.usage.over(run.budget) == ()
 
     async def test_a_handler_killed_at_its_cap_still_charges_what_it_spent(
         self, dsn: str, conn: QueueConnection, queued: Callable[..., TaskSpec]

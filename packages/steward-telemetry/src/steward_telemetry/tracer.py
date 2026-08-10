@@ -21,7 +21,7 @@ Two rules make tracing safe to depend on:
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from enum import StrEnum
 from typing import Protocol
@@ -69,6 +69,21 @@ class Span(Protocol):
         that exits with an exception is `ERROR` -- the explicit call exists for
         failures that are return values rather than raises (a handler returning
         `TaskStatus.FAILED`, say)."""
+        ...
+
+    def observe(self, measurements: Mapping[str, object]) -> None:
+        """Attach what this span measured: latency, tokens, cost, validated I/O.
+
+        Separate from `record` because the two answer different questions and
+        arrive at different times -- `record` says how the work ended, this says
+        what it cost and what passed through it (I7, SPEC.md §3.2). A trace
+        carrying only identity fields tells an operator which model was called
+        and nothing about whether it was expensive or what it saw.
+
+        Callable more than once; later keys win. Values must already be safe to
+        export: anything derived from customer data reaches here masked (I6),
+        which is a property of the caller, not of this seam.
+        """
         ...
 
 
@@ -121,6 +136,9 @@ class NoopSpan:
     def record(self, outcome: SpanOutcome, detail: str | None = None) -> None:
         """Discard the outcome. The trace id is still on the run row, so the
         run remains correlatable even with no span backend at all."""
+
+    def observe(self, measurements: Mapping[str, object]) -> None:
+        """Discard the measurements, for the same reason."""
 
 
 class NoopTracer:

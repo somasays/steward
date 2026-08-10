@@ -312,6 +312,23 @@ class AgentRuntime:
         try:
             with span as generation:
                 completion = await self._client.complete(request)
+                # What the call cost and what passed through it (I7). The
+                # request's messages are what the model was actually sent, and
+                # anything customer-derived reached them masked (I6) -- this
+                # seam exports, it does not sanitise.
+                generation.observe(
+                    {
+                        "latency_seconds": completion.usage.latency.total_seconds(),
+                        "prompt_tokens": completion.usage.prompt_tokens,
+                        "completion_tokens": completion.usage.completion_tokens,
+                        "total_tokens": completion.usage.total_tokens,
+                        "cost_usd": str(completion.usage.cost_usd),
+                        "finish_reason": completion.finish_reason.value,
+                        "input": [message.content for message in request.messages],
+                        "output": completion.text,
+                        "tool_calls": [call.name for call in completion.tool_calls],
+                    }
+                )
                 generation.record(SpanOutcome.OK)
         except LLMError as exc:
             # The call spent what it generated before it died; report and
@@ -339,17 +356,25 @@ class AgentRuntime:
         submitted = next(
             (call for call in completion.tool_calls if call.name == SUBMIT_RESULT), None
         )
-        if submitted is None:
-            if completion.finish_reason is FinishReason.STOP:
-                raise AgentRuntimeError(
-                    f"the agent stopped without calling {SUBMIT_RESULT!r}; "
-                    "a run's result is submitted through that tool, never as prose"
+        try:
+            if submitted is None:
+                if completion.finish_reason is FinishReason.STOP:
+                    raise AgentRuntimeError(
+                        f"the agent stopped without calling {SUBMIT_RESULT!r}; "
+                        "a run's result is submitted through that tool, never as prose"
+                    )
+                updated = base.model_copy(
+                    update={"pending_tool_calls": completion.tool_calls}
                 )
-            updated = base.model_copy(
-                update={"pending_tool_calls": completion.tool_calls}
-            )
-        else:
-            updated = self._submission(base, submitted, completion.tool_calls, output_model)
+            else:
+                updated = self._submission(base, submitted, completion.tool_calls, output_model)
+        except Exception:
+            # The call was made and its tokens are gone, whatever we decided
+            # about the answer. `base` already carries that spend, so
+            # checkpointing it before the failure travels is what stops a resumed
+            # attempt from believing the call never happened.
+            await self._checkpoints.save(key, base)
+            raise
         await self._checkpoints.save(key, updated)
         return updated
 
@@ -434,13 +459,29 @@ class AgentRuntime:
             async with asyncio.timeout(reserved.total_seconds()):
                 with self._tracer.tool_span(
                     trace_id=trace.trace_id, task_id=trace.task_id, tool_name=call.name
-                ):
+                ) as tool:
                     content = (
                         await self._tools.invoke(call, allowlist=allowlist)
                     ).model_dump_json()
+                    # Both sides are the *validated* models' own JSON, so what
+                    # the trace shows is what the registry admitted, not what
+                    # the model happened to emit.
+                    tool.observe(
+                        {
+                            "latency_seconds": time.monotonic() - started,
+                            "input": call.arguments,
+                            "output": content,
+                        }
+                    )
         except TimeoutError as exc:
-            self._spent(
-                RunBudget(steps=1, tokens=0, cost_usd=Decimal(0), wall_clock=reserved)
+            # The step is charged the time it was *allowed*, and the charge is
+            # checkpointed before the failure travels. A debit the ledger sees
+            # but the checkpoint does not is a resumed run reconsidering this
+            # step with more cap than it really has left (#69 review, finding 3).
+            await self._charge_failed_step(
+                key,
+                current,
+                RunBudget(steps=1, tokens=0, cost_usd=Decimal(0), wall_clock=reserved),
             )
             raise AgentRuntimeError(
                 f"tool {call.name!r} outran the {reserved} it declared"
@@ -449,9 +490,14 @@ class AgentRuntime:
             # Bad arguments are the model's to fix, once (SPEC.md §3.2). A second
             # failure on the same call is not feedback any more, it is a loop.
             if not exc.blames_model or call.id in current.answered_with_feedback:
+                await self._charge_failed_step(key, current, self._elapsed_step(started))
                 raise
             content = str(exc)
             answered = current.answered_with_feedback + (call.id,)
+        except Exception:
+            # Anything else the tool raised still consumed the time it ran for.
+            await self._charge_failed_step(key, current, self._elapsed_step(started))
+            raise
 
         spend = RunBudget(
             steps=1,
@@ -471,6 +517,33 @@ class AgentRuntime:
         )
         await self._checkpoints.save(key, updated)
         return updated
+
+    @staticmethod
+    def _elapsed_step(started: float) -> RunBudget:
+        """One step, and the wall clock it actually took."""
+        return RunBudget(
+            steps=1,
+            tokens=0,
+            cost_usd=Decimal(0),
+            wall_clock=timedelta(seconds=time.monotonic() - started),
+        )
+
+    async def _charge_failed_step(
+        self, key: str, current: AgentCheckpoint, spend: RunBudget
+    ) -> None:
+        """Report and checkpoint what a step spent before it failed.
+
+        Both halves, in that order, on every path that can raise after work has
+        begun. The ledger is what charges the run for an attempt that never
+        returns; the checkpoint is what stops a *resumed* attempt from spending
+        the same allowance twice. Reporting without checkpointing bills the run
+        correctly and lets the agent overrun its cap on resume, which is the
+        harder failure to see (#69 review, finding 3).
+        """
+        self._spent(spend)
+        await self._checkpoints.save(
+            key, current.model_copy(update={"usage": _add(current.usage, spend)})
+        )
 
     def _preflight_model(
         self, used: RunBudget, cap: RunBudget, messages: tuple[Message, ...]
