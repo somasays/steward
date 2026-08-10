@@ -85,6 +85,16 @@ class _LangfuseSpan:
         self._recorded = True
         self._observation.update(output=outcome.value, level=_LEVELS[outcome], status_message=detail)
 
+    def observe(self, measurements: Mapping[str, object]) -> None:
+        """Write measurements onto the observation as metadata.
+
+        Not `output`: that field carries the outcome, and a span whose output
+        was overwritten by a token count would read as having succeeded with a
+        number. Metadata is where Langfuse expects per-observation detail, and
+        it survives a later `record`.
+        """
+        self._observation.update(metadata=dict(measurements))
+
 
 class LangfuseTracer:
     """`Tracer` backed by a Langfuse client. Satisfies `Tracer` structurally.

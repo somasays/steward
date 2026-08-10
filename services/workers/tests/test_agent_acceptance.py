@@ -21,7 +21,8 @@ What each of these is for, since "end to end" can mean almost nothing:
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import json
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -116,8 +117,13 @@ class RecordedSpan:
     attributes: dict[str, str]
     outcome: SpanOutcome | None = None
 
+    measurements: dict[str, object] = field(default_factory=dict)
+
     def record(self, outcome: SpanOutcome, detail: str | None = None) -> None:
         self.outcome = outcome
+
+    def observe(self, measurements: Mapping[str, object]) -> None:
+        self.measurements.update(measurements)
 
 
 @dataclass
@@ -221,7 +227,12 @@ def register_agent(
     return stub
 
 
-def planned(conn: QueueConnection, *, prompt: str = "echo the value 'steward'") -> TaskSpec:
+def planned(
+    conn: QueueConnection,
+    *,
+    prompt: str = "echo the value 'steward'",
+    max_attempts: int = 1,
+) -> TaskSpec:
     """Plan an `agent_echo` run the way the API does, and enqueue its task.
 
     Through `GOALS` rather than by hand: the plan-time budget reservation (D9)
@@ -236,7 +247,7 @@ def planned(conn: QueueConnection, *, prompt: str = "echo the value 'steward'") 
         task_type=planned_task.task_type,
         payload=planned_task.payload,
         budget=planned_task.budget,
-        max_attempts=1,
+        max_attempts=max_attempts,
     )
     enqueue(conn, spec)
     conn.commit()
@@ -288,6 +299,20 @@ class TestAgentEndToEnd:
         assert all(span.attributes["prompt_version"] for span in tracer.of("generation"))
         assert all(span.attributes["model_alias"] == "steward-fast" for span in tracer.of("generation"))
         assert tracer.of("tool")[0].attributes["tool_name"] == "echo"
+
+        # Identity is not the contract #69 states -- latency, tokens, cost and
+        # validated I/O are. Asserted as *values*, so a span that carried the
+        # field names and nothing in them fails here.
+        first, second = tracer.of("generation")
+        assert first.measurements["total_tokens"] == 18
+        assert second.measurements["total_tokens"] == 28
+        assert first.measurements["cost_usd"] == "0.001"
+        assert float(first.measurements["latency_seconds"]) > 0  # type: ignore[arg-type]
+        assert first.measurements["input"] == ["echo the value 'steward'"]
+        assert first.measurements["tool_calls"] == ["echo"]
+        tool_span = tracer.of("tool")[0]
+        assert tool_span.measurements["input"] == '{"value":"steward"}'
+        assert json.loads(str(tool_span.measurements["output"])) == {"value": "steward"}
         run = get_run(conn, spec.run_id)
         assert run is not None
         assert {span.attributes["trace_id"] for span in tracer.spans} == {run.trace_id}
@@ -360,11 +385,18 @@ class TestAgentEndToEnd:
             ],
             tracer,
         )
-        spec = planned(conn)
+        spec = planned(conn, max_attempts=2)
 
-        await Worker(dsn, "w1", tracer=tracer).run_once()
+        # No backoff: the retry this proves is the scheduling, not the waiting.
+        await Worker(dsn, "w1", tracer=tracer, retry_base_delay=timedelta(0)).run_once()
+        # Failed, and *scheduled for retry* by the production path -- not dead,
+        # and not resurrected by this test. Retry admission projects what one
+        # more attempt at this task can still cost (`budget - used`), so a task
+        # that has spent part of its cap is still affordable; projecting the
+        # whole budget again is what used to dead-letter it here (#69 review).
         task = get_task(conn, spec.task_id)
-        assert task is not None and task.state is TaskState.DEAD
+        assert task is not None and task.state is TaskState.PENDING
+        assert task.attempts == 1
         assert len(first.calls) == 2
 
         saved = latest_checkpoint(conn, spec.task_id)
@@ -373,16 +405,13 @@ class TestAgentEndToEnd:
         # The tool ran and its result is in the saved history: that is the step
         # the resumed attempt must not pay for again.
         assert any(message["role"] == "tool" for message in saved["messages"])
+        charged_for_the_failure = get_run(conn, spec.run_id)
+        assert charged_for_the_failure is not None
+        failed_attempt_spend = charged_for_the_failure.usage
 
         # A second worker, given only the submitting reply: enough to finish
         # *if* it resumes, not enough to redo the tool step.
         resumed = register_agent(dsn, [replies[1]], tracer)
-        conn.execute(
-            "UPDATE tasks SET state = 'pending', attempts = 0, claimed_by = NULL, "
-            "lease_expires_at = NULL, available_at = now() WHERE id = %s",
-            (spec.task_id,),
-        )
-        conn.commit()
 
         assert await Worker(dsn, "w2", tracer=tracer).run_once() == 1
         task = get_task(conn, spec.task_id)
@@ -393,7 +422,15 @@ class TestAgentEndToEnd:
         ).fetchone()
         assert result is not None and result[0]["output"] == {"answer": "steward"}
 
-        # The failed attempt's spend was charged too, not lost with its result.
         run = get_run(conn, spec.run_id)
         assert run is not None
-        assert run.usage.tokens > replies[1].chunks[-1].usage.total_tokens
+        # The successful attempt is charged what *it* spent. The checkpoint's
+        # usage is cumulative so the loop can bound the whole task against one
+        # cap; reporting that on success would charge the run a second time for
+        # the failed attempt it has already paid for (#69 review, finding 2).
+        submitted = sum(chunk.usage.total_tokens for chunk in replies[1].chunks)
+        assert run.usage.tokens == failed_attempt_spend.tokens + submitted
+        # Not the cumulative figure: charging that would make this
+        # `failed + (failed + submitted)`.
+        assert run.usage.tokens < 2 * failed_attempt_spend.tokens + submitted
+        assert run.usage.over(run.budget) == ()
