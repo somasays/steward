@@ -21,7 +21,7 @@ from steward_schemas.classification import (
     EvidenceKind,
     EvidenceRef,
     ProposalStatus,
-    ReviewDecision,
+    ReviewCommand,
     ReviewOutcome,
     SensitivityLabel,
 )
@@ -71,7 +71,7 @@ __all__ = [
     "EvidenceKind",
     "EvidenceRef",
     "ProposalStatus",
-    "ReviewDecision",
+    "ReviewCommand",
     "ReviewOutcome",
     "SensitivityLabel",
     "TableProfile",

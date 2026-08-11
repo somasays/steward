@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -36,7 +35,15 @@ from steward_catalog.classification import (
     reject,
 )
 from steward_catalog.profiles import record_profile
-from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedger, connect
+from steward_queue import (
+    SYSTEM_ACTOR,
+    Actor,
+    ActorKind,
+    QueueConnection,
+    TaskContext,
+    UsageLedger,
+    connect,
+)
 from steward_schemas import (
     ClassificationProposal,
     ColumnClassification,
@@ -44,7 +51,7 @@ from steward_schemas import (
     EvidenceKind,
     EvidenceRef,
     ProposalStatus,
-    ReviewDecision,
+    ReviewCommand,
     ReviewOutcome,
     SensitivityLabel,
     SourceCreate,
@@ -135,7 +142,8 @@ def a_proposal(
                         profile_version=profile_version,
                         column_name="email",
                         kind=EvidenceKind.COLUMN_NAME,
-                        detail="named 'email'",
+                        locator="email",
+                        detail="the column is named 'email'",
                     ),
                 ),
             ),
@@ -143,13 +151,10 @@ def a_proposal(
     )
 
 
-def a_decision(outcome: ReviewOutcome = ReviewOutcome.APPROVED, actor: str = "reviewer") -> ReviewDecision:
-    return ReviewDecision(
-        outcome=outcome,
-        actor=actor,
-        reason="looks right",
-        decided_at=datetime.now(UTC),
-    )
+def a_command(policy_id: str | None = None) -> ReviewCommand:
+    """What a reviewer supplies: a reason, and at most a policy. Outcome, actor
+    and time are the repository's."""
+    return ReviewCommand(reason="looks right", policy_id=policy_id)
 
 
 def recorded(conn: QueueConnection, asset: UUID, **kwargs: object) -> UUID:
@@ -164,6 +169,17 @@ def recorded(conn: QueueConnection, asset: UUID, **kwargs: object) -> UUID:
     )
     conn.commit()
     return record.id
+
+
+@pytest.fixture
+def second_asset_id(conn: QueueConnection, asset_id: UUID) -> UUID:
+    """A second profiled asset, so two decisions hold different asset locks."""
+    row = conn.execute(SELECT_ASSET_ID, {"schema": "sales", "name": "orders"}).fetchone()
+    assert row is not None, "the fixture estate has no second table to classify"
+    identifier: UUID = row[0]
+    record_profile(conn, identifier, a_profile(7), actor=SYSTEM_ACTOR)
+    conn.commit()
+    return identifier
 
 
 @pytest.fixture
@@ -182,7 +198,7 @@ class TestApproval:
         proposal_id = recorded(conn, asset_id)
         assert current_classification(conn, asset_id) is None
 
-        published = approve(conn, proposal_id, decision=a_decision(), actor=SYSTEM_ACTOR)
+        published = approve(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         assert published.status is ProposalStatus.APPROVED
@@ -190,7 +206,9 @@ class TestApproval:
         assert current is not None and current.id == proposal_id
         reviews = record_proposal_reviews(conn, proposal_id)
         assert [r.outcome for r in reviews] == [ReviewOutcome.APPROVED]
-        assert reviews[0].actor == "reviewer"
+        # The same author as the audit row: attribution is the trusted actor's,
+        # not something the caller passed in.
+        assert reviews[0].actor == SYSTEM_ACTOR
 
     def test_approving_a_replacement_supersedes_in_one_action(
         self, conn: QueueConnection, asset_id: UUID
@@ -200,14 +218,14 @@ class TestApproval:
         all in between -- visible to every reader, and permanent if the second
         never happened."""
         first = recorded(conn, asset_id)
-        approve(conn, first, decision=a_decision(), actor=SYSTEM_ACTOR)
+        approve(conn, first, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         record_profile(conn, asset_id, a_profile(11), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
 
-        approve(conn, second, decision=a_decision(), actor=SYSTEM_ACTOR)
+        approve(conn, second, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         current = current_classification(conn, asset_id)
@@ -223,14 +241,14 @@ class TestApproval:
         A half-applied supersession would unpublish a classification nobody
         rejected."""
         first = recorded(conn, asset_id)
-        approve(conn, first, decision=a_decision(), actor=SYSTEM_ACTOR)
+        approve(conn, first, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         record_profile(conn, asset_id, a_profile(12), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
 
-        approve(conn, second, decision=a_decision(), actor=SYSTEM_ACTOR)
+        approve(conn, second, command=a_command(), actor=SYSTEM_ACTOR)
         conn.rollback()  # the caller's transaction fails after the repository returned
 
         current = current_classification(conn, asset_id)
@@ -248,11 +266,11 @@ class TestApproval:
         record_profile(conn, asset_id, a_profile(13), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
-        approve(conn, second, decision=a_decision(), actor=SYSTEM_ACTOR)
+        approve(conn, second, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         with pytest.raises(StaleProposal):
-            approve(conn, first, decision=a_decision(), actor=SYSTEM_ACTOR)
+            approve(conn, first, command=a_command(), actor=SYSTEM_ACTOR)
         conn.rollback()
 
         current = current_classification(conn, asset_id)
@@ -266,7 +284,7 @@ class TestApproval:
         conn.commit()
 
         with pytest.raises(StaleProposal, match="data it describes has changed"):
-            approve(conn, proposal_id, decision=a_decision(), actor=SYSTEM_ACTOR)
+            approve(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
 
 
 class TestIdempotency:
@@ -274,10 +292,10 @@ class TestIdempotency:
         self, conn: QueueConnection, asset_id: UUID
     ) -> None:
         proposal_id = recorded(conn, asset_id)
-        first = approve(conn, proposal_id, decision=a_decision(), idempotency_key="k1", actor=SYSTEM_ACTOR)
+        first = approve(conn, proposal_id, command=a_command(), idempotency_key="k1", actor=SYSTEM_ACTOR)
         conn.commit()
 
-        again = approve(conn, proposal_id, decision=a_decision(), idempotency_key="k1", actor=SYSTEM_ACTOR)
+        again = approve(conn, proposal_id, command=a_command(), idempotency_key="k1", actor=SYSTEM_ACTOR)
         conn.commit()
 
         assert again.id == first.id and again.status is ProposalStatus.APPROVED
@@ -303,13 +321,13 @@ class TestIdempotencyKeyMisuse:
         settled = recorded(conn, asset_id, profile_version=2)
         untouched = recorded(conn, asset_id, profile_version=2, prompt="classify@v2")
 
-        approve(conn, settled, decision=a_decision(), idempotency_key="shared", actor=SYSTEM_ACTOR)
+        approve(conn, settled, command=a_command(), idempotency_key="shared", actor=SYSTEM_ACTOR)
         conn.commit()
 
         # Same key, different proposal: a replay of someone else's request.
         with pytest.raises(IdempotencyKeyReused):
             approve(
-                conn, untouched, decision=a_decision(), idempotency_key="shared", actor=SYSTEM_ACTOR
+                conn, untouched, command=a_command(), idempotency_key="shared", actor=SYSTEM_ACTOR
             )
         conn.rollback()
 
@@ -320,14 +338,14 @@ class TestIdempotencyKeyMisuse:
         self, conn: QueueConnection, asset_id: UUID
     ) -> None:
         proposal_id = recorded(conn, asset_id)
-        approve(conn, proposal_id, decision=a_decision(), idempotency_key="k", actor=SYSTEM_ACTOR)
+        approve(conn, proposal_id, command=a_command(), idempotency_key="k", actor=SYSTEM_ACTOR)
         conn.commit()
 
         with pytest.raises(IdempotencyKeyReused):
             reject(
                 conn,
                 proposal_id,
-                decision=a_decision(ReviewOutcome.REJECTED),
+                command=a_command(),
                 idempotency_key="k",
                 actor=SYSTEM_ACTOR,
             )
@@ -348,7 +366,7 @@ class TestUnpublishableInputs:
         conn.commit()
 
         with pytest.raises(AssetNotClassifiable):
-            approve(conn, proposal_id, decision=a_decision(), actor=SYSTEM_ACTOR)
+            approve(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
         conn.rollback()
         assert current_classification(conn, asset_id) is None
 
@@ -372,6 +390,7 @@ class TestUnpublishableInputs:
                             profile_version=1,
                             column_name="not_a_real_column",
                             kind=EvidenceKind.COLUMN_NAME,
+                            locator="not_a_real_column",
                             detail="looks sensitive",
                         ),
                     ),
@@ -390,18 +409,58 @@ class TestUnpublishableInputs:
         conn.rollback()
 
 
+    def test_a_masked_sample_the_profile_never_recorded_is_refused(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The gap "the column exists" left open: a real column, an invented
+        sample. `detail` is prose and resolves to nothing, so before locators
+        this passed."""
+        invented = ClassificationProposal(
+            asset_id=asset_id,
+            profile_version=1,
+            prompt_version="classify@v1",
+            model_alias="steward-classify",
+            columns=(
+                ColumnClassification(
+                    column_name="email",
+                    labels=(SensitivityLabel.PII,),
+                    confidence=Decimal("0.9"),
+                    evidence=(
+                        EvidenceRef(
+                            profile_version=1,
+                            column_name="email",
+                            kind=EvidenceKind.MASKED_SAMPLE,
+                            locator="j***@g***.***",
+                            detail="an email-shaped sample",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        with pytest.raises(EvidenceNotResolvable, match="MASKED_SAMPLE|masked_sample"):
+            propose(
+                conn,
+                invented,
+                run_id=uuid4(),
+                task_id=uuid4(),
+                trace_id="trace-test",
+                actor=SYSTEM_ACTOR,
+            )
+        conn.rollback()
+
+
 class TestRejection:
     def test_rejecting_leaves_the_published_version_alone(
         self, conn: QueueConnection, asset_id: UUID
     ) -> None:
         first = recorded(conn, asset_id)
-        approve(conn, first, decision=a_decision(), actor=SYSTEM_ACTOR)
+        approve(conn, first, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         record_profile(conn, asset_id, a_profile(14), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
-        reject(conn, second, decision=a_decision(ReviewOutcome.REJECTED), actor=SYSTEM_ACTOR)
+        reject(conn, second, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         current = current_classification(conn, asset_id)
@@ -413,11 +472,11 @@ class TestRejection:
         self, conn: QueueConnection, asset_id: UUID
     ) -> None:
         proposal_id = recorded(conn, asset_id)
-        reject(conn, proposal_id, decision=a_decision(ReviewOutcome.REJECTED), actor=SYSTEM_ACTOR)
+        reject(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         with pytest.raises(ProposalNotPending):
-            approve(conn, proposal_id, decision=a_decision(), actor=SYSTEM_ACTOR)
+            approve(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
 
 
 class TestConcurrency:
@@ -464,7 +523,7 @@ class TestConcurrency:
             try:
                 start.wait(timeout=10)
                 record = approve(
-                    connection, proposal_id, decision=a_decision(), actor=SYSTEM_ACTOR
+                    connection, proposal_id, command=a_command(), actor=SYSTEM_ACTOR
                 )
                 connection.commit()
                 published.append(record.id)
@@ -504,11 +563,11 @@ class TestConcurrency:
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
 
-        approve(conn, second, decision=a_decision(), actor=SYSTEM_ACTOR)
+        approve(conn, second, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         with pytest.raises(ClassificationConflict):
-            approve(other, first, decision=a_decision(), actor=SYSTEM_ACTOR)
+            approve(other, first, command=a_command(), actor=SYSTEM_ACTOR)
         other.rollback()
 
         approved = [r for r in proposal_history(conn, asset_id) if r.status is ProposalStatus.APPROVED]
@@ -519,12 +578,125 @@ class TestConcurrency:
     ) -> None:
         proposal_id = recorded(conn, asset_id)
 
-        approve(conn, proposal_id, decision=a_decision(), actor=SYSTEM_ACTOR)
+        approve(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
         conn.commit()
 
         with pytest.raises(ProposalNotPending):
-            reject(other, proposal_id, decision=a_decision(ReviewOutcome.REJECTED), actor=SYSTEM_ACTOR)
+            reject(other, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
         other.rollback()
 
         current = current_classification(conn, asset_id)
         assert current is not None and current.id == proposal_id
+
+
+class TestAttribution:
+    """The review table and the audit log must name the same author (I7)."""
+
+    def test_a_human_cannot_record_a_policy_approval(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """SPEC §3.3 allows auto-approval only through a configured policy, and
+        requires it to be auditable back to that policy. A person supplying a
+        policy id would be claiming a policy approved something."""
+        proposal_id = recorded(conn, asset_id)
+        human = Actor(kind=ActorKind.HUMAN, id="alice")
+
+        with pytest.raises(ClassificationConflict, match="policy id"):
+            approve(
+                conn,
+                proposal_id,
+                command=a_command(policy_id="auto-approve-low-risk"),
+                actor=human,
+            )
+        conn.rollback()
+
+    def test_a_policy_actor_may_record_one(self, conn: QueueConnection, asset_id: UUID) -> None:
+        proposal_id = recorded(conn, asset_id)
+        policy = Actor(kind=ActorKind.POLICY, id="auto-approve-low-risk")
+
+        approve(conn, proposal_id, command=a_command(policy_id="auto-approve-low-risk"), actor=policy)
+        conn.commit()
+
+        review = record_proposal_reviews(conn, proposal_id)[0]
+        assert review.actor == policy
+        assert review.policy_id == "auto-approve-low-risk"
+
+    def test_the_recorded_time_is_the_databases(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """No caller-supplied timestamp exists to be ignored: the command has no
+        such field, and the column defaults to `now()`."""
+        proposal_id = recorded(conn, asset_id)
+        approve(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
+        conn.commit()
+
+        review = record_proposal_reviews(conn, proposal_id)[0]
+        assert review.decided_at is not None
+        assert not hasattr(a_command(), "decided_at")
+        assert not hasattr(a_command(), "outcome")
+        assert not hasattr(a_command(), "actor")
+
+
+class TestConcurrentKeyReuse:
+    """One key, two assets, two connections.
+
+    Different assets hold *different* advisory locks, so nothing serialises
+    these two decisions until they reach the reviews table's key index. Before
+    `_record_decision` checked its own insert, both would see no existing key,
+    both would proceed, one insert would silently do nothing, and two proposals
+    would change status on the strength of a single review event.
+    """
+
+    def test_one_key_cannot_settle_decisions_on_two_assets(
+        self, conn: QueueConnection, steward_dsn: str, asset_id: UUID, second_asset_id: UUID
+    ) -> None:
+        first = recorded(conn, asset_id)
+        second = recorded(conn, second_asset_id)
+
+        start = threading.Barrier(2)
+        outcomes: list[tuple[UUID, BaseException | None]] = []
+
+        def decide(proposal_id: UUID) -> None:
+            connection = connect(steward_dsn)
+            try:
+                start.wait(timeout=10)
+                approve(
+                    connection,
+                    proposal_id,
+                    command=a_command(),
+                    idempotency_key="one-key",
+                    actor=SYSTEM_ACTOR,
+                )
+                connection.commit()
+                outcomes.append((proposal_id, None))
+            except BaseException as exc:  # noqa: BLE001 -- the type is the assertion
+                connection.rollback()
+                outcomes.append((proposal_id, exc))
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=decide, args=(pid,)) for pid in (first, second)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert len(outcomes) == 2
+        settled = [pid for pid, exc in outcomes if exc is None]
+        refused = [exc for _, exc in outcomes if exc is not None]
+        assert len(settled) == 1, "one review event settled two governance actions"
+        for failure in refused:
+            assert isinstance(failure, IdempotencyKeyReused), (
+                f"the loser got {type(failure).__name__} rather than a typed conflict"
+            )
+
+        # Exactly one proposal moved; the other is untouched.
+        statuses = {
+            record.id: record.status
+            for asset in (asset_id, second_asset_id)
+            for record in proposal_history(conn, asset)
+        }
+        assert sorted(statuses[pid].value for pid in (first, second)) == [
+            "approved",
+            "pending_review",
+        ]
