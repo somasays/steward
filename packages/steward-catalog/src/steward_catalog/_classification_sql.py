@@ -110,3 +110,10 @@ LEFT JOIN profiles AS p ON p.asset_id = a.id
 WHERE a.id = %(asset_id)s
 GROUP BY a.lifecycle
 """
+
+# The profile a proposal claims to have read. Evidence is checked against this
+# rather than against the proposal's own text: the type can verify a citation is
+# self-consistent, but only the stored profile knows whether the column existed.
+SELECT_PROFILE_VERSION = """
+SELECT profile FROM profiles WHERE asset_id = %(asset_id)s AND version = %(version)s
+"""

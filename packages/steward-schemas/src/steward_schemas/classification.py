@@ -140,6 +140,11 @@ class ColumnClassification(SchemaModel):
                 f"{self.column_name}: a sensitive label needs at least one evidence "
                 "reference; a label nobody can check is not a finding"
             )
+        if len(set(self.evidence)) != len(self.evidence):
+            raise ValueError(
+                f"{self.column_name}: the same evidence is cited twice; a repeated "
+                "citation is not a second reason"
+            )
         for reference in self.evidence:
             if reference.column_name != self.column_name:
                 raise ValueError(

@@ -22,7 +22,10 @@ from uuid import UUID, uuid4
 import pytest
 from steward_catalog import EnvSecretResolver, build_scan_source, postgres_inspector, register_source
 from steward_catalog.classification import (
+    AssetNotClassifiable,
     ClassificationConflict,
+    EvidenceNotResolvable,
+    IdempotencyKeyReused,
     ProposalNotPending,
     StaleProposal,
     approve,
@@ -37,6 +40,7 @@ from steward_queue import SYSTEM_ACTOR, QueueConnection, TaskContext, UsageLedge
 from steward_schemas import (
     ClassificationProposal,
     ColumnClassification,
+    ColumnProfile,
     EvidenceKind,
     EvidenceRef,
     ProposalStatus,
@@ -52,6 +56,29 @@ from steward_schemas import (
 SELECT_ASSET_ID = (
     "SELECT id FROM assets WHERE schema_name = %(schema)s AND name = %(name)s"
 )
+
+
+def a_profile(row_count: int) -> TableProfile:
+    """A profile that actually contains the column the proposals cite.
+
+    The first version of this fixture recorded `a_profile(10)` with
+    no columns at all, and every test passed -- because nothing resolved a
+    citation against the stored profile. It does now, so the fixture has to be
+    the real shape.
+    """
+    return TableProfile(
+        row_count=row_count,
+        columns=(
+            ColumnProfile(
+                name="email",
+                data_type="text",
+                null_count=0,
+                null_ratio=Decimal("0"),
+                distinct_count=row_count,
+                distinct_ratio=Decimal("1"),
+            ),
+        ),
+    )
 
 
 def _ctx(conn: QueueConnection, spec: TaskSpec) -> TaskContext:
@@ -85,7 +112,7 @@ def asset_id(
     row = conn.execute(SELECT_ASSET_ID, {"schema": "sales", "name": "customers"}).fetchone()
     assert row is not None
     identifier: UUID = row[0]
-    record_profile(conn, identifier, TableProfile(row_count=10), actor=SYSTEM_ACTOR)
+    record_profile(conn, identifier, a_profile(10), actor=SYSTEM_ACTOR)
     conn.commit()
     return identifier
 
@@ -176,7 +203,7 @@ class TestApproval:
         approve(conn, first, decision=a_decision(), actor=SYSTEM_ACTOR)
         conn.commit()
 
-        record_profile(conn, asset_id, TableProfile(row_count=11), actor=SYSTEM_ACTOR)
+        record_profile(conn, asset_id, a_profile(11), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
 
@@ -199,7 +226,7 @@ class TestApproval:
         approve(conn, first, decision=a_decision(), actor=SYSTEM_ACTOR)
         conn.commit()
 
-        record_profile(conn, asset_id, TableProfile(row_count=12), actor=SYSTEM_ACTOR)
+        record_profile(conn, asset_id, a_profile(12), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
 
@@ -218,7 +245,7 @@ class TestApproval:
         """Approving an older version would roll the published classification
         backwards, silently -- nothing about the row says it is the older one."""
         first = recorded(conn, asset_id)
-        record_profile(conn, asset_id, TableProfile(row_count=13), actor=SYSTEM_ACTOR)
+        record_profile(conn, asset_id, a_profile(13), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
         approve(conn, second, decision=a_decision(), actor=SYSTEM_ACTOR)
@@ -235,7 +262,7 @@ class TestApproval:
         self, conn: QueueConnection, asset_id: UUID
     ) -> None:
         proposal_id = recorded(conn, asset_id)
-        record_profile(conn, asset_id, TableProfile(row_count=99), actor=SYSTEM_ACTOR)
+        record_profile(conn, asset_id, a_profile(99), actor=SYSTEM_ACTOR)
         conn.commit()
 
         with pytest.raises(StaleProposal, match="data it describes has changed"):
@@ -258,6 +285,111 @@ class TestIdempotency:
         assert len(record_proposal_reviews(conn, proposal_id)) == 1
 
 
+class TestIdempotencyKeyMisuse:
+    """A key identifies one request, not one caller.
+
+    Approve and reject are opposite governance actions sharing one key index.
+    Before this was checked, replaying a *reject* under an *approve*'s key
+    returned the approved record and left the rejected proposal untouched -- the
+    caller was told their rejection succeeded while nothing had happened to the
+    proposal they named.
+    """
+
+    def test_a_key_cannot_settle_a_different_proposal(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        record_profile(conn, asset_id, a_profile(21), actor=SYSTEM_ACTOR)
+        conn.commit()
+        settled = recorded(conn, asset_id, profile_version=2)
+        untouched = recorded(conn, asset_id, profile_version=2, prompt="classify@v2")
+
+        approve(conn, settled, decision=a_decision(), idempotency_key="shared", actor=SYSTEM_ACTOR)
+        conn.commit()
+
+        # Same key, different proposal: a replay of someone else's request.
+        with pytest.raises(IdempotencyKeyReused):
+            approve(
+                conn, untouched, decision=a_decision(), idempotency_key="shared", actor=SYSTEM_ACTOR
+            )
+        conn.rollback()
+
+        history = {record.id: record.status for record in proposal_history(conn, asset_id)}
+        assert history[untouched] is ProposalStatus.PENDING_REVIEW
+
+    def test_a_reject_cannot_replay_under_an_approvals_key(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        proposal_id = recorded(conn, asset_id)
+        approve(conn, proposal_id, decision=a_decision(), idempotency_key="k", actor=SYSTEM_ACTOR)
+        conn.commit()
+
+        with pytest.raises(IdempotencyKeyReused):
+            reject(
+                conn,
+                proposal_id,
+                decision=a_decision(ReviewOutcome.REJECTED),
+                idempotency_key="k",
+                actor=SYSTEM_ACTOR,
+            )
+        conn.rollback()
+
+        current = current_classification(conn, asset_id)
+        assert current is not None and current.id == proposal_id
+
+
+class TestUnpublishableInputs:
+    def test_an_inactive_asset_cannot_publish(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The half of `_require_classifiable` nothing exercised: deleting the
+        lifecycle check left all 11 tests passing."""
+        proposal_id = recorded(conn, asset_id)
+        conn.execute("UPDATE assets SET lifecycle = 'missing' WHERE id = %s", (asset_id,))
+        conn.commit()
+
+        with pytest.raises(AssetNotClassifiable):
+            approve(conn, proposal_id, decision=a_decision(), actor=SYSTEM_ACTOR)
+        conn.rollback()
+        assert current_classification(conn, asset_id) is None
+
+    def test_evidence_citing_a_column_the_profile_lacks_is_refused(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The type checks a citation against its own column; only the stored
+        profile knows whether that column ever existed."""
+        invented = ClassificationProposal(
+            asset_id=asset_id,
+            profile_version=1,
+            prompt_version="classify@v1",
+            model_alias="steward-classify",
+            columns=(
+                ColumnClassification(
+                    column_name="not_a_real_column",
+                    labels=(SensitivityLabel.PII,),
+                    confidence=Decimal("0.9"),
+                    evidence=(
+                        EvidenceRef(
+                            profile_version=1,
+                            column_name="not_a_real_column",
+                            kind=EvidenceKind.COLUMN_NAME,
+                            detail="looks sensitive",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        with pytest.raises(EvidenceNotResolvable):
+            propose(
+                conn,
+                invented,
+                run_id=uuid4(),
+                task_id=uuid4(),
+                trace_id="trace-test",
+                actor=SYSTEM_ACTOR,
+            )
+        conn.rollback()
+
+
 class TestRejection:
     def test_rejecting_leaves_the_published_version_alone(
         self, conn: QueueConnection, asset_id: UUID
@@ -266,7 +398,7 @@ class TestRejection:
         approve(conn, first, decision=a_decision(), actor=SYSTEM_ACTOR)
         conn.commit()
 
-        record_profile(conn, asset_id, TableProfile(row_count=14), actor=SYSTEM_ACTOR)
+        record_profile(conn, asset_id, a_profile(14), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
         reject(conn, second, decision=a_decision(ReviewOutcome.REJECTED), actor=SYSTEM_ACTOR)
@@ -317,7 +449,7 @@ class TestConcurrency:
         `lock_timeout` instead, which passed with the lock removed because the
         *index* was doing the waiting.
         """
-        record_profile(conn, asset_id, TableProfile(row_count=17), actor=SYSTEM_ACTOR)
+        record_profile(conn, asset_id, a_profile(17), actor=SYSTEM_ACTOR)
         conn.commit()
         older = recorded(conn, asset_id, profile_version=2)
         newer = recorded(conn, asset_id, profile_version=2, prompt="classify@v2")
@@ -368,7 +500,7 @@ class TestConcurrency:
         approval -- and both would promote, leaving the partial unique index to
         surface a database error where the product has a decision to report."""
         first = recorded(conn, asset_id)
-        record_profile(conn, asset_id, TableProfile(row_count=16), actor=SYSTEM_ACTOR)
+        record_profile(conn, asset_id, a_profile(16), actor=SYSTEM_ACTOR)
         conn.commit()
         second = recorded(conn, asset_id, profile_version=2)
 
