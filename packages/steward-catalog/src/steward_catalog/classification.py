@@ -57,6 +57,8 @@ from steward_catalog.models import WORKSPACE_ID
 __all__ = [
     "PROPOSAL_ENTITY",
     "AssetNotClassifiable",
+    "EvidenceNotResolvable",
+    "IdempotencyKeyReused",
     "ClassificationConflict",
     "ProposalNotPending",
     "ProposalRecord",
@@ -97,6 +99,28 @@ class StaleProposal(ClassificationConflict):
 
 class AssetNotClassifiable(ClassificationConflict):
     """The asset is gone or inactive, so nothing about it can be published."""
+
+
+class IdempotencyKeyReused(ClassificationConflict):
+    """This key already settled a *different* decision.
+
+    A key identifies one request. Reusing it for another proposal, or for the
+    opposite outcome, is a caller bug -- and the dangerous kind: without this
+    check a `reject` replayed under an `approve`'s key returned the approved
+    record and silently did nothing, so the rejection looked like it had
+    happened. Approve and reject are opposite governance actions sharing one key
+    index; conflating them is worse than conflating two creates.
+    """
+
+
+class EvidenceNotResolvable(ClassificationConflict):
+    """A citation points at a column the cited profile does not contain.
+
+    The type checks that evidence cites *its own* column; only the database
+    knows whether that column was in the profile the proposal claims to have
+    read. An unresolvable citation is indistinguishable, to a reviewer, from a
+    fabricated one (#50).
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +200,7 @@ def propose(
     one competing for review (I8).
     """
     _lock(conn, proposal.asset_id)
+    _require_resolvable_evidence(conn, proposal)
     existing = conn.execute(
         _sql.SELECT_PROPOSAL_BY_REQUEST,
         {
@@ -258,7 +283,9 @@ def approve(
     """
     _lock_by_proposal(conn, proposal_id)
     if idempotency_key is not None:
-        replayed = _replayed(conn, idempotency_key)
+        replayed = _replayed(
+            conn, idempotency_key, proposal_id=proposal_id, outcome=ReviewOutcome.APPROVED
+        )
         if replayed is not None:
             return replayed
 
@@ -298,7 +325,9 @@ def reject(
     """
     _lock_by_proposal(conn, proposal_id)
     if idempotency_key is not None:
-        replayed = _replayed(conn, idempotency_key)
+        replayed = _replayed(
+            conn, idempotency_key, proposal_id=proposal_id, outcome=ReviewOutcome.REJECTED
+        )
         if replayed is not None:
             return replayed
 
@@ -326,6 +355,39 @@ def record_proposal_reviews(conn: QueueConnection, proposal_id: UUID) -> tuple[R
     """Every decision recorded against `proposal_id`, oldest first."""
     rows = conn.execute(_sql.SELECT_REVIEWS_FOR_PROPOSAL, {"proposal_id": proposal_id}).fetchall()
     return tuple(_review(row) for row in rows)
+
+
+def _require_resolvable_evidence(conn: QueueConnection, proposal: ClassificationProposal) -> None:
+    """Every citation must name a column the cited profile actually contains.
+
+    The type validator checks a citation against the proposal's own column name,
+    which catches a model citing some *other* column but not one citing a column
+    that never existed. #50 asks for evidence "resolvable back to that profile",
+    and this is the only place that can resolve it: the profile is a row, and the
+    proposal is text until it is checked against one.
+    """
+    row = conn.execute(
+        _sql.SELECT_PROFILE_VERSION,
+        {"asset_id": proposal.asset_id, "version": proposal.profile_version},
+    ).fetchone()
+    if row is None:
+        raise EvidenceNotResolvable(
+            f"asset {proposal.asset_id} has no profile version {proposal.profile_version} "
+            "to resolve this proposal's evidence against"
+        )
+    profiled = {column["name"] for column in row[0].get("columns", ())}
+    cited = {
+        reference.column_name
+        for column in proposal.columns
+        for reference in column.evidence
+    } | {column.column_name for column in proposal.columns}
+    unknown = sorted(cited - profiled)
+    if unknown:
+        raise EvidenceNotResolvable(
+            f"profile version {proposal.profile_version} has no column(s) "
+            f"{', '.join(unknown)}; a citation that resolves to nothing is one a "
+            "reviewer cannot check"
+        )
 
 
 def _lock(conn: QueueConnection, asset_id: UUID) -> None:
@@ -372,14 +434,33 @@ def _require_classifiable(conn: QueueConnection, target: ProposalRecord) -> None
         )
 
 
-def _replayed(conn: QueueConnection, idempotency_key: str) -> ProposalRecord | None:
-    """The proposal a previous decision under this key already settled."""
+def _replayed(
+    conn: QueueConnection,
+    idempotency_key: str,
+    *,
+    proposal_id: UUID,
+    outcome: ReviewOutcome,
+) -> ProposalRecord | None:
+    """The proposal a previous decision under this key settled, if it is *this* one.
+
+    Both halves are checked, and both were missing. A key that settled another
+    proposal, or the opposite outcome, is not a replay of this request: it is
+    the same key used for a different one. Returning the earlier record then
+    told a caller their decision had succeeded when nothing had happened to the
+    proposal they named -- a rejection that silently did not reject.
+    """
     row = conn.execute(
         _sql.SELECT_REVIEW_BY_KEY, {"idempotency_key": idempotency_key}
     ).fetchone()
     if row is None:
         return None
-    return _locked_proposal(conn, _review(row).proposal_id)
+    review = _review(row)
+    if review.proposal_id != proposal_id or review.outcome is not outcome:
+        raise IdempotencyKeyReused(
+            f"key {idempotency_key!r} already recorded {review.outcome.value} on proposal "
+            f"{review.proposal_id}; it cannot also record {outcome.value} on {proposal_id}"
+        )
+    return _locked_proposal(conn, review.proposal_id)
 
 
 def _record_decision(
