@@ -701,6 +701,45 @@ class TestFailurePaths:
         settled = get_run(conn, run.id)
         assert settled is not None and settled.usage.over(settled.budget) == ()
 
+    async def test_a_retry_cannot_spend_the_cap_a_second_time(
+        self, dsn: str, conn: QueueConnection
+    ) -> None:
+        """A non-checkpointing handler restarts from zero on every attempt, so
+        without this it could spend part of its budget, fail, and then spend the
+        whole thing again -- each attempt fitting its cap and the total blowing
+        it, invisibly to both the reservation and `_overspent`, which each look
+        at one attempt at a time (#69 review)."""
+        spec = affordable(
+            conn,
+            task_type=SPENDS_WHAT_IS_LEFT,
+            payload={"fail_first": True},
+            max_attempts=2,
+            attempts_affordable=1,
+        )
+        worker = Worker(dsn, "w1", retry_base_delay=NO_BACKOFF)
+
+        assert await worker.run_once() == 1  # spends some of it, then fails
+        assert await worker.run_once() == 1  # retried, and helps itself to the rest
+
+        task = get_task(conn, spec.task_id)
+        assert task is not None and task.state is TaskState.SUCCEEDED
+
+        # Asserted on the **task's** accumulator, not the run's. `runs.used_*`
+        # is clamped at the cap by `ADD_RUN_USAGE` (SPEC §13 D12), so it reads
+        # "exactly one budget" whether or not the task actually spent two --
+        # which made an earlier version of this test pass with the fix removed.
+        # `tasks.used_*` is unclamped and is where a second helping shows.
+        spent = conn.execute(
+            "SELECT used_steps, used_tokens FROM tasks WHERE id = %s", (spec.task_id,)
+        ).fetchone()
+        assert spent is not None
+        assert spent == (ONE_ATTEMPT.steps, ONE_ATTEMPT.tokens), (
+            "the two attempts spent more than one budget between them"
+        )
+        run = get_run(conn, spec.run_id)
+        assert run is not None
+        assert run.usage.over(run.budget) == ()
+
     async def test_a_partly_spent_task_is_still_retried(
         self, dsn: str, conn: QueueConnection
     ) -> None:
