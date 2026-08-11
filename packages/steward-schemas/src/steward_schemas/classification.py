@@ -26,7 +26,6 @@ the agent produces it. Those are `steward-catalog`, `steward-api` and
 
 from __future__ import annotations
 
-from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
@@ -41,7 +40,7 @@ __all__ = [
     "EvidenceKind",
     "EvidenceRef",
     "ProposalStatus",
-    "ReviewDecision",
+    "ReviewCommand",
     "ReviewOutcome",
     "SensitivityLabel",
 ]
@@ -98,8 +97,28 @@ class EvidenceRef(SchemaModel):
     profile_version: int = Field(ge=1)
     column_name: str = Field(min_length=1)
     kind: EvidenceKind
+    locator: str = Field(min_length=1, max_length=200)
+    """The value being cited, exactly as the profile stores it.
+
+    A *locator*, not a description: `detail` is prose and cannot be resolved, so
+    a citation carrying only prose proves the column exists and nothing else --
+    `MASKED_SAMPLE` passed whether or not the profile held any such sample. This
+    field is checked against the stored profile, per kind:
+
+    | kind | resolves against |
+    |---|---|
+    | `COLUMN_NAME` | the column's name |
+    | `DATA_TYPE` | its `data_type` |
+    | `NULL_RATIO` / `DISTINCT_RATIO` | the stored ratio |
+    | `SEMANTIC_TYPE` | the stored semantic type |
+    | `MASKED_SAMPLE` | one of the column's masked `top_values` |
+
+    So a reviewer following a citation lands on the fact it was drawn from,
+    rather than on the classifier's account of it.
+    """
+
     detail: str = Field(min_length=1, max_length=500)
-    """What the cited evidence says, in the classifier's words.
+    """Why that value supports the label, in the classifier's words.
 
     Bounded because it is model output that will be shown to a reviewer and
     stored forever; unbounded prose here is how a proposal row becomes a place
@@ -213,18 +232,33 @@ class ReviewOutcome(StrEnum):
     REJECTED = "rejected"
 
 
-class ReviewDecision(SchemaModel):
-    """A human's or a policy's decision on a proposal.
+class ReviewCommand(SchemaModel):
+    """What a reviewer *asks for*, and nothing more.
 
-    `policy_id` is present on an auto-approval and absent on a human one, and
-    both are recorded the same way. SPEC §3.3 requires an auto-approval to be
-    auditable back to the policy that allowed it -- so it is a review decision
-    with a policy attached, never an agent deciding its own output is fit to
-    publish.
+    Deliberately not a decision: it carries no outcome, no actor and no
+    timestamp, because a caller must not be able to supply any of them.
+
+    * **Outcome** comes from the method called. When it lived here,
+      `approve(decision=ReviewDecision(outcome=REJECTED))` was representable: it
+      recorded a rejection and published the proposal, so the review table and
+      the proposal disagreed about what happened.
+    * **Actor** comes from the trusted `Actor` the repository is given, the same
+      one the audit row uses. When both existed the tests attributed one action
+      to `"reviewer"` in the review table and to the system in the audit log --
+      the same decision, two different authors.
+    * **Time** comes from the database. A caller-supplied timestamp was accepted
+      and then ignored, which is worse than refusing it: the field looked
+      authoritative and was decoration.
+
+    What remains is what only the reviewer knows: why, and under which policy.
     """
 
-    outcome: ReviewOutcome
-    actor: str = Field(min_length=1)
     reason: str = Field(min_length=1, max_length=1000)
     policy_id: str | None = None
-    decided_at: datetime
+    """Set only by an automatic approval, and only by a `POLICY` actor.
+
+    SPEC §3.3 allows auto-approval through an explicit configured policy and
+    requires it to be auditable back to that policy. A human decision carrying a
+    policy id would be a person claiming a policy approved something -- the one
+    attribution this table exists to keep honest -- so the repository refuses it.
+    """

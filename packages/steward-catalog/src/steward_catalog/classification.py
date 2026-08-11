@@ -43,12 +43,16 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
-from steward_queue import Actor, QueueConnection, write_audit
+from steward_queue import Actor, ActorKind, QueueConnection, write_audit
 from steward_schemas import (
     ClassificationProposal,
+    ColumnProfile,
+    EvidenceKind,
+    EvidenceRef,
     ProposalStatus,
-    ReviewDecision,
+    ReviewCommand,
     ReviewOutcome,
+    TableProfile,
 )
 
 from steward_catalog import _classification_sql as _sql
@@ -148,7 +152,7 @@ class ReviewRecord:
     id: UUID
     proposal_id: UUID
     outcome: ReviewOutcome
-    actor: str
+    actor: Actor
     reason: str
     policy_id: str | None
     decided_at: datetime
@@ -176,10 +180,10 @@ def _review(row: Sequence[Any]) -> ReviewRecord:
         id=row[0],
         proposal_id=row[1],
         outcome=ReviewOutcome(row[2]),
-        actor=row[3],
-        reason=row[4],
-        policy_id=row[5],
-        decided_at=row[6],
+        actor=Actor(kind=ActorKind(row[3]), id=row[4]),
+        reason=row[5],
+        policy_id=row[6],
+        decided_at=row[7],
     )
 
 
@@ -260,11 +264,16 @@ def approve(
     conn: QueueConnection,
     proposal_id: UUID,
     *,
-    decision: ReviewDecision,
+    command: ReviewCommand,
     idempotency_key: str | None = None,
     actor: Actor,
 ) -> ProposalRecord:
     """Publish `proposal_id`, superseding whatever it replaces, atomically.
+
+    The outcome is this method's, not the caller's: `APPROVED` is what calling
+    `approve` means. When the caller supplied it, a rejection could be recorded
+    while the proposal was published, and the two tables disagreed about what
+    had happened.
 
     The sequence, and each step is load-bearing:
 
@@ -303,7 +312,11 @@ def approve(
             f"approving version {target.version} would publish an older classification"
         )
 
-    _record_decision(conn, target, decision, idempotency_key)
+    replayed = _record_decision(
+        conn, target, command, ReviewOutcome.APPROVED, idempotency_key, actor=actor
+    )
+    if replayed is not None:
+        return replayed
     if incumbent is not None:
         _set_status(conn, incumbent, ProposalStatus.SUPERSEDED, actor=actor)
     published = _set_status(conn, target, ProposalStatus.APPROVED, actor=actor)
@@ -314,7 +327,7 @@ def reject(
     conn: QueueConnection,
     proposal_id: UUID,
     *,
-    decision: ReviewDecision,
+    command: ReviewCommand,
     idempotency_key: str | None = None,
     actor: Actor,
 ) -> ProposalRecord:
@@ -336,7 +349,11 @@ def reject(
         raise ProposalNotPending(
             f"proposal {proposal_id} is {target.status.value}, not pending review"
         )
-    _record_decision(conn, target, decision, idempotency_key)
+    replayed = _record_decision(
+        conn, target, command, ReviewOutcome.REJECTED, idempotency_key, actor=actor
+    )
+    if replayed is not None:
+        return replayed
     return _set_status(conn, target, ProposalStatus.REJECTED, actor=actor)
 
 
@@ -358,13 +375,17 @@ def record_proposal_reviews(conn: QueueConnection, proposal_id: UUID) -> tuple[R
 
 
 def _require_resolvable_evidence(conn: QueueConnection, proposal: ClassificationProposal) -> None:
-    """Every citation must name a column the cited profile actually contains.
+    """Every citation must resolve to a fact the cited profile actually holds.
 
-    The type validator checks a citation against the proposal's own column name,
-    which catches a model citing some *other* column but not one citing a column
-    that never existed. #50 asks for evidence "resolvable back to that profile",
-    and this is the only place that can resolve it: the profile is a row, and the
-    proposal is text until it is checked against one.
+    Two levels, and the second is the one that matters. The column must exist --
+    a citation naming a column that never did is unverifiable. But so is one
+    naming a real column and an invented sample, which is what "the column
+    exists" alone allowed: `MASKED_SAMPLE` passed whether or not the profile
+    held any such value. So each reference carries a `locator` and it is checked
+    against the stored profile per kind.
+
+    This is the only place that can do it. The type validator sees the proposal;
+    only the database has the profile the proposal claims to have read (#50).
     """
     row = conn.execute(
         _sql.SELECT_PROFILE_VERSION,
@@ -375,19 +396,45 @@ def _require_resolvable_evidence(conn: QueueConnection, proposal: Classification
             f"asset {proposal.asset_id} has no profile version {proposal.profile_version} "
             "to resolve this proposal's evidence against"
         )
-    profiled = {column["name"] for column in row[0].get("columns", ())}
-    cited = {
-        reference.column_name
-        for column in proposal.columns
-        for reference in column.evidence
-    } | {column.column_name for column in proposal.columns}
-    unknown = sorted(cited - profiled)
-    if unknown:
+    profile = TableProfile.model_validate(row[0])
+    columns = {column.name: column for column in profile.columns}
+    for classification in proposal.columns:
+        profiled = columns.get(classification.column_name)
+        if profiled is None:
+            raise EvidenceNotResolvable(
+                f"profile version {proposal.profile_version} has no column "
+                f"{classification.column_name!r}; a citation that resolves to nothing is "
+                "one a reviewer cannot check"
+            )
+        for reference in classification.evidence:
+            _resolve(reference, profiled, proposal.profile_version)
+
+
+def _resolve(reference: EvidenceRef, column: ColumnProfile, version: int) -> None:
+    """Check one citation's locator against the fact it names."""
+    stored = _stored_values(column)[reference.kind]
+    if reference.locator not in stored:
         raise EvidenceNotResolvable(
-            f"profile version {proposal.profile_version} has no column(s) "
-            f"{', '.join(unknown)}; a citation that resolves to nothing is one a "
-            "reviewer cannot check"
+            f"{column.name}: {reference.kind.value} evidence cites {reference.locator!r}, "
+            f"which profile version {version} does not contain "
+            f"({', '.join(sorted(stored)) or 'nothing of that kind is recorded'})"
         )
+
+
+def _stored_values(column: ColumnProfile) -> dict[EvidenceKind, set[str]]:
+    """What each kind of citation may legitimately name, for this column.
+
+    Rendered as text because that is how a model cites them and how they are
+    stored in the proposal; the profile's own types are the source.
+    """
+    return {
+        EvidenceKind.COLUMN_NAME: {column.name},
+        EvidenceKind.DATA_TYPE: {column.data_type},
+        EvidenceKind.NULL_RATIO: {str(column.null_ratio)},
+        EvidenceKind.DISTINCT_RATIO: {str(column.distinct_ratio)},
+        EvidenceKind.SEMANTIC_TYPE: {column.semantic_type.value},
+        EvidenceKind.MASKED_SAMPLE: {str(value.value) for value in column.top_values},
+    }
 
 
 def _lock(conn: QueueConnection, asset_id: UUID) -> None:
@@ -466,21 +513,64 @@ def _replayed(
 def _record_decision(
     conn: QueueConnection,
     target: ProposalRecord,
-    decision: ReviewDecision,
+    command: ReviewCommand,
+    outcome: ReviewOutcome,
     idempotency_key: str | None,
-) -> None:
-    conn.execute(
+    *,
+    actor: Actor,
+) -> ProposalRecord | None:
+    """Append the decision, or discover that this key already settled one.
+
+    Returns the settled proposal when the insert lost the key -- the caller then
+    returns it *without changing any status*, because the winning transaction
+    already did. Returns `None` when this call recorded the decision and should
+    proceed.
+
+    The check is here, after the sequential one in `approve`/`reject`, because
+    the two catch different races. That one catches a key reused in a later
+    transaction. This catches two decisions **on different assets**, which hold
+    different advisory locks and therefore contend for nothing until they reach
+    this index: both would see no existing key, both would proceed, one insert
+    would silently do nothing, and two proposals would change status on the
+    strength of one review event.
+    """
+    if command.policy_id is not None and actor.kind is not ActorKind.POLICY:
+        raise ClassificationConflict(
+            f"a policy id may only accompany a {ActorKind.POLICY.value} actor; "
+            f"{actor.kind.value} {actor.id!r} cannot record an automatic approval "
+            "as though a policy made it"
+        )
+    row = conn.execute(
         _sql.INSERT_REVIEW,
         {
             "id": uuid4(),
             "proposal_id": target.id,
-            "outcome": decision.outcome.value,
-            "actor": decision.actor,
-            "reason": decision.reason,
-            "policy_id": decision.policy_id,
+            "outcome": outcome.value,
+            # From the trusted actor, never the command: the review table and the
+            # audit row must name the same author of the same action.
+            "actor_kind": actor.kind.value,
+            "actor_id": actor.id,
+            "reason": command.reason,
+            "policy_id": command.policy_id,
             "idempotency_key": idempotency_key,
         },
-    )
+    ).fetchone()
+    if row is not None:
+        return None
+    # No row: another transaction holds this key. It is a replay only if it is
+    # the same request; anything else is a key doing two jobs.
+    winner = conn.execute(
+        _sql.SELECT_REVIEW_BY_KEY, {"idempotency_key": idempotency_key}
+    ).fetchone()
+    if winner is None:  # pragma: no cover -- the conflict implies a row exists
+        raise ClassificationConflict("the decision was neither recorded nor found")
+    settled = _review(winner)
+    if settled.proposal_id != target.id or settled.outcome is not outcome:
+        raise IdempotencyKeyReused(
+            f"key {idempotency_key!r} already recorded {settled.outcome.value} on proposal "
+            f"{settled.proposal_id}; it cannot also record {outcome.value} on {target.id}"
+        )
+    return _locked_proposal(conn, settled.proposal_id)
 
 
 def _set_status(

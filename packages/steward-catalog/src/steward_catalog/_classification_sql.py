@@ -78,23 +78,28 @@ RETURNING id, asset_id, version, profile_version, prompt_version, model_alias, s
           proposal, run_id, task_id, trace_id, created_at
 """
 
+# `DO NOTHING` returns no row when another transaction won the key, and the
+# caller must notice: proceeding would change a proposal's status on the
+# strength of somebody else's review event. The unique index is also the
+# serialisation point -- two decisions on *different* assets hold different
+# advisory locks, so the key is the only thing they contend for.
 INSERT_REVIEW = """
 INSERT INTO classification_reviews
-    (id, proposal_id, outcome, actor, reason, policy_id, idempotency_key)
-VALUES (%(id)s, %(proposal_id)s, %(outcome)s, %(actor)s, %(reason)s, %(policy_id)s,
-        %(idempotency_key)s)
+    (id, proposal_id, outcome, actor_kind, actor_id, reason, policy_id, idempotency_key)
+VALUES (%(id)s, %(proposal_id)s, %(outcome)s, %(actor_kind)s, %(actor_id)s, %(reason)s,
+        %(policy_id)s, %(idempotency_key)s)
 ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-RETURNING id, proposal_id, outcome, actor, reason, policy_id, decided_at
+RETURNING id, proposal_id, outcome, actor_kind, actor_id, reason, policy_id, decided_at
 """
 
 SELECT_REVIEW_BY_KEY = """
-SELECT id, proposal_id, outcome, actor, reason, policy_id, decided_at
+SELECT id, proposal_id, outcome, actor_kind, actor_id, reason, policy_id, decided_at
 FROM classification_reviews
 WHERE idempotency_key = %(idempotency_key)s
 """
 
 SELECT_REVIEWS_FOR_PROPOSAL = """
-SELECT id, proposal_id, outcome, actor, reason, policy_id, decided_at
+SELECT id, proposal_id, outcome, actor_kind, actor_id, reason, policy_id, decided_at
 FROM classification_reviews
 WHERE proposal_id = %(proposal_id)s
 ORDER BY decided_at, id

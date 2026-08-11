@@ -85,7 +85,13 @@ CREATE TABLE classification_reviews (
     id uuid PRIMARY KEY,
     proposal_id uuid NOT NULL REFERENCES classification_proposals (id) ON DELETE CASCADE,
     outcome text NOT NULL CHECK (outcome IN ('approved', 'rejected')),
-    actor text NOT NULL,
+    -- Kind and id, not one flattened string: the actor is the trusted `Actor`
+    -- the repository was given, the same one the audit row records, and
+    -- collapsing it into free text would make "who approved this" a value a
+    -- caller could shape. `policy_id` is meaningful only for a `policy` actor,
+    -- which the repository enforces (SPEC §3.3).
+    actor_kind text NOT NULL CHECK (actor_kind IN ('human', 'agent', 'policy', 'system')),
+    actor_id text NOT NULL,
     reason text NOT NULL,
     policy_id text,
     idempotency_key text,
