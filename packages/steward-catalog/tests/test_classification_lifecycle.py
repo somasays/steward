@@ -50,15 +50,20 @@ from steward_schemas import (
     ColumnProfile,
     EvidenceKind,
     EvidenceRef,
+    MaskedSample,
     ProposalStatus,
     ReviewCommand,
     ReviewOutcome,
+    SemanticType,
     SensitivityLabel,
     SourceCreate,
     TableProfile,
     TaskSpec,
     TaskStatus,
+    ValueFrequency,
 )
+
+MASKED_EMAIL = "j***@g***.***"
 
 SELECT_ASSET_ID = (
     "SELECT id FROM assets WHERE schema_name = %(schema)s AND name = %(name)s"
@@ -83,6 +88,12 @@ def a_profile(row_count: int) -> TableProfile:
                 null_ratio=Decimal("0"),
                 distinct_count=row_count,
                 distinct_ratio=Decimal("1"),
+                top_values=(
+                    ValueFrequency(
+                        value=MaskedSample(masked=MASKED_EMAIL, semantic_type=SemanticType.EMAIL),
+                        count=row_count,
+                    ),
+                ),
             ),
         ),
     )
@@ -430,8 +441,10 @@ class TestUnpublishableInputs:
                             profile_version=1,
                             column_name="email",
                             kind=EvidenceKind.MASKED_SAMPLE,
-                            locator="j***@g***.***",
-                            detail="an email-shaped sample",
+                            # The profile records `j***@g***.***` and nothing
+                            # else, so this names a sample that was never taken.
+                            locator="4***-****-****-1234",
+                            detail="a card-shaped sample",
                         ),
                     ),
                 ),
@@ -614,7 +627,7 @@ class TestAttribution:
         proposal_id = recorded(conn, asset_id)
         policy = Actor(kind=ActorKind.POLICY, id="auto-approve-low-risk")
 
-        approve(conn, proposal_id, command=a_command(policy_id="auto-approve-low-risk"), actor=policy)
+        approve(conn, proposal_id, command=a_command(policy_id=policy.id), actor=policy)
         conn.commit()
 
         review = record_proposal_reviews(conn, proposal_id)[0]
@@ -700,3 +713,197 @@ class TestConcurrentKeyReuse:
             "approved",
             "pending_review",
         ]
+
+
+class TestEvidenceResolvesPositively:
+    """The path the negative tests could not see.
+
+    "Rejects a sample the profile never recorded" passed while the
+    implementation rejected *every* sample: the locator set was built from
+    `str(MaskedSample(...))`, which is the model's repr, not the masked value.
+    Only citing a **real** sample can tell those two apart.
+    """
+
+    def test_a_citation_of_a_recorded_masked_sample_is_accepted(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        cited = ClassificationProposal(
+            asset_id=asset_id,
+            profile_version=1,
+            prompt_version="classify@v1",
+            model_alias="steward-classify",
+            columns=(
+                ColumnClassification(
+                    column_name="email",
+                    labels=(SensitivityLabel.PII,),
+                    confidence=Decimal("0.97"),
+                    evidence=(
+                        EvidenceRef(
+                            profile_version=1,
+                            column_name="email",
+                            kind=EvidenceKind.MASKED_SAMPLE,
+                            locator=MASKED_EMAIL,
+                            detail="the sampled values are email-shaped",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        record = propose(
+            conn, cited, run_id=uuid4(), task_id=uuid4(), trace_id="t", actor=SYSTEM_ACTOR
+        )
+        conn.commit()
+        assert record.status is ProposalStatus.PENDING_REVIEW
+
+    def test_every_kind_of_locator_resolves_against_the_stored_profile(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """One citation of each kind, all naming what the fixture profile holds."""
+        kinds = (
+            (EvidenceKind.COLUMN_NAME, "email"),
+            (EvidenceKind.DATA_TYPE, "text"),
+            (EvidenceKind.NULL_RATIO, "0"),
+            (EvidenceKind.DISTINCT_RATIO, "1"),
+            (EvidenceKind.SEMANTIC_TYPE, SemanticType.UNKNOWN.value),
+            (EvidenceKind.MASKED_SAMPLE, MASKED_EMAIL),
+        )
+        every_kind = ClassificationProposal(
+            asset_id=asset_id,
+            profile_version=1,
+            prompt_version="classify@every-kind",
+            model_alias="steward-classify",
+            columns=(
+                ColumnClassification(
+                    column_name="email",
+                    labels=(SensitivityLabel.PII,),
+                    confidence=Decimal("0.99"),
+                    evidence=tuple(
+                        EvidenceRef(
+                            profile_version=1,
+                            column_name="email",
+                            kind=kind,
+                            locator=locator,
+                            detail=f"cited as {kind.value}",
+                        )
+                        for kind, locator in kinds
+                    ),
+                ),
+            ),
+        )
+        record = propose(
+            conn, every_kind, run_id=uuid4(), task_id=uuid4(), trace_id="t", actor=SYSTEM_ACTOR
+        )
+        conn.commit()
+        assert len(record.proposal.columns[0].evidence) == len(kinds)
+
+
+class TestKeyIdentifiesTheWholeCommand:
+    """A key names a governance command, not a target and a verb.
+
+    Comparing only proposal and outcome let one caller's key carry another's
+    decision: alice approves P with reason A under key K; bob approves P with
+    reason B under K and is told his review succeeded, though only alice's was
+    ever recorded.
+    """
+
+    def test_a_different_actor_under_the_same_key_is_refused(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        proposal_id = recorded(conn, asset_id)
+        alice = Actor(kind=ActorKind.HUMAN, id="alice")
+        bob = Actor(kind=ActorKind.HUMAN, id="bob")
+        approve(conn, proposal_id, command=a_command(), idempotency_key="k", actor=alice)
+        conn.commit()
+
+        with pytest.raises(IdempotencyKeyReused):
+            approve(conn, proposal_id, command=a_command(), idempotency_key="k", actor=bob)
+        conn.rollback()
+
+        assert record_proposal_reviews(conn, proposal_id)[0].actor == alice
+
+    def test_a_different_reason_under_the_same_key_is_refused(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        proposal_id = recorded(conn, asset_id)
+        approve(conn, proposal_id, command=a_command(), idempotency_key="k", actor=SYSTEM_ACTOR)
+        conn.commit()
+
+        with pytest.raises(IdempotencyKeyReused):
+            approve(
+                conn,
+                proposal_id,
+                command=ReviewCommand(reason="a different justification entirely"),
+                idempotency_key="k",
+                actor=SYSTEM_ACTOR,
+            )
+        conn.rollback()
+        assert len(record_proposal_reviews(conn, proposal_id)) == 1
+
+    def test_a_different_policy_under_the_same_key_is_refused(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        proposal_id = recorded(conn, asset_id)
+        first = Actor(kind=ActorKind.POLICY, id="policy-a")
+        approve(
+            conn, proposal_id, command=a_command(policy_id="policy-a"), idempotency_key="k", actor=first
+        )
+        conn.commit()
+
+        second = Actor(kind=ActorKind.POLICY, id="policy-b")
+        with pytest.raises(IdempotencyKeyReused):
+            approve(
+                conn,
+                proposal_id,
+                command=a_command(policy_id="policy-b"),
+                idempotency_key="k",
+                actor=second,
+            )
+        conn.rollback()
+        assert record_proposal_reviews(conn, proposal_id)[0].policy_id == "policy-a"
+
+    def test_the_identical_command_still_replays(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """Scoping must not break the case idempotency exists for."""
+        proposal_id = recorded(conn, asset_id)
+        first = approve(
+            conn, proposal_id, command=a_command(), idempotency_key="k", actor=SYSTEM_ACTOR
+        )
+        conn.commit()
+        again = approve(
+            conn, proposal_id, command=a_command(), idempotency_key="k", actor=SYSTEM_ACTOR
+        )
+        conn.commit()
+
+        assert again.id == first.id and again.status is ProposalStatus.APPROVED
+        assert len(record_proposal_reviews(conn, proposal_id)) == 1
+
+
+class TestPolicyAttribution:
+    """An automatic approval resolves to the policy that made it — exactly."""
+
+    def test_a_policy_actor_without_a_policy_id_is_refused(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        proposal_id = recorded(conn, asset_id)
+        with pytest.raises(ClassificationConflict, match="no policy id"):
+            approve(
+                conn,
+                proposal_id,
+                command=a_command(),
+                actor=Actor(kind=ActorKind.POLICY, id="auto"),
+            )
+        conn.rollback()
+
+    def test_a_policy_cannot_attribute_to_another_policy(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        proposal_id = recorded(conn, asset_id)
+        with pytest.raises(ClassificationConflict, match="other than the one making it"):
+            approve(
+                conn,
+                proposal_id,
+                command=a_command(policy_id="policy-b"),
+                actor=Actor(kind=ActorKind.POLICY, id="policy-a"),
+            )
+        conn.rollback()

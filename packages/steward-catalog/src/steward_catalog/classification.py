@@ -293,7 +293,12 @@ def approve(
     _lock_by_proposal(conn, proposal_id)
     if idempotency_key is not None:
         replayed = _replayed(
-            conn, idempotency_key, proposal_id=proposal_id, outcome=ReviewOutcome.APPROVED
+            conn,
+            idempotency_key,
+            proposal_id=proposal_id,
+            outcome=ReviewOutcome.APPROVED,
+            command=command,
+            actor=actor,
         )
         if replayed is not None:
             return replayed
@@ -339,7 +344,12 @@ def reject(
     _lock_by_proposal(conn, proposal_id)
     if idempotency_key is not None:
         replayed = _replayed(
-            conn, idempotency_key, proposal_id=proposal_id, outcome=ReviewOutcome.REJECTED
+            conn,
+            idempotency_key,
+            proposal_id=proposal_id,
+            outcome=ReviewOutcome.REJECTED,
+            command=command,
+            actor=actor,
         )
         if replayed is not None:
             return replayed
@@ -433,7 +443,7 @@ def _stored_values(column: ColumnProfile) -> dict[EvidenceKind, set[str]]:
         EvidenceKind.NULL_RATIO: {str(column.null_ratio)},
         EvidenceKind.DISTINCT_RATIO: {str(column.distinct_ratio)},
         EvidenceKind.SEMANTIC_TYPE: {column.semantic_type.value},
-        EvidenceKind.MASKED_SAMPLE: {str(value.value) for value in column.top_values},
+        EvidenceKind.MASKED_SAMPLE: {frequency.value.masked for frequency in column.top_values},
     }
 
 
@@ -487,6 +497,8 @@ def _replayed(
     *,
     proposal_id: UUID,
     outcome: ReviewOutcome,
+    command: ReviewCommand,
+    actor: Actor,
 ) -> ProposalRecord | None:
     """The proposal a previous decision under this key settled, if it is *this* one.
 
@@ -502,12 +514,75 @@ def _replayed(
     if row is None:
         return None
     review = _review(row)
-    if review.proposal_id != proposal_id or review.outcome is not outcome:
+    if not _same_request(
+        review, proposal_id=proposal_id, outcome=outcome, command=command, actor=actor
+    ):
         raise IdempotencyKeyReused(
             f"key {idempotency_key!r} already recorded {review.outcome.value} on proposal "
-            f"{review.proposal_id}; it cannot also record {outcome.value} on {proposal_id}"
+            f"{review.proposal_id} by {review.actor.kind.value} {review.actor.id!r}; "
+            "it cannot also record a different decision"
         )
     return _locked_proposal(conn, review.proposal_id)
+
+
+def _require_consistent_policy(command: ReviewCommand, actor: Actor) -> None:
+    """An automatic approval resolves to the policy that made it, exactly.
+
+    Three rules, and each closes a direction the others leave open. Only the
+    first was enforced, which let a `policy` actor record a decision with no
+    policy at all, or with a policy id naming *someone else's* policy -- both of
+    which make "which policy approved this" unanswerable while looking audited
+    (SPEC §3.3).
+
+    `policy_id == actor.id` because in this representation they are the same
+    thing: the actor *is* the policy. If they are ever meant to differ, that
+    needs a trusted mapping rather than two free-form strings permitted to
+    disagree.
+    """
+    if actor.kind is ActorKind.POLICY:
+        if command.policy_id is None:
+            raise ClassificationConflict(
+                f"policy actor {actor.id!r} recorded no policy id; an automatic approval "
+                "that cannot name its policy is not auditable back to one"
+            )
+        if command.policy_id != actor.id:
+            raise ClassificationConflict(
+                f"policy actor {actor.id!r} recorded policy id {command.policy_id!r}; "
+                "an approval cannot be attributed to a policy other than the one making it"
+            )
+        return
+    if command.policy_id is not None:
+        raise ClassificationConflict(
+            f"a policy id may only accompany a {ActorKind.POLICY.value} actor; "
+            f"{actor.kind.value} {actor.id!r} cannot record an automatic approval "
+            "as though a policy made it"
+        )
+
+
+def _same_request(
+    settled: ReviewRecord,
+    *,
+    proposal_id: UUID,
+    outcome: ReviewOutcome,
+    command: ReviewCommand,
+    actor: Actor,
+) -> bool:
+    """Whether a key's earlier decision is *this* request, in full.
+
+    A key identifies a governance command, not a target and a verb. Comparing
+    only proposal and outcome let one caller's key carry another's decision:
+    alice approves P with reason A under key K, bob approves P with reason B
+    under the same key, and bob is told his review succeeded though only
+    alice's was ever recorded. Actor, reason and policy are as much a part of
+    the command as its target.
+    """
+    return (
+        settled.proposal_id == proposal_id
+        and settled.outcome is outcome
+        and settled.actor == actor
+        and settled.reason == command.reason
+        and settled.policy_id == command.policy_id
+    )
 
 
 def _record_decision(
@@ -534,12 +609,7 @@ def _record_decision(
     would silently do nothing, and two proposals would change status on the
     strength of one review event.
     """
-    if command.policy_id is not None and actor.kind is not ActorKind.POLICY:
-        raise ClassificationConflict(
-            f"a policy id may only accompany a {ActorKind.POLICY.value} actor; "
-            f"{actor.kind.value} {actor.id!r} cannot record an automatic approval "
-            "as though a policy made it"
-        )
+    _require_consistent_policy(command, actor)
     row = conn.execute(
         _sql.INSERT_REVIEW,
         {
@@ -565,10 +635,13 @@ def _record_decision(
     if winner is None:  # pragma: no cover -- the conflict implies a row exists
         raise ClassificationConflict("the decision was neither recorded nor found")
     settled = _review(winner)
-    if settled.proposal_id != target.id or settled.outcome is not outcome:
+    if not _same_request(
+        settled, proposal_id=target.id, outcome=outcome, command=command, actor=actor
+    ):
         raise IdempotencyKeyReused(
             f"key {idempotency_key!r} already recorded {settled.outcome.value} on proposal "
-            f"{settled.proposal_id}; it cannot also record {outcome.value} on {target.id}"
+            f"{settled.proposal_id} by {settled.actor.kind.value} {settled.actor.id!r}; "
+            "it cannot also record a different decision"
         )
     return _locked_proposal(conn, settled.proposal_id)
 
