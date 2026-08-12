@@ -47,6 +47,24 @@ transaction, the advisory lock, and the evidence locators.
 found real defects, but the branch was far too large to review well. Steps 3–5 merged as PR #81. **The
 active work is steps 6–8**, branched from `main`.
 
+### The order to build it in
+
+Straight down the vertical path — each step is worth having on its own, and none of them is a layer
+built for a later step's benefit:
+
+1. Register the classifier goal and its worker task type.
+2. Load one immutable current profile version.
+3. Build the evidence-only agent input from it.
+4. Add the versioned prompt artifact.
+5. Run it through the existing #69 runtime.
+6. Persist the typed proposal as `pending_review` (`steward_catalog.classification.propose`).
+7. Add start / read / history / current / review API behaviour.
+8. Prove API → queue → worker → agent → review → published classification against real PostgreSQL.
+
+**Nothing else belongs in this increment.** No lifecycle redesign, no new runtime abstraction, no B2
+evaluation, no automatic scheduling (#72), no Documentarian (#51). B2 and the live proxy smoke test are
+the increment *after*, because both need the completed agent path to exist first.
+
 ### The contracts for steps 6–8
 
 - **Register `steward-classify`; do not build another runtime.** The bounded loop, budgets, checkpointing,
