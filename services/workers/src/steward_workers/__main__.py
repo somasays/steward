@@ -14,8 +14,14 @@ import os
 import signal
 import socket
 import uuid
+from collections.abc import Callable, Mapping
 
 import steward_catalog  # noqa: F401 -- imported for its side effect: registers `scan_source`
+from steward_catalog import (
+    CLASSIFY_ASSET_TASK_TYPE,
+    classifier_bound,
+    provide_classifier,
+)
 from steward_llm import (
     PROXY_KEY_ENV,
     PROXY_URL_ENV,
@@ -30,8 +36,42 @@ from steward_queue import DSN_ENV, Worker, registered_types
 from steward_telemetry import Tracer, tracer_from_env
 
 from steward_workers import agent_tasks
+from steward_workers.classifier import AgentColumnClassifier
 
 WORKER_ID_ENV = "STEWARD_WORKER_ID"
+
+CAPABILITIES: Mapping[str, Callable[[], bool]] = {
+    CLASSIFY_ASSET_TASK_TYPE: classifier_bound,
+}
+"""Registered task types this process may only claim if it can actually do them.
+
+Most handlers are executable by any process that imported their package. A few
+need a *capability* the package cannot supply -- `classify_asset` needs a model,
+which `steward-catalog` may not reach (I4) and only a composition root may
+configure (I15) -- and those are registered systemwide but claimable per process.
+
+The map is keyed on the pathology rather than listing the safe cases: a task
+type absent from it is claimable, and a type in it is claimable exactly when its
+predicate says the capability is present. Adding a second agent-backed handler
+means adding a row, not remembering to edit a filter.
+"""
+
+
+def claimable_types() -> tuple[str, ...]:
+    """The task types this process may claim.
+
+    Not `registered_types()`, which is every handler the registry holds. A
+    worker with no classifier bound would otherwise claim `classify_asset`,
+    fail it, and keep failing it on every retry -- a task nobody can execute
+    sitting in the queue is better than a worker that takes it in order to
+    refuse it, because the first is visible as a backlog and the second looks
+    like a broken classifier.
+    """
+    return tuple(name for name in registered_types() if CAPABILITIES.get(name, _always)())
+
+
+def _always() -> bool:
+    return True
 
 AGENT_TRANSPORT_ENV = "STEWARD_AGENT_TRANSPORT"
 """How this worker reaches models: `proxy` for production, `stub` for a fixture.
@@ -74,7 +114,15 @@ def register_agent_tasks(dsn: str, gateway: GatewayConfig | None, tracer: Tracer
         transport = StubGateway({})
         where = "the stub transport"
     agent_tasks.register(dsn=dsn, gateway=gateway, transport=transport, tracer=tracer)
-    return f"{agent_tasks.AGENT_ECHO} on {where}"
+    # The Classifier's handler is already registered -- `steward_catalog`
+    # registered it at import, which is what lets `classify_asset` be a goal the
+    # shipped registry carries (SPEC.md §13 D15). What this process supplies is
+    # the capability behind it, and until it does, `claimable_types()` leaves the
+    # task type off this worker's claim list.
+    provide_classifier(
+        AgentColumnClassifier(dsn=dsn, gateway=gateway, transport=transport, tracer=tracer)
+    )
+    return f"{agent_tasks.AGENT_ECHO}, {CLASSIFY_ASSET_TASK_TYPE} on {where}"
 
 SHUTDOWN_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
@@ -145,10 +193,23 @@ def main() -> None:
         else "none configured; this worker cannot call a model",
     )
     tracer = tracer_from_env()
+    model_consuming = bool(os.environ.get(AGENT_TRANSPORT_ENV, "").strip())
     log.info("agent tasks: %s", register_agent_tasks(dsn, gateway, tracer))
+    if model_consuming and not classifier_bound():
+        # Asserting the effect of the call above rather than trusting its
+        # intent. A worker asked for a transport is a worker meant to run the
+        # Classifier; if registration silently stopped binding one, this process
+        # would come up, claim everything except `classify_asset`, and look
+        # perfectly healthy while the product capability it was started for was
+        # simply absent.
+        raise SystemExit(
+            f"{AGENT_TRANSPORT_ENV} is set but no classifier was bound; "
+            "this worker was started to run the Classifier and cannot"
+        )
     worker_id = os.environ.get(WORKER_ID_ENV, "").strip() or default_worker_id()
-    log.info("worker %s claims %s", worker_id, ", ".join(registered_types()))
-    asyncio.run(run(Worker(dsn, worker_id, tracer=tracer)))
+    claims = claimable_types()
+    log.info("worker %s claims %s", worker_id, ", ".join(claims))
+    asyncio.run(run(Worker(dsn, worker_id, task_types=claims, tracer=tracer)))
 
 
 if __name__ == "__main__":
