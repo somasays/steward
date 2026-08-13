@@ -8,6 +8,7 @@ from steward_api.catalog import CatalogStore, InMemoryCatalogStore
 from steward_api.problem_details import install_problem_details
 from steward_api.routes.assets import build_router as build_assets_router
 from steward_api.routes.health import router as health_router
+from steward_api.routes.reviews import build_router as build_reviews_router
 from steward_api.routes.runs import build_router as build_runs_router
 from steward_api.routes.sources import build_router as build_sources_router
 from steward_api.store import InMemoryRunStore, RunStore
@@ -37,4 +38,5 @@ def create_app(run_store: RunStore | None = None, catalog_store: CatalogStore | 
     app.include_router(build_runs_router(run_store if run_store is not None else InMemoryRunStore()))
     app.include_router(build_sources_router(catalog))
     app.include_router(build_assets_router(catalog))
+    app.include_router(build_reviews_router(catalog))
     return app
