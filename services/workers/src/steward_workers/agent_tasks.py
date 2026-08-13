@@ -25,6 +25,7 @@ import json
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel
 from steward_agents import (
@@ -133,11 +134,25 @@ class DurableCheckpointStore:
     Satisfies the protocol structurally; `steward-agents` never learns it exists.
     """
 
-    def __init__(self, ctx: TaskContext, dsn: str) -> None:
-        self._task_id = ctx.spec.task_id
-        self._run_id = ctx.spec.run_id
-        self._claimed_by = ctx.claimed_by
-        self._attempts = ctx.attempts
+    def __init__(
+        self,
+        *,
+        dsn: str,
+        task_id: UUID,
+        run_id: UUID,
+        claimed_by: str,
+        attempts: int,
+    ) -> None:
+        # The four identity fields rather than a `TaskContext`, because the
+        # Classifier's store is built from a `ClassificationRun` — the narrowed
+        # execution identity `steward_catalog.classify_handler` hands a
+        # classifier instead of the handler's own connection (#50). Taking the
+        # context would have made this store reachable only from something
+        # holding one.
+        self._task_id = task_id
+        self._run_id = run_id
+        self._claimed_by = claimed_by
+        self._attempts = attempts
         self._dsn = dsn
         self._conn: QueueConnection | None = None
         self._charged = NOTHING_SPENT
@@ -231,7 +246,13 @@ def build_agent_echo(
     )
 
     async def agent_echo(ctx: TaskContext) -> TaskResult:
-        checkpoints = DurableCheckpointStore(ctx, dsn)
+        checkpoints = DurableCheckpointStore(
+            dsn=dsn,
+            task_id=ctx.spec.task_id,
+            run_id=ctx.spec.run_id,
+            claimed_by=ctx.claimed_by,
+            attempts=ctx.attempts,
+        )
         runtime = AgentRuntime(
             client=LLMClient(gateway, transport),
             tools=echo_registry(),
