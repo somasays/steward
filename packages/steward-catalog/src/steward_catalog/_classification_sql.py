@@ -21,6 +21,16 @@ LOCK_ASSET_CLASSIFICATION = """
 SELECT pg_advisory_xact_lock(hashtextextended(%(asset_id)s::text, 2))
 """
 
+# The read a *reader* gets: no `FOR UPDATE`. Serving a GET through the locking
+# variant would make every reader queue behind whichever decision holds the row,
+# and would leave a lock held for the length of an HTTP response.
+SELECT_PROPOSAL = """
+SELECT id, asset_id, version, profile_version, prompt_version, model_alias, status,
+       proposal, run_id, task_id, trace_id, created_at
+FROM classification_proposals
+WHERE id = %(id)s
+"""
+
 SELECT_PROPOSAL_FOR_UPDATE = """
 SELECT id, asset_id, version, profile_version, prompt_version, model_alias, status,
        proposal, run_id, task_id, trace_id, created_at
