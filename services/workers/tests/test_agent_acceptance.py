@@ -53,9 +53,7 @@ from steward_orchestration.registry import REGISTRY as GOAL_REGISTRY
 from steward_queue import (
     REGISTRY,
     StaleClaim,
-    TaskContext,
     TaskState,
-    UsageLedger,
     Worker,
     claim,
     get_run,
@@ -604,15 +602,11 @@ class TestStaleClaimFencing:
         conn.commit()
         assert [task.spec.task_id for task in claimed] == [spec.task_id]
         stale = DurableCheckpointStore(
-            TaskContext(
-                connection=conn,
-                spec=claimed[0].spec,
-                attempts=claimed[0].attempts,
-                claimed_by="w-stale",
-                trace_id=claimed[0].trace_id,
-                usage=UsageLedger(),
-            ),
-            dsn,
+            dsn=dsn,
+            task_id=claimed[0].spec.task_id,
+            run_id=claimed[0].spec.run_id,
+            claimed_by="w-stale",
+            attempts=claimed[0].attempts,
         )
         checkpoint = AgentCheckpoint(
             messages=(Message(role=Role.USER, content="from the stale attempt"),),
