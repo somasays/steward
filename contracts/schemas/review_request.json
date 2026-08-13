@@ -1,0 +1,17 @@
+{
+  "additionalProperties": false,
+  "description": "What a reviewer sends to approve or reject: why, and nothing else.\n\nOutcome comes from the endpoint (`:approve` / `:reject`), actor from the\nauthenticated caller, time from the database -- the three reasons\n`ReviewCommand` refuses them.\n\n`policy_id` is absent for a fourth reason, specific to HTTP. An automatic\napproval must be attributable to the policy that made it, and the repository\nenforces that by requiring the policy actor's own id to match; a request\narriving over this endpoint is attributed to the API's human actor, so any\npolicy id a body could carry is one the repository would refuse. Publishing\nthe field would advertise a way to record a policy decision that cannot\nwork. Auto-approval is a configured policy calling the repository, not a\nrequest claiming to be one (SPEC.md \u00a73.3).",
+  "properties": {
+    "reason": {
+      "maxLength": 1000,
+      "minLength": 1,
+      "title": "Reason",
+      "type": "string"
+    }
+  },
+  "required": [
+    "reason"
+  ],
+  "title": "ReviewRequest",
+  "type": "object"
+}

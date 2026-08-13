@@ -19,9 +19,12 @@ merely incomplete:
   machine has no transition from proposed to published that does not pass
   through a recorded human or policy review (SPEC §3.3).
 
-Deliberately not here: how a proposal is stored, how the API renders it, or how
-the agent produces it. Those are `steward-catalog`, `steward-api` and
+Deliberately not here: how a proposal is stored, how it is served, or how the
+agent produces it. Those are `steward-catalog`, `steward-api` and
 `steward-agents` respectively; this package stays free of all three (I3, I4).
+The *shapes* the review API publishes -- a stored proposal with its status and
+review history -- are contracts and so do live in this package, one module over
+in `review`, composed from these models rather than restating them.
 """
 
 from __future__ import annotations

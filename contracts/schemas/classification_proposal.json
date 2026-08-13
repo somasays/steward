@@ -1,0 +1,157 @@
+{
+  "$defs": {
+    "ColumnClassification": {
+      "additionalProperties": false,
+      "description": "One column's proposed labels, with the evidence for each.",
+      "properties": {
+        "column_name": {
+          "minLength": 1,
+          "title": "Column Name",
+          "type": "string"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Confidence"
+        },
+        "evidence": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "labels": {
+          "items": {
+            "$ref": "#/$defs/SensitivityLabel"
+          },
+          "minItems": 1,
+          "title": "Labels",
+          "type": "array"
+        }
+      },
+      "required": [
+        "column_name",
+        "labels",
+        "confidence"
+      ],
+      "title": "ColumnClassification",
+      "type": "object"
+    },
+    "EvidenceKind": {
+      "description": "Which part of a profile a citation points at.\n\nThe kinds are closed on purpose: an evidence reference has to be resolvable\nback to the exact input, and a free-text \"kind\" would let the model cite\nsomething the resolver cannot look up -- an unresolvable citation being\nindistinguishable, to a reviewer, from a fabricated one.",
+      "enum": [
+        "column_name",
+        "data_type",
+        "masked_sample",
+        "distinct_ratio",
+        "null_ratio",
+        "semantic_type"
+      ],
+      "title": "EvidenceKind",
+      "type": "string"
+    },
+    "EvidenceRef": {
+      "additionalProperties": false,
+      "description": "A pointer into the profile that justified a label.\n\n`profile_version` and `column_name` are part of the reference rather than\nimplied by context, so a reference can be checked against the input it\nclaims to come from. Cross-profile and cross-column citations are the two\nfailure modes worth catching by construction: a model that cites a column\nit was not asked about, or a profile version it never saw, is one whose\noutput is unverifiable however plausible it reads.",
+      "properties": {
+        "column_name": {
+          "minLength": 1,
+          "title": "Column Name",
+          "type": "string"
+        },
+        "detail": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Detail",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EvidenceKind"
+        },
+        "locator": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Locator",
+          "type": "string"
+        },
+        "profile_version": {
+          "minimum": 1,
+          "title": "Profile Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "profile_version",
+        "column_name",
+        "kind",
+        "locator",
+        "detail"
+      ],
+      "title": "EvidenceRef",
+      "type": "object"
+    },
+    "SensitivityLabel": {
+      "description": "What a column may be classified as (#50).\n\nFour values, and `NONE` is not one of the sensitive three: it is the\nassertion that none apply. Multiple sensitive labels on one column are\nallowed -- a payments table's `card_holder_name` is plausibly `PII` and\n`FINANCIAL` at once -- because forcing a single label would make the\nclassifier choose between two true statements.",
+      "enum": [
+        "pii",
+        "phi",
+        "financial",
+        "none"
+      ],
+      "title": "SensitivityLabel",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One classification of one asset, from one profile, by one prompt.\n\nThe provenance fields are not decoration: they are the answer to \"why does\nthis column say PII\", and they are what makes a proposal reproducible. An\nasset re-profiled next month produces a *new* proposal against the new\nprofile version; this one keeps saying what was true of the old one.",
+  "properties": {
+    "asset_id": {
+      "format": "uuid",
+      "title": "Asset Id",
+      "type": "string"
+    },
+    "columns": {
+      "items": {
+        "$ref": "#/$defs/ColumnClassification"
+      },
+      "minItems": 1,
+      "title": "Columns",
+      "type": "array"
+    },
+    "model_alias": {
+      "minLength": 1,
+      "title": "Model Alias",
+      "type": "string"
+    },
+    "profile_version": {
+      "minimum": 1,
+      "title": "Profile Version",
+      "type": "integer"
+    },
+    "prompt_version": {
+      "minLength": 1,
+      "title": "Prompt Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "asset_id",
+    "profile_version",
+    "prompt_version",
+    "model_alias",
+    "columns"
+  ],
+  "title": "ClassificationProposal",
+  "type": "object"
+}

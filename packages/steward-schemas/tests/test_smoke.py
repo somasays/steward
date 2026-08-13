@@ -32,4 +32,12 @@ def test_contracts_registry_exported() -> None:
         "problem_details",
         "run_create",
         "run",
+        "evidence_ref",
+        "column_classification",
+        "classification_proposal",
+        "classification",
+        "classification_review",
+        "classification_detail",
+        "classification_history",
+        "review_request",
     }

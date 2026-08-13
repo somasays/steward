@@ -1,0 +1,55 @@
+{
+  "$defs": {
+    "EvidenceKind": {
+      "description": "Which part of a profile a citation points at.\n\nThe kinds are closed on purpose: an evidence reference has to be resolvable\nback to the exact input, and a free-text \"kind\" would let the model cite\nsomething the resolver cannot look up -- an unresolvable citation being\nindistinguishable, to a reviewer, from a fabricated one.",
+      "enum": [
+        "column_name",
+        "data_type",
+        "masked_sample",
+        "distinct_ratio",
+        "null_ratio",
+        "semantic_type"
+      ],
+      "title": "EvidenceKind",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A pointer into the profile that justified a label.\n\n`profile_version` and `column_name` are part of the reference rather than\nimplied by context, so a reference can be checked against the input it\nclaims to come from. Cross-profile and cross-column citations are the two\nfailure modes worth catching by construction: a model that cites a column\nit was not asked about, or a profile version it never saw, is one whose\noutput is unverifiable however plausible it reads.",
+  "properties": {
+    "column_name": {
+      "minLength": 1,
+      "title": "Column Name",
+      "type": "string"
+    },
+    "detail": {
+      "maxLength": 500,
+      "minLength": 1,
+      "title": "Detail",
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/EvidenceKind"
+    },
+    "locator": {
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Locator",
+      "type": "string"
+    },
+    "profile_version": {
+      "minimum": 1,
+      "title": "Profile Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "profile_version",
+    "column_name",
+    "kind",
+    "locator",
+    "detail"
+  ],
+  "title": "EvidenceRef",
+  "type": "object"
+}
