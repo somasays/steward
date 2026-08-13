@@ -21,6 +21,10 @@ the import alone, with no setup call a caller could forget.
 """
 
 from steward_orchestration.goals import (
+    CLASSIFY_ASSET_BUDGET,
+    CLASSIFY_ASSET_GOAL,
+    CLASSIFY_ASSET_TASK_BUDGET,
+    CLASSIFY_ASSET_TASK_TYPE,
     NOOP_BUDGET,
     NOOP_GOAL,
     NOOP_TASK_BUDGET,
@@ -33,6 +37,7 @@ from steward_orchestration.goals import (
     SCAN_SOURCE_GOAL,
     SCAN_SOURCE_TASK_BUDGET,
     SCAN_SOURCE_TASK_TYPE,
+    ClassifyAssetParams,
     NoopParams,
     ProfileAssetParams,
     ScanSourceParams,
@@ -56,6 +61,10 @@ from steward_orchestration.registry import (
 )
 
 __all__ = [
+    "CLASSIFY_ASSET_BUDGET",
+    "CLASSIFY_ASSET_GOAL",
+    "CLASSIFY_ASSET_TASK_BUDGET",
+    "CLASSIFY_ASSET_TASK_TYPE",
     "DEFAULT_MAX_ATTEMPTS",
     "NOOP_BUDGET",
     "NOOP_GOAL",
@@ -69,6 +78,7 @@ __all__ = [
     "SCAN_SOURCE_GOAL",
     "SCAN_SOURCE_TASK_BUDGET",
     "SCAN_SOURCE_TASK_TYPE",
+    "ClassifyAssetParams",
     "DisallowedTaskType",
     "EmptyRunPlan",
     "GoalParams",

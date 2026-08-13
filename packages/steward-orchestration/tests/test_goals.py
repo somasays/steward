@@ -20,6 +20,8 @@ from uuid import uuid4
 
 import steward_catalog
 from steward_orchestration import (
+    CLASSIFY_ASSET_GOAL,
+    CLASSIFY_ASSET_TASK_TYPE,
     NOOP_GOAL,
     NOOP_TASK_BUDGET,
     NOOP_TASK_TYPE,
@@ -49,6 +51,7 @@ def test_the_task_type_names_on_both_sides_of_the_seam_agree() -> None:
     check below looks for."""
     assert SCAN_SOURCE_TASK_TYPE == steward_catalog.SCAN_SOURCE_TASK_TYPE
     assert PROFILE_ASSET_TASK_TYPE == steward_catalog.PROFILE_ASSET_TASK_TYPE
+    assert CLASSIFY_ASSET_TASK_TYPE == steward_catalog.CLASSIFY_ASSET_TASK_TYPE
 
 
 def test_every_goal_plans_only_executable_task_types() -> None:
@@ -119,6 +122,42 @@ def test_profile_asset_plans_exactly_one_task_per_asset() -> None:
     ]
     assert plan.reserved() == plan.budget
     assert plan.budget.tokens == 0  # no model is called in this slice (#49)
+
+
+def test_classify_asset_plans_one_task_naming_a_profile_version() -> None:
+    """The first shipped goal whose task calls a model (#50).
+
+    Two things are asserted that no other goal here can be: the payload carries
+    the *version* rather than leaving the handler to resolve "the latest" -- which
+    is what makes a re-profile between request and claim a refusal rather than a
+    silent substitution -- and the budget is non-zero in the dimensions a model
+    spends. A classifier goal with `tokens == 0` would be a cap that refuses the
+    first call.
+    """
+    plan = plan_run(CLASSIFY_ASSET_GOAL, {"asset_id": ASSET_ID, "profile_version": 3})
+
+    assert [(task.task_type, dict(task.payload)) for task in plan.tasks] == [
+        (CLASSIFY_ASSET_TASK_TYPE, {"asset_id": ASSET_ID, "profile_version": 3})
+    ]
+    assert plan.reserved() == plan.budget
+    assert plan.budget.tokens > 0
+    assert plan.budget.cost_usd > 0
+
+
+def test_classify_asset_rejects_a_payload_that_does_not_name_one_profile_version() -> None:
+    for payload in (
+        {},
+        {"asset_id": ASSET_ID},
+        {"profile_version": 1},
+        {"asset_id": ASSET_ID, "profile_version": 0},
+        {"asset_id": "not-a-uuid", "profile_version": 1},
+        {"asset_id": ASSET_ID, "profile_version": 1, "columns": ["email"]},
+    ):
+        try:
+            plan_run(CLASSIFY_ASSET_GOAL, payload)
+        except InvalidGoalPayload:
+            continue
+        raise AssertionError(f"payload should not have been accepted: {payload}")
 
 
 def test_profile_asset_rejects_a_payload_that_is_not_an_asset_id() -> None:
