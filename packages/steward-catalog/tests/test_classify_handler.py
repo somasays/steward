@@ -32,6 +32,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 import pytest
+from pydantic import ValidationError
 from steward_catalog import (
     CLASSIFIER,
     CLASSIFY_ASSET_SAMPLE_PAYLOAD,
@@ -49,6 +50,7 @@ from steward_catalog import (
     build_profile_asset,
     build_scan_source,
     classifier_bound,
+    latest_profile,
     postgres_inspector,
     postgres_profiler,
     provide_classifier,
@@ -466,6 +468,72 @@ def test_an_asset_that_was_never_profiled_is_refused(
     assert result.status is TaskStatus.FAILED
     assert result.error is not None and result.error.type == "urn:steward:profile-not-found"
     assert stub.calls == 0
+
+
+def test_an_empty_classification_is_unrepresentable() -> None:
+    """Why the refusal below is a refusal and not an empty proposal.
+
+    A proposal must carry at least one column, so for a relation with no columns
+    the coverage contract and the schema cannot both be satisfied. Pinned here so
+    that a later widening of `ProposedClassification` has to come past this test
+    and decide what an approved classification of nothing would mean.
+    """
+    with pytest.raises(ValidationError):
+        ProposedClassification(columns=(), prompt_version=PROMPT_VERSION, model_alias=MODEL_ALIAS)
+
+
+def test_a_relation_with_no_columns_is_refused_before_the_model_runs(
+    conn: QueueConnection,
+    source_create: SourceCreate,
+    resolver: EnvSecretResolver,
+    scan_spec: Callable[[UUID], TaskSpec],
+    source_admin: psycopg.Connection[psycopg.rows.TupleRow],
+) -> None:
+    """Postgres permits a table with no columns, and this catalog profiles one.
+
+    The whole path is real rather than a hand-built empty profile: the relation
+    is created in the fixture source, scanned, and profiled by the production
+    handlers, and the stored profile is asserted to have no columns before the
+    classification is attempted. A fabricated `TableProfile(columns=())` would
+    prove the guard fires on a shape nothing produces.
+    """
+    source_admin.execute("CREATE TABLE sales.columnless ()")
+    source_admin.execute("INSERT INTO sales.columnless DEFAULT VALUES")
+    source_admin.execute("GRANT SELECT ON sales.columnless TO steward_reader")
+
+    source, _ = register_source(conn, source_create, actor=SYSTEM_ACTOR)
+    conn.commit()
+    scan = asyncio.run(
+        build_scan_source(resolver=resolver, inspect=postgres_inspector)(
+            _ctx(conn, scan_spec(source.id))
+        )
+    )
+    conn.commit()
+    assert scan.status is TaskStatus.SUCCEEDED, scan.error
+    row = conn.execute(SELECT_ASSET_ID, {"schema": "sales", "name": "columnless"}).fetchone()
+    assert row is not None, "the scan did not catalogue the columnless relation"
+    columnless: UUID = row[0]
+
+    profiled = asyncio.run(
+        build_profile_asset(resolver=resolver, profiler=postgres_profiler)(
+            _ctx(conn, _spec(conn, "profile_asset", {"asset_id": str(columnless)}))
+        )
+    )
+    conn.commit()
+    assert profiled.status is TaskStatus.SUCCEEDED, profiled.error
+    stored = latest_profile(conn, columnless)
+    assert stored is not None
+    assert stored.profile.columns == (), "the fixture relation was profiled with columns after all"
+    assert stored.profile.row_count == 1
+
+    stub = StubClassifier(answer=cites_its_own_column)
+    result = classify(conn, columnless, stub)
+
+    assert result.status is TaskStatus.FAILED
+    assert result.error is not None
+    assert result.error.type == "urn:steward:no-classifiable-columns"
+    assert stub.calls == 0, "a relation with nothing to classify still reached the model"
+    assert proposal_history(conn, columnless) == ()
 
 
 def test_an_invented_citation_cannot_be_persisted(conn: QueueConnection, asset_id: UUID) -> None:

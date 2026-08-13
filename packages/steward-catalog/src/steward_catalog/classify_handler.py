@@ -422,6 +422,31 @@ def _prepare(
             f"current version is {latest.version}; the data it describes has changed",
             409,
         )
+    if not latest.profile.columns:
+        # Postgres permits a relation with no columns and this catalog profiles
+        # one -- `TableProfile(row_count=n, columns=())` (`test_profiler.py`) --
+        # so this is a state the system really reaches, not a defensive branch.
+        #
+        # Refused here rather than left to fail later, because there is no output
+        # that could satisfy the contract: a proposal must classify exactly the
+        # profiled columns *and* carry at least one, and no set is both empty and
+        # non-empty. Without this the task would spend a model call, spend its one
+        # correction on a validation error the model cannot fix, and end as
+        # `classifier-failed` -- an error naming the classifier for a property of
+        # the asset.
+        #
+        # Admitting an empty proposal instead would be the larger change, and the
+        # wrong one at this size: `ClassificationProposal` and the persistence
+        # schema both require a non-empty proposal, and "reviewed and approved
+        # that nothing is sensitive" would become a publishable claim about a
+        # relation with nothing in it to be sensitive.
+        return _problem(
+            "urn:steward:no-classifiable-columns",
+            "Asset has no columns to classify",
+            f"profile version {latest.version} of asset {payload.asset_id} records no "
+            "columns; a classification of nothing is not a finding",
+            409,
+        )
     return ClassificationRequest(
         asset_id=payload.asset_id,
         profile_version=latest.version,
