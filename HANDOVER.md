@@ -19,7 +19,9 @@ brief, so fix SPEC first.
 
 ## State
 
-M0 and M1 slices 1–3a are shipped, and #50's persistence layer with them. `main` is at `89a971e`, green.
+M0 and M1 slices 1–3a are shipped, and #50's persistence layer and Classifier with them. `main` is at
+`6b6f605`, green — `make fitness` re-run on merged main, all checks green (S6 SKIPs on main by design: the
+merge-base is HEAD itself, so there is no divergence to compare).
 Working end to end: register a Postgres source, scan it, persist assets/columns, profile every column
 through a masking layer, run a **bounded agent** through API → queue → worker with per-attempt budget
 accounting, durable checkpoints and tracing, and reach a model through a real **LiteLLM proxy HTTP
@@ -29,23 +31,16 @@ gates SKIP until M2.
 **#69, #48 and #74 are closed.** PR #81 merged the classification schemas, migration `0006`, the
 repository and the review lifecycle.
 
-### One thing is open: PR #82
+### Nothing is open
 
-Branch `m1/50-classifier-agent`. The code landed through `4ccc48a` in 8 commits; the head also carries this
-handover. **CI green, MERGEABLE, reviewed PASS, not merged** — the merge decision is the maintainer's and
-had not been made when this was written.
+**PR #82 merged at `6b6f605`** (rebase, linear history, branch kept — the style #81 used). It landed
+**#50 steps 1–6**: `POST /v1/runs` → queue → worker → bounded agent → typed evidence-backed proposal in
+`pending_review`. It went through three review rounds and every one found something real; read the PR body
+and its two review-response comments before touching any of it — the reasoning behind the split is in
+**SPEC §13 D15** and the reasoning behind the three defects is in the comments.
 
-It lands **#50 steps 1–6**: `POST /v1/runs` → queue → worker → bounded agent → typed evidence-backed
-proposal in `pending_review`. Read the PR body and its two review-response comments before touching any of
-it; the reasoning behind the split is in **SPEC §13 D15** and the reasoning behind three defects is in the
-comments.
-
-**Before doing anything else: check whether #82 merged.** If it did, `git pull` and re-run `make fitness`
-on merged `main` (PROOFS row 11 is why). If it did not, ask before merging.
-
-**`PROOFS.md` rows 106–117 are on that branch**, appended directly under CLAUDE.md's solo-branch rule. If
-you open a second #50 branch before #82 merges, put your rows in the PR body instead — the ledger has one
-writer for a reason.
+`PROOFS.md` rows 106–117 landed with it. **#50 itself is still open** — steps 7–8 remain, which is why the
+PR said "Part of #50" rather than `Closes`.
 
 ## What #82 decided, so you don't relitigate it
 
