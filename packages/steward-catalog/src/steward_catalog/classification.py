@@ -36,12 +36,13 @@ SQL lives in `_classification_sql` as static constants (I5).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+from psycopg.rows import DictRow, dict_row
 from psycopg.types.json import Jsonb
 from steward_queue import Actor, ActorKind, QueueConnection, write_audit
 from steward_schemas import (
@@ -66,6 +67,7 @@ __all__ = [
     "ClassificationConflict",
     "ProposalNotPending",
     "ProposalRecord",
+    "ReviewRecord",
     "StaleProposal",
     "approve",
     "current_classification",
@@ -158,32 +160,63 @@ class ReviewRecord:
     decided_at: datetime
 
 
-def _proposal(row: Sequence[Any]) -> ProposalRecord:
+def _one(conn: QueueConnection, sql: str, params: Mapping[str, Any]) -> DictRow | None:
+    """One row, keyed by column name. `None` when the statement matched nothing.
+
+    Every read in this module goes through here or `_all`, and both use
+    `dict_row` rather than the connection's default tuples. That is not a
+    style preference: the same twelve-column projection is written out in seven
+    separate statements in `_classification_sql` -- it has to be, because S608
+    (the check that enforces I5) cannot tell a column list composed from a
+    module constant from a query composed from user input, so factoring it out
+    would cost a `noqa` on each one and disable the SQL-safety gate for the
+    whole file.
+
+    Duplicated text is cheap. Duplicated text that is decoded *by position* is
+    not: reordering one list, or adding a column to six statements and not the
+    seventh, silently lands values in the wrong fields, and a proposal whose
+    `status` is read out of `model_alias` is a governance record that lies. By
+    name, that same drift is a `KeyError` at the first read.
+
+    Closing the cursor does not end the transaction, so the caller still owns
+    it, exactly as this module's contract says.
+    """
+    with conn.cursor(row_factory=dict_row) as cursor:
+        return cursor.execute(sql, params).fetchone()
+
+
+def _all(conn: QueueConnection, sql: str, params: Mapping[str, Any]) -> list[DictRow]:
+    """Every matching row, keyed by column name. See `_one`."""
+    with conn.cursor(row_factory=dict_row) as cursor:
+        return cursor.execute(sql, params).fetchall()
+
+
+def _proposal(row: Mapping[str, Any]) -> ProposalRecord:
     return ProposalRecord(
-        id=row[0],
-        asset_id=row[1],
-        version=row[2],
-        profile_version=row[3],
-        prompt_version=row[4],
-        model_alias=row[5],
-        status=ProposalStatus(row[6]),
-        proposal=ClassificationProposal.model_validate(row[7]),
-        run_id=row[8],
-        task_id=row[9],
-        trace_id=row[10],
-        created_at=row[11],
+        id=row["id"],
+        asset_id=row["asset_id"],
+        version=row["version"],
+        profile_version=row["profile_version"],
+        prompt_version=row["prompt_version"],
+        model_alias=row["model_alias"],
+        status=ProposalStatus(row["status"]),
+        proposal=ClassificationProposal.model_validate(row["proposal"]),
+        run_id=row["run_id"],
+        task_id=row["task_id"],
+        trace_id=row["trace_id"],
+        created_at=row["created_at"],
     )
 
 
-def _review(row: Sequence[Any]) -> ReviewRecord:
+def _review(row: Mapping[str, Any]) -> ReviewRecord:
     return ReviewRecord(
-        id=row[0],
-        proposal_id=row[1],
-        outcome=ReviewOutcome(row[2]),
-        actor=Actor(kind=ActorKind(row[3]), id=row[4]),
-        reason=row[5],
-        policy_id=row[6],
-        decided_at=row[7],
+        id=row["id"],
+        proposal_id=row["proposal_id"],
+        outcome=ReviewOutcome(row["outcome"]),
+        actor=Actor(kind=ActorKind(row["actor_kind"]), id=row["actor_id"]),
+        reason=row["reason"],
+        policy_id=row["policy_id"],
+        decided_at=row["decided_at"],
     )
 
 
@@ -205,7 +238,8 @@ def propose(
     """
     _lock(conn, proposal.asset_id)
     _require_resolvable_evidence(conn, proposal)
-    existing = conn.execute(
+    existing = _one(
+        conn,
         _sql.SELECT_PROPOSAL_BY_REQUEST,
         {
             "asset_id": proposal.asset_id,
@@ -213,16 +247,17 @@ def propose(
             "prompt_version": proposal.prompt_version,
             "model_alias": proposal.model_alias,
         },
-    ).fetchone()
+    )
     if existing is not None:
         return _proposal(existing)
 
     latest = conn.execute(
         _sql.SELECT_LATEST_PROPOSAL_VERSION, {"asset_id": proposal.asset_id}
-    ).fetchone()
+    ).fetchone()  # one aggregate, no projection to drift
     version = (latest[0] if latest else 0) + FIRST_VERSION
     proposal_id = uuid4()
-    row = conn.execute(
+    row = _one(
+        conn,
         _sql.INSERT_PROPOSAL,
         {
             "id": proposal_id,
@@ -237,7 +272,7 @@ def propose(
             "task_id": task_id,
             "trace_id": trace_id,
         },
-    ).fetchone()
+    )
     if row is None:  # pragma: no cover -- the lock above serialises this
         raise ClassificationConflict("another proposal for this request was recorded first")
     record = _proposal(row)
@@ -374,13 +409,13 @@ def current_classification(conn: QueueConnection, asset_id: UUID) -> ProposalRec
 
 def proposal_history(conn: QueueConnection, asset_id: UUID) -> tuple[ProposalRecord, ...]:
     """Every proposal for `asset_id`, newest version first."""
-    rows = conn.execute(_sql.SELECT_PROPOSALS_FOR_ASSET, {"asset_id": asset_id}).fetchall()
+    rows = _all(conn, _sql.SELECT_PROPOSALS_FOR_ASSET, {"asset_id": asset_id})
     return tuple(_proposal(row) for row in rows)
 
 
 def record_proposal_reviews(conn: QueueConnection, proposal_id: UUID) -> tuple[ReviewRecord, ...]:
     """Every decision recorded against `proposal_id`, oldest first."""
-    rows = conn.execute(_sql.SELECT_REVIEWS_FOR_PROPOSAL, {"proposal_id": proposal_id}).fetchall()
+    rows = _all(conn, _sql.SELECT_REVIEWS_FOR_PROPOSAL, {"proposal_id": proposal_id})
     return tuple(_review(row) for row in rows)
 
 
@@ -397,16 +432,17 @@ def _require_resolvable_evidence(conn: QueueConnection, proposal: Classification
     This is the only place that can do it. The type validator sees the proposal;
     only the database has the profile the proposal claims to have read (#50).
     """
-    row = conn.execute(
+    row = _one(
+        conn,
         _sql.SELECT_PROFILE_VERSION,
         {"asset_id": proposal.asset_id, "version": proposal.profile_version},
-    ).fetchone()
+    )
     if row is None:
         raise EvidenceNotResolvable(
             f"asset {proposal.asset_id} has no profile version {proposal.profile_version} "
             "to resolve this proposal's evidence against"
         )
-    profile = TableProfile.model_validate(row[0])
+    profile = TableProfile.model_validate(row["profile"])
     columns = {column.name: column for column in profile.columns}
     for classification in proposal.columns:
         profiled = columns.get(classification.column_name)
@@ -458,32 +494,32 @@ def _lock_by_proposal(conn: QueueConnection, proposal_id: UUID) -> None:
     authoritative read happens afterwards, under it. A decision made on this
     first read would be exactly the race the lock exists to remove.
     """
-    row = conn.execute(_sql.SELECT_PROPOSAL_FOR_UPDATE, {"id": proposal_id}).fetchone()
+    row = _one(conn, _sql.SELECT_PROPOSAL_FOR_UPDATE, {"id": proposal_id})
     if row is None:
         raise LookupError(f"no such proposal: {proposal_id}")
     _lock(conn, _proposal(row).asset_id)
 
 
 def _locked_proposal(conn: QueueConnection, proposal_id: UUID) -> ProposalRecord:
-    row = conn.execute(_sql.SELECT_PROPOSAL_FOR_UPDATE, {"id": proposal_id}).fetchone()
+    row = _one(conn, _sql.SELECT_PROPOSAL_FOR_UPDATE, {"id": proposal_id})
     if row is None:
         raise LookupError(f"no such proposal: {proposal_id}")
     return _proposal(row)
 
 
 def _approved(conn: QueueConnection, asset_id: UUID) -> ProposalRecord | None:
-    row = conn.execute(_sql.SELECT_APPROVED_PROPOSAL, {"asset_id": asset_id}).fetchone()
+    row = _one(conn, _sql.SELECT_APPROVED_PROPOSAL, {"asset_id": asset_id})
     return _proposal(row) if row is not None else None
 
 
 def _require_classifiable(conn: QueueConnection, target: ProposalRecord) -> None:
     """The asset is still active and the cited profile is still its latest."""
-    row = conn.execute(_sql.SELECT_ASSET_STATE, {"asset_id": target.asset_id}).fetchone()
-    if row is None or row[0] != "active":
+    row = _one(conn, _sql.SELECT_ASSET_STATE, {"asset_id": target.asset_id})
+    if row is None or row["lifecycle"] != "active":
         raise AssetNotClassifiable(
             f"asset {target.asset_id} is inactive or absent; nothing about it can be published"
         )
-    latest_profile = row[1]
+    latest_profile = row["latest_profile"]
     if latest_profile != target.profile_version:
         raise StaleProposal(
             f"proposal reads profile version {target.profile_version}, but the asset's "
@@ -508,9 +544,7 @@ def _replayed(
     told a caller their decision had succeeded when nothing had happened to the
     proposal they named -- a rejection that silently did not reject.
     """
-    row = conn.execute(
-        _sql.SELECT_REVIEW_BY_KEY, {"idempotency_key": idempotency_key}
-    ).fetchone()
+    row = _one(conn, _sql.SELECT_REVIEW_BY_KEY, {"idempotency_key": idempotency_key})
     if row is None:
         return None
     review = _review(row)
@@ -610,7 +644,8 @@ def _record_decision(
     strength of one review event.
     """
     _require_consistent_policy(command, actor)
-    row = conn.execute(
+    row = _one(
+        conn,
         _sql.INSERT_REVIEW,
         {
             "id": uuid4(),
@@ -624,14 +659,12 @@ def _record_decision(
             "policy_id": command.policy_id,
             "idempotency_key": idempotency_key,
         },
-    ).fetchone()
+    )
     if row is not None:
         return None
     # No row: another transaction holds this key. It is a replay only if it is
     # the same request; anything else is a key doing two jobs.
-    winner = conn.execute(
-        _sql.SELECT_REVIEW_BY_KEY, {"idempotency_key": idempotency_key}
-    ).fetchone()
+    winner = _one(conn, _sql.SELECT_REVIEW_BY_KEY, {"idempotency_key": idempotency_key})
     if winner is None:  # pragma: no cover -- the conflict implies a row exists
         raise ClassificationConflict("the decision was neither recorded nor found")
     settled = _review(winner)
@@ -649,9 +682,7 @@ def _record_decision(
 def _set_status(
     conn: QueueConnection, target: ProposalRecord, status: ProposalStatus, *, actor: Actor
 ) -> ProposalRecord:
-    row = conn.execute(
-        _sql.SET_PROPOSAL_STATUS, {"id": target.id, "status": status.value}
-    ).fetchone()
+    row = _one(conn, _sql.SET_PROPOSAL_STATUS, {"id": target.id, "status": status.value})
     if row is None:  # pragma: no cover -- the row was read under lock above
         raise ClassificationConflict(f"proposal {target.id} vanished mid-decision")
     record = _proposal(row)
