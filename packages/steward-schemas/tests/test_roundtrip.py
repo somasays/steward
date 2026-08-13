@@ -21,15 +21,28 @@ from steward_schemas import (
     AssetLifecycle,
     AssetPage,
     AssetType,
+    Classification,
+    ClassificationDetail,
+    ClassificationHistory,
+    ClassificationProposal,
+    ClassificationReview,
     Column,
+    ColumnClassification,
     ColumnProfile,
+    EvidenceKind,
+    EvidenceRef,
     MaskedSample,
     ProblemDetails,
+    ProposalStatus,
+    ReviewerKind,
+    ReviewOutcome,
+    ReviewRequest,
     Run,
     RunBudget,
     RunCreate,
     RunStatus,
     SemanticType,
+    SensitivityLabel,
     Source,
     SourceCreate,
     SourceEngine,
@@ -219,6 +232,72 @@ def build_run() -> Run:
     )
 
 
+ASSET_ID = UUID("88888888-8888-8888-8888-888888888888")
+PROPOSAL_ID = UUID("99999999-9999-9999-9999-999999999999")
+
+
+def build_evidence_ref() -> EvidenceRef:
+    return EvidenceRef(
+        profile_version=3,
+        column_name="email",
+        kind=EvidenceKind.COLUMN_NAME,
+        locator="email",
+        detail="the column is named 'email'",
+    )
+
+
+def build_column_classification() -> ColumnClassification:
+    return ColumnClassification(
+        column_name="email",
+        labels=(SensitivityLabel.PII,),
+        confidence=Decimal("0.95"),
+        evidence=(build_evidence_ref(),),
+    )
+
+
+def build_classification_proposal() -> ClassificationProposal:
+    return ClassificationProposal(
+        asset_id=ASSET_ID,
+        profile_version=3,
+        prompt_version="classify_asset@v1",
+        model_alias="steward-classify",
+        columns=(
+            build_column_classification(),
+            ColumnClassification(
+                column_name="id",
+                labels=(SensitivityLabel.NONE,),
+                confidence=Decimal("0.99"),
+            ),
+        ),
+    )
+
+
+def build_classification() -> Classification:
+    return Classification(
+        id=PROPOSAL_ID,
+        asset_id=ASSET_ID,
+        version=2,
+        status=ProposalStatus.PENDING_REVIEW,
+        proposal=build_classification_proposal(),
+        run_id=UUID("77777777-7777-7777-7777-777777777777"),
+        task_id=UUID("66666666-6666-6666-6666-666666666666"),
+        trace_id="0123456789abcdef0123456789abcdef",
+        created_at=NOW,
+    )
+
+
+def build_classification_review() -> ClassificationReview:
+    return ClassificationReview(
+        id=UUID("55555555-5555-5555-5555-555555555555"),
+        proposal_id=PROPOSAL_ID,
+        outcome=ReviewOutcome.APPROVED,
+        actor_kind=ReviewerKind.HUMAN,
+        actor_id="api",
+        reason="evidence checks out",
+        decided_at=NOW,
+    )
+
+
 # One sample per `CONTRACTS` entry -- test_samples_cover_every_registered_contract
 # below asserts nothing is missing, and each one is exercised by
 # test_contract_sample_roundtrips.
@@ -240,6 +319,16 @@ SAMPLES: dict[str, BaseModel] = {
     "problem_details": build_problem_details(),
     "run_create": build_run_create(),
     "run": build_run(),
+    "evidence_ref": build_evidence_ref(),
+    "column_classification": build_column_classification(),
+    "classification_proposal": build_classification_proposal(),
+    "classification": build_classification(),
+    "classification_review": build_classification_review(),
+    "classification_detail": ClassificationDetail(
+        classification=build_classification(), reviews=(build_classification_review(),)
+    ),
+    "classification_history": ClassificationHistory(items=(build_classification(),)),
+    "review_request": ReviewRequest(reason="evidence checks out"),
 }
 
 # Additional shapes worth round-tripping that aren't 1:1 with a CONTRACTS
@@ -258,6 +347,17 @@ EXTRA_SAMPLES: dict[str, BaseModel] = {
         distinct_ratio=Decimal("0.000000"),
     ),
     "table_profile_empty": TableProfile(row_count=0),
+    "classification_review_by_policy": ClassificationReview(
+        id=UUID("44444444-4444-4444-4444-444444444444"),
+        proposal_id=PROPOSAL_ID,
+        outcome=ReviewOutcome.APPROVED,
+        actor_kind=ReviewerKind.POLICY,
+        actor_id="auto-approve-none",
+        reason="no sensitive labels proposed",
+        policy_id="auto-approve-none",
+        decided_at=NOW,
+    ),
+    "classification_history_empty": ClassificationHistory(items=()),
 }
 
 

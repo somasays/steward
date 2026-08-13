@@ -1,0 +1,81 @@
+{
+  "$defs": {
+    "ReviewOutcome": {
+      "enum": [
+        "approved",
+        "rejected"
+      ],
+      "title": "ReviewOutcome",
+      "type": "string"
+    },
+    "ReviewerKind": {
+      "description": "Who recorded a decision, as the API publishes it.\n\nA deliberate duplicate of `steward_queue.ActorKind`, which this package may\nnot import (I4: `steward-schemas` depends on pydantic and the standard\nlibrary, and everything depends on it). The duplication is not left to\ndrift: `services/api/tests/test_review_routes.py` asserts the two enums have\nthe same members, so adding an actor kind on one side fails on the other\nrather than rendering as a value no client's generated types know.",
+      "enum": [
+        "human",
+        "agent",
+        "policy",
+        "system"
+      ],
+      "title": "ReviewerKind",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One recorded decision. An event: never edited, never deleted.\n\n`actor_kind`/`actor_id` are the trusted actor the repository was given, not\nanything a caller supplied, and they are the same pair the audit row carries\nfor the same action.",
+  "properties": {
+    "actor_id": {
+      "minLength": 1,
+      "title": "Actor Id",
+      "type": "string"
+    },
+    "actor_kind": {
+      "$ref": "#/$defs/ReviewerKind"
+    },
+    "decided_at": {
+      "format": "date-time",
+      "title": "Decided At",
+      "type": "string"
+    },
+    "id": {
+      "format": "uuid",
+      "title": "Id",
+      "type": "string"
+    },
+    "outcome": {
+      "$ref": "#/$defs/ReviewOutcome"
+    },
+    "policy_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Policy Id"
+    },
+    "proposal_id": {
+      "format": "uuid",
+      "title": "Proposal Id",
+      "type": "string"
+    },
+    "reason": {
+      "minLength": 1,
+      "title": "Reason",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "proposal_id",
+    "outcome",
+    "actor_kind",
+    "actor_id",
+    "reason",
+    "decided_at"
+  ],
+  "title": "ClassificationReview",
+  "type": "object"
+}

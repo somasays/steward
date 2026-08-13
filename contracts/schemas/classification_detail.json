@@ -1,0 +1,329 @@
+{
+  "$defs": {
+    "Classification": {
+      "additionalProperties": false,
+      "description": "One stored proposal, projected: what was proposed, and where it stands.\n\nThe proposal is nested rather than flattened because it is already the\ncontract for \"what a classifier proposed\", validated on the way in and\nstored verbatim. Flattening would republish every one of its fields under a\nsecond name, and the day the two disagreed there would be no answer to which\none the reviewer read.\n\nWhat the projection adds is everything the proposal cannot know about\nitself: which row it is, which version of this asset's classification, what\nreview has decided so far, and which run, task and trace produced it. That\nlast group is the provenance an operator follows backwards -- from a label\non a column to the model call that proposed it (I7).",
+      "properties": {
+        "asset_id": {
+          "format": "uuid",
+          "title": "Asset Id",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "title": "Id",
+          "type": "string"
+        },
+        "proposal": {
+          "$ref": "#/$defs/ClassificationProposal"
+        },
+        "run_id": {
+          "format": "uuid",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ProposalStatus"
+        },
+        "task_id": {
+          "format": "uuid",
+          "title": "Task Id",
+          "type": "string"
+        },
+        "trace_id": {
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "asset_id",
+        "version",
+        "status",
+        "proposal",
+        "run_id",
+        "task_id",
+        "trace_id",
+        "created_at"
+      ],
+      "title": "Classification",
+      "type": "object"
+    },
+    "ClassificationProposal": {
+      "additionalProperties": false,
+      "description": "One classification of one asset, from one profile, by one prompt.\n\nThe provenance fields are not decoration: they are the answer to \"why does\nthis column say PII\", and they are what makes a proposal reproducible. An\nasset re-profiled next month produces a *new* proposal against the new\nprofile version; this one keeps saying what was true of the old one.",
+      "properties": {
+        "asset_id": {
+          "format": "uuid",
+          "title": "Asset Id",
+          "type": "string"
+        },
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/ColumnClassification"
+          },
+          "minItems": 1,
+          "title": "Columns",
+          "type": "array"
+        },
+        "model_alias": {
+          "minLength": 1,
+          "title": "Model Alias",
+          "type": "string"
+        },
+        "profile_version": {
+          "minimum": 1,
+          "title": "Profile Version",
+          "type": "integer"
+        },
+        "prompt_version": {
+          "minLength": 1,
+          "title": "Prompt Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "asset_id",
+        "profile_version",
+        "prompt_version",
+        "model_alias",
+        "columns"
+      ],
+      "title": "ClassificationProposal",
+      "type": "object"
+    },
+    "ClassificationReview": {
+      "additionalProperties": false,
+      "description": "One recorded decision. An event: never edited, never deleted.\n\n`actor_kind`/`actor_id` are the trusted actor the repository was given, not\nanything a caller supplied, and they are the same pair the audit row carries\nfor the same action.",
+      "properties": {
+        "actor_id": {
+          "minLength": 1,
+          "title": "Actor Id",
+          "type": "string"
+        },
+        "actor_kind": {
+          "$ref": "#/$defs/ReviewerKind"
+        },
+        "decided_at": {
+          "format": "date-time",
+          "title": "Decided At",
+          "type": "string"
+        },
+        "id": {
+          "format": "uuid",
+          "title": "Id",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ReviewOutcome"
+        },
+        "policy_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Policy Id"
+        },
+        "proposal_id": {
+          "format": "uuid",
+          "title": "Proposal Id",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "proposal_id",
+        "outcome",
+        "actor_kind",
+        "actor_id",
+        "reason",
+        "decided_at"
+      ],
+      "title": "ClassificationReview",
+      "type": "object"
+    },
+    "ColumnClassification": {
+      "additionalProperties": false,
+      "description": "One column's proposed labels, with the evidence for each.",
+      "properties": {
+        "column_name": {
+          "minLength": 1,
+          "title": "Column Name",
+          "type": "string"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Confidence"
+        },
+        "evidence": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "labels": {
+          "items": {
+            "$ref": "#/$defs/SensitivityLabel"
+          },
+          "minItems": 1,
+          "title": "Labels",
+          "type": "array"
+        }
+      },
+      "required": [
+        "column_name",
+        "labels",
+        "confidence"
+      ],
+      "title": "ColumnClassification",
+      "type": "object"
+    },
+    "EvidenceKind": {
+      "description": "Which part of a profile a citation points at.\n\nThe kinds are closed on purpose: an evidence reference has to be resolvable\nback to the exact input, and a free-text \"kind\" would let the model cite\nsomething the resolver cannot look up -- an unresolvable citation being\nindistinguishable, to a reviewer, from a fabricated one.",
+      "enum": [
+        "column_name",
+        "data_type",
+        "masked_sample",
+        "distinct_ratio",
+        "null_ratio",
+        "semantic_type"
+      ],
+      "title": "EvidenceKind",
+      "type": "string"
+    },
+    "EvidenceRef": {
+      "additionalProperties": false,
+      "description": "A pointer into the profile that justified a label.\n\n`profile_version` and `column_name` are part of the reference rather than\nimplied by context, so a reference can be checked against the input it\nclaims to come from. Cross-profile and cross-column citations are the two\nfailure modes worth catching by construction: a model that cites a column\nit was not asked about, or a profile version it never saw, is one whose\noutput is unverifiable however plausible it reads.",
+      "properties": {
+        "column_name": {
+          "minLength": 1,
+          "title": "Column Name",
+          "type": "string"
+        },
+        "detail": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Detail",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EvidenceKind"
+        },
+        "locator": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Locator",
+          "type": "string"
+        },
+        "profile_version": {
+          "minimum": 1,
+          "title": "Profile Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "profile_version",
+        "column_name",
+        "kind",
+        "locator",
+        "detail"
+      ],
+      "title": "EvidenceRef",
+      "type": "object"
+    },
+    "ProposalStatus": {
+      "description": "Where a proposal sits in review.\n\n`PENDING_REVIEW` is the only state a proposal is created in. There is no\ntransition to `APPROVED` that is not a recorded `ReviewDecision`, which is\nwhat makes \"no proposal publishes without a review\" a property of the state\nmachine rather than a rule the API remembers to apply.",
+      "enum": [
+        "pending_review",
+        "approved",
+        "rejected",
+        "superseded"
+      ],
+      "title": "ProposalStatus",
+      "type": "string"
+    },
+    "ReviewOutcome": {
+      "enum": [
+        "approved",
+        "rejected"
+      ],
+      "title": "ReviewOutcome",
+      "type": "string"
+    },
+    "ReviewerKind": {
+      "description": "Who recorded a decision, as the API publishes it.\n\nA deliberate duplicate of `steward_queue.ActorKind`, which this package may\nnot import (I4: `steward-schemas` depends on pydantic and the standard\nlibrary, and everything depends on it). The duplication is not left to\ndrift: `services/api/tests/test_review_routes.py` asserts the two enums have\nthe same members, so adding an actor kind on one side fails on the other\nrather than rendering as a value no client's generated types know.",
+      "enum": [
+        "human",
+        "agent",
+        "policy",
+        "system"
+      ],
+      "title": "ReviewerKind",
+      "type": "string"
+    },
+    "SensitivityLabel": {
+      "description": "What a column may be classified as (#50).\n\nFour values, and `NONE` is not one of the sensitive three: it is the\nassertion that none apply. Multiple sensitive labels on one column are\nallowed -- a payments table's `card_holder_name` is plausibly `PII` and\n`FINANCIAL` at once -- because forcing a single label would make the\nclassifier choose between two true statements.",
+      "enum": [
+        "pii",
+        "phi",
+        "financial",
+        "none"
+      ],
+      "title": "SensitivityLabel",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A proposal and every decision recorded against it, oldest first.\n\nThe history is part of the *detail* view and not of the list view because a\nreviewer deciding one proposal needs to see that someone already rejected\nit, while a client listing an asset's versions does not -- and fetching it\nfor each would be a query per row.",
+  "properties": {
+    "classification": {
+      "$ref": "#/$defs/Classification"
+    },
+    "reviews": {
+      "items": {
+        "$ref": "#/$defs/ClassificationReview"
+      },
+      "title": "Reviews",
+      "type": "array"
+    }
+  },
+  "required": [
+    "classification",
+    "reviews"
+  ],
+  "title": "ClassificationDetail",
+  "type": "object"
+}

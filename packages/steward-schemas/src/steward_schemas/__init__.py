@@ -34,6 +34,14 @@ from steward_schemas.profile import (
     TableProfile,
     ValueFrequency,
 )
+from steward_schemas.review import (
+    Classification,
+    ClassificationDetail,
+    ClassificationHistory,
+    ClassificationReview,
+    ReviewerKind,
+    ReviewRequest,
+)
 from steward_schemas.run import Run, RunCreate, RunStatus
 from steward_schemas.source import (
     DEFAULT_EXCLUDED_SCHEMAS,
@@ -66,13 +74,19 @@ __all__ = [
     "Source",
     "SourceCreate",
     "SourceEngine",
+    "Classification",
+    "ClassificationDetail",
+    "ClassificationHistory",
     "ClassificationProposal",
+    "ClassificationReview",
     "ColumnClassification",
     "EvidenceKind",
     "EvidenceRef",
     "ProposalStatus",
     "ReviewCommand",
     "ReviewOutcome",
+    "ReviewRequest",
+    "ReviewerKind",
     "SensitivityLabel",
     "TableProfile",
     "TaskResult",
@@ -99,4 +113,12 @@ CONTRACTS: dict[str, type[BaseModel]] = {
     "problem_details": ProblemDetails,
     "run_create": RunCreate,
     "run": Run,
+    "evidence_ref": EvidenceRef,
+    "column_classification": ColumnClassification,
+    "classification_proposal": ClassificationProposal,
+    "classification": Classification,
+    "classification_review": ClassificationReview,
+    "classification_detail": ClassificationDetail,
+    "classification_history": ClassificationHistory,
+    "review_request": ReviewRequest,
 }
