@@ -31,6 +31,7 @@ from steward_catalog.classification import (
     _proposal,
     approve,
     current_classification,
+    get_proposal,
     proposal_history,
     propose,
     record_proposal_reviews,
@@ -933,6 +934,50 @@ class TestPolicyAttribution:
                 command=a_command(policy_id="policy-b"),
                 actor=Actor(kind=ActorKind.POLICY, id="policy-a"),
             )
+        conn.rollback()
+
+
+class TestReading:
+    """The read path a reviewer's GET takes. Its property is what it does *not* do."""
+
+    def test_a_proposal_reads_back_by_id(self, conn: QueueConnection, asset_id: UUID) -> None:
+        proposal_id = recorded(conn, asset_id)
+
+        record = get_proposal(conn, proposal_id)
+
+        assert record is not None
+        assert (record.id, record.asset_id, record.version) == (proposal_id, asset_id, 1)
+        assert record.status is ProposalStatus.PENDING_REVIEW
+        assert [column.column_name for column in record.proposal.columns] == ["email"]
+
+    def test_an_unknown_id_reads_as_none_rather_than_raising(self, conn: QueueConnection) -> None:
+        assert get_proposal(conn, uuid4()) is None
+
+    def test_reading_does_not_wait_on_a_decision_in_progress(
+        self, conn: QueueConnection, other: QueueConnection, asset_id: UUID
+    ) -> None:
+        """A GET must not queue behind whoever is deciding.
+
+        `approve` on `conn` holds the asset's advisory lock and the proposal row
+        under `FOR UPDATE`, uncommitted, for the length of this block. A plain
+        read is unaffected by both; the locking read `approve` itself uses would
+        block until that transaction ends -- which is why serving a GET through
+        it would hold a reader for the length of someone else's decision.
+
+        The timeout is what makes this an assertion rather than a hang: swap
+        `SELECT_PROPOSAL` for `SELECT_PROPOSAL_FOR_UPDATE` and this fails in two
+        seconds instead of passing.
+        """
+        proposal_id = recorded(conn, asset_id)
+        approve(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)  # left uncommitted
+
+        other.execute("SET LOCAL statement_timeout = '2s'")
+        record = get_proposal(other, proposal_id)
+
+        assert record is not None
+        # The uncommitted approval is invisible, as it must be: this reader is
+        # in its own transaction and the decision has not landed yet.
+        assert record.status is ProposalStatus.PENDING_REVIEW
         conn.rollback()
 
 

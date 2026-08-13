@@ -71,6 +71,7 @@ __all__ = [
     "StaleProposal",
     "approve",
     "current_classification",
+    "get_proposal",
     "propose",
     "proposal_history",
     "record_proposal_reviews",
@@ -400,6 +401,18 @@ def reject(
     if replayed is not None:
         return replayed
     return _set_status(conn, target, ProposalStatus.REJECTED, actor=actor)
+
+
+def get_proposal(conn: QueueConnection, proposal_id: UUID) -> ProposalRecord | None:
+    """One proposal by id, whatever its status, without locking it.
+
+    The read path. `_locked_proposal` exists for decisions, which must read
+    under the asset's lock; a reader must not take that lock, or a GET would
+    queue behind whoever is deciding and hold a connection for the length of
+    someone else's transaction.
+    """
+    row = _one(conn, _sql.SELECT_PROPOSAL, {"id": proposal_id})
+    return _proposal(row) if row is not None else None
 
 
 def current_classification(conn: QueueConnection, asset_id: UUID) -> ProposalRecord | None:
