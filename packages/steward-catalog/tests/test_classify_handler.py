@@ -120,33 +120,58 @@ class StubClassifier:
         return self.answer(request)
 
 
-def cites_its_own_column(request: ClassificationRequest) -> ProposedClassification:
-    """Label the `email` column `pii`, citing a fact the stored profile holds.
+def covering(
+    request: ClassificationRequest,
+    *,
+    email_evidence: tuple[EvidenceRef, ...] | None = None,
+    extra: tuple[ColumnClassification, ...] = (),
+    omit: str | None = None,
+    prompt_version: str = PROMPT_VERSION,
+) -> ProposedClassification:
+    """An answer that classifies **every** column of the request, as the contract
+    requires — with knobs for the tests that need to break exactly one thing.
 
-    The locator is read *out of the request* rather than written down here, so
-    this answer stays resolvable when the fixture estate changes -- and so the
-    test cannot accidentally assert against a citation the profile never had.
+    Built from the request rather than written down, for two reasons. It stays
+    correct when the fixture estate changes; and it means a negative test
+    perturbs only the property it is about. A stub that returned one column
+    would now be refused for *coverage* before its citation was ever resolved,
+    which is how a later guard silently disarms an earlier test — the failure
+    mode this repo has shipped before.
+
+    `email` carries the sensitive label; the rest are `none`, which needs no
+    evidence.
     """
-    return ProposedClassification(
-        columns=(
-            ColumnClassification(
+    evidence = email_evidence
+    if evidence is None:
+        evidence = (
+            EvidenceRef(
+                profile_version=request.profile_version,
                 column_name="email",
-                labels=(SensitivityLabel.PII,),
-                confidence=Decimal("0.95"),
-                evidence=(
-                    EvidenceRef(
-                        profile_version=request.profile_version,
-                        column_name="email",
-                        kind=EvidenceKind.COLUMN_NAME,
-                        locator="email",
-                        detail="the column is named 'email'",
-                    ),
-                ),
+                kind=EvidenceKind.COLUMN_NAME,
+                locator="email",
+                detail="the column is named 'email'",
             ),
-        ),
-        prompt_version=PROMPT_VERSION,
+        )
+    columns = tuple(
+        ColumnClassification(
+            column_name=column.name,
+            labels=(SensitivityLabel.PII,) if column.name == "email" else (SensitivityLabel.NONE,),
+            confidence=Decimal("0.95") if column.name == "email" else Decimal("0.99"),
+            evidence=evidence if column.name == "email" else (),
+        )
+        for column in request.profile.columns
+        if column.name != omit
+    )
+    return ProposedClassification(
+        columns=columns + extra,
+        prompt_version=prompt_version,
         model_alias=MODEL_ALIAS,
     )
+
+
+def cites_its_own_column(request: ClassificationRequest) -> ProposedClassification:
+    """The ordinary answer: every column classified, `email` cited from the profile."""
+    return covering(request)
 
 
 def _ctx(conn: QueueConnection, spec: TaskSpec) -> TaskContext:
@@ -258,7 +283,10 @@ def test_a_classification_lands_as_pending_review(conn: QueueConnection, asset_i
     assert record.prompt_version == PROMPT_VERSION
     assert record.model_alias == MODEL_ALIAS
     assert record.trace_id == "trace-test"
-    assert [column.column_name for column in record.proposal.columns] == ["email"]
+    # Every column of the table, not just the interesting one: an asset that
+    # reads as classified must have had each of its columns assessed.
+    assert {column.column_name for column in record.proposal.columns} == {"id", "email", "card"}
+    assert [column.column_name for column in record.proposal.sensitive_columns] == ["email"]
     assert result.output == {
         "proposal_id": str(record.id),
         "asset_id": str(asset_id),
@@ -450,25 +478,17 @@ def test_an_invented_citation_cannot_be_persisted(conn: QueueConnection, asset_i
     """
 
     def invents_a_sample(request: ClassificationRequest) -> ProposedClassification:
-        return ProposedClassification(
-            columns=(
-                ColumnClassification(
+        return covering(
+            request,
+            email_evidence=(
+                EvidenceRef(
+                    profile_version=request.profile_version,
                     column_name="email",
-                    labels=(SensitivityLabel.PII,),
-                    confidence=Decimal("0.9"),
-                    evidence=(
-                        EvidenceRef(
-                            profile_version=request.profile_version,
-                            column_name="email",
-                            kind=EvidenceKind.MASKED_SAMPLE,
-                            locator="n***@n***.***",
-                            detail="a sample nothing in this profile contains",
-                        ),
-                    ),
+                    kind=EvidenceKind.MASKED_SAMPLE,
+                    locator="n***@n***.***",
+                    detail="a sample nothing in this profile contains",
                 ),
             ),
-            prompt_version=PROMPT_VERSION,
-            model_alias=MODEL_ALIAS,
         )
 
     result = classify(conn, asset_id, StubClassifier(answer=invents_a_sample))
@@ -484,25 +504,17 @@ def test_a_cross_profile_citation_cannot_be_persisted(
     """Evidence from a profile version this proposal does not classify is refused."""
 
     def cites_another_version(request: ClassificationRequest) -> ProposedClassification:
-        return ProposedClassification(
-            columns=(
-                ColumnClassification(
+        return covering(
+            request,
+            email_evidence=(
+                EvidenceRef(
+                    profile_version=request.profile_version + 1,
                     column_name="email",
-                    labels=(SensitivityLabel.PII,),
-                    confidence=Decimal("0.9"),
-                    evidence=(
-                        EvidenceRef(
-                            profile_version=request.profile_version + 1,
-                            column_name="email",
-                            kind=EvidenceKind.COLUMN_NAME,
-                            locator="email",
-                            detail="read from a version this proposal does not classify",
-                        ),
-                    ),
+                    kind=EvidenceKind.COLUMN_NAME,
+                    locator="email",
+                    detail="read from a version this proposal does not classify",
                 ),
             ),
-            prompt_version=PROMPT_VERSION,
-            model_alias=MODEL_ALIAS,
         )
 
     result = classify(conn, asset_id, StubClassifier(answer=cites_another_version))
@@ -512,35 +524,94 @@ def test_a_cross_profile_citation_cannot_be_persisted(
     assert proposal_history(conn, asset_id) == ()
 
 
+def test_a_partial_classification_cannot_be_persisted(
+    conn: QueueConnection, asset_id: UUID
+) -> None:
+    """A column the classifier never assessed is not a column it found nothing in.
+
+    This is the defect the coverage check exists for: every other guard here asks
+    whether a column's labels are supportable, and none of them notices a column
+    that was never labelled. Accepting the subset produced a `pending_review`
+    proposal and a `SUCCEEDED` task, so the asset read as classified and a
+    reviewer approving it published two columns' worth of silence as a finding.
+
+    The positive case is `test_a_classification_lands_as_pending_review`, which
+    covers all three columns of the same table through the same path.
+    """
+    result = classify(
+        conn, asset_id, StubClassifier(answer=lambda request: covering(request, omit="card"))
+    )
+
+    assert result.status is TaskStatus.FAILED
+    assert result.error is not None
+    assert result.error.type == "urn:steward:classification-column-mismatch"
+    assert "never classified card" in result.error.detail
+    assert proposal_history(conn, asset_id) == ()
+
+
 def test_a_column_the_profile_does_not_have_cannot_be_classified(
     conn: QueueConnection, asset_id: UUID
 ) -> None:
+    """An invented column is refused even when it carries no citation to resolve.
+
+    `none` needs no evidence, so an invented column labelled `none` never reaches
+    the evidence resolver at all — the guard that existed caught the careless
+    model and missed the plausible one. Coverage is checked on names, so both
+    are refused here.
+    """
+
     def invents_a_column(request: ClassificationRequest) -> ProposedClassification:
-        return ProposedClassification(
-            columns=(
+        return covering(
+            request,
+            extra=(
                 ColumnClassification(
                     column_name="ssn",
-                    labels=(SensitivityLabel.PII,),
+                    labels=(SensitivityLabel.NONE,),
                     confidence=Decimal("0.9"),
-                    evidence=(
-                        EvidenceRef(
-                            profile_version=request.profile_version,
-                            column_name="ssn",
-                            kind=EvidenceKind.COLUMN_NAME,
-                            locator="ssn",
-                            detail="a column this table does not have",
-                        ),
-                    ),
                 ),
             ),
-            prompt_version=PROMPT_VERSION,
-            model_alias=MODEL_ALIAS,
         )
 
     result = classify(conn, asset_id, StubClassifier(answer=invents_a_column))
 
     assert result.status is TaskStatus.FAILED
-    assert result.error is not None and result.error.type == "urn:steward:unresolvable-evidence"
+    assert result.error is not None
+    assert result.error.type == "urn:steward:classification-column-mismatch"
+    assert "does not contain" in result.error.detail
+    assert proposal_history(conn, asset_id) == ()
+
+
+def test_a_swap_is_caught_by_name_rather_than_by_count(
+    conn: QueueConnection, asset_id: UUID
+) -> None:
+    """Dropping one column and inventing another keeps the count right.
+
+    A coverage check comparing lengths would agree with itself here, which is
+    the shape a model is most likely to produce — it answered for three columns,
+    just not the three it was given.
+    """
+
+    def swaps_a_column(request: ClassificationRequest) -> ProposedClassification:
+        return covering(
+            request,
+            omit="card",
+            extra=(
+                ColumnClassification(
+                    column_name="ssn",
+                    labels=(SensitivityLabel.NONE,),
+                    confidence=Decimal("0.9"),
+                ),
+            ),
+        )
+
+    proposed = swaps_a_column
+    result = classify(conn, asset_id, StubClassifier(answer=proposed))
+
+    assert result.status is TaskStatus.FAILED
+    assert result.error is not None
+    assert result.error.type == "urn:steward:classification-column-mismatch"
+    assert "never classified card" in result.error.detail
+    assert "does not contain" in result.error.detail
     assert proposal_history(conn, asset_id) == ()
 
 
@@ -577,25 +648,18 @@ def test_every_kind_of_citation_copied_from_the_prompt_resolves(
     def cites(request: ClassificationRequest) -> ProposedClassification:
         shown = json.loads(request.model_dump_json())
         column = next(c for c in shown["profile"]["columns"] if c["name"] == "email")
-        return ProposedClassification(
-            columns=(
-                ColumnClassification(
+        return covering(
+            request,
+            email_evidence=(
+                EvidenceRef(
+                    profile_version=request.profile_version,
                     column_name="email",
-                    labels=(SensitivityLabel.PII,),
-                    confidence=Decimal("0.9"),
-                    evidence=(
-                        EvidenceRef(
-                            profile_version=request.profile_version,
-                            column_name="email",
-                            kind=kind,
-                            locator=read_locator(column),
-                            detail=f"copied from the {kind.value} the prompt showed",
-                        ),
-                    ),
+                    kind=kind,
+                    locator=read_locator(column),
+                    detail=f"copied from the {kind.value} the prompt showed",
                 ),
             ),
             prompt_version=f"{PROMPT_VERSION}+{kind.value}",
-            model_alias=MODEL_ALIAS,
         )
 
     result = classify(conn, asset_id, StubClassifier(answer=cites))
