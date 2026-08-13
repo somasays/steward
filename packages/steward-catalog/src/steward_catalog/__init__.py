@@ -1,8 +1,9 @@
 """steward-catalog: the deterministic, metadata-only catalog (FR1, issue #20).
 
-Register a Postgres source, scan it, persist what it holds. No model is called
-here and none will be: profiling, documentation and classification are later
-slices that read what this one wrote.
+Register a Postgres source, scan it, persist what it holds. **No model is called
+here and none will be** -- not even by the classification workflow this package
+now owns, which reaches one only through a protocol something else implements
+(`classify_handler`).
 
 The shape, in the order a scan moves through it:
 
@@ -32,11 +33,43 @@ Profiling (issue #49) is the second slice and the first that reads customer
   stored one writes nothing at all (I8).
 * `profile_handler` -- `profile_asset`, one bounded task per asset.
 
-Importing this package registers both handlers with `steward_queue`, the same
-way importing `steward_orchestration` registers its goals -- no setup call a
-process could forget.
+Classification (issue #50) is the third slice and the first whose work a model
+does. The catalog still owns the workflow -- which profile version is read,
+what a classifier may see, what becomes a proposal, and that it lands as
+`pending_review` -- because all of that is catalog state:
+
+* `classification` -- append-only proposals and the review lifecycle, where
+  approval is one atomic supersession (SPEC.md §13 D14).
+* `classify_handler` -- `classify_asset`, one bounded task per asset, with the
+  model call behind the `ColumnClassifier` protocol a worker binds an
+  implementation of (SPEC.md §13 D15). This package calls no model and imports
+  no gateway (I4).
+
+Importing this package registers all three handlers with `steward_queue`, the
+same way importing `steward_orchestration` registers its goals -- no setup call
+a process could forget. `classify_asset` additionally needs a *capability* bound
+into the process (`provide_classifier`); a process without one narrows its claim
+list rather than claiming tasks it cannot execute.
 """
 
+from steward_catalog.classify_handler import (
+    CLASSIFIER,
+    CLASSIFY_ASSET_SAMPLE_PAYLOAD,
+    CLASSIFY_ASSET_TASK_TYPE,
+    ClassificationRequest,
+    ClassificationRun,
+    ClassifierAlreadyBound,
+    ClassifierBudgetExceeded,
+    ClassifierFailed,
+    ClassifierProvider,
+    ClassifierUnbound,
+    ClassifyAssetPayload,
+    ColumnClassifier,
+    ProposedClassification,
+    build_classify_asset,
+    classifier_bound,
+    provide_classifier,
+)
 from steward_catalog.cursor import InvalidCursor, decode_cursor, encode_cursor
 from steward_catalog.diff import CatalogState, ConvergencePlan, plan_convergence
 from steward_catalog.handler import (
@@ -102,6 +135,9 @@ from steward_catalog.secrets import (
 
 __all__ = [
     "CATALOG_ENTITIES",
+    "CLASSIFIER",
+    "CLASSIFY_ASSET_SAMPLE_PAYLOAD",
+    "CLASSIFY_ASSET_TASK_TYPE",
     "PROFILE_ASSET_SAMPLE_PAYLOAD",
     "PROFILE_ASSET_TASK_TYPE",
     "PROFILE_ENTITY",
@@ -110,6 +146,15 @@ __all__ = [
     "WORKSPACE_ID",
     "AssetRecord",
     "CatalogState",
+    "ClassificationRequest",
+    "ClassificationRun",
+    "ClassifierAlreadyBound",
+    "ClassifierBudgetExceeded",
+    "ClassifierFailed",
+    "ClassifierProvider",
+    "ClassifierUnbound",
+    "ClassifyAssetPayload",
+    "ColumnClassifier",
     "ColumnRecord",
     "ConvergencePlan",
     "DiscoveredAsset",
@@ -120,6 +165,7 @@ __all__ = [
     "ProfileAssetPayload",
     "ProfileRecord",
     "ProfileTarget",
+    "ProposedClassification",
     "RawCell",
     "RecordedProfile",
     "SchemaFilter",
@@ -134,8 +180,10 @@ __all__ = [
     "SourceKey",
     "SourceRecord",
     "apply_plan",
+    "build_classify_asset",
     "build_profile_asset",
     "build_scan_source",
+    "classifier_bound",
     "column_semantic_type",
     "decode_cursor",
     "encode_cursor",
@@ -152,6 +200,7 @@ __all__ = [
     "postgres_inspector",
     "postgres_profiler",
     "profile_digest",
+    "provide_classifier",
     "record_profile",
     "register_source",
 ]
