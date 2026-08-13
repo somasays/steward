@@ -89,6 +89,12 @@
       "GUARDRAILS.md",
       "evals/*"
     ],
+    "services/*/src/*/prompts/*": [
+      "GUARDRAILS.md",
+      "evals/*",
+      "PROOFS.md",
+      "SPEC.md"
+    ],
     "evals/*": [
       "GUARDRAILS.md",
       "PROOFS.md"
