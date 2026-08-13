@@ -398,6 +398,8 @@ GET    /v1/sources/{id}/assets
 GET    /v1/assets?query=&source=&sensitivity=
 GET    /v1/assets/{id}                   # doc + profile + classifications + rules
 GET    /v1/assets/{id}/history
+GET    /v1/assets/{id}/classification    # the approved version, or 404
+GET    /v1/assets/{id}/classifications   # every version, newest first
 
 # Search & ask
 POST   /v1/search                        # hybrid retrieval, returns ranked chunks + scores
@@ -411,6 +413,7 @@ POST   /v1/incidents/{id}:resolve
 
 # Review queue (human-in-the-loop)
 GET    /v1/reviews?type=classification|document|rule
+GET    /v1/reviews/{id}                       # the proposal, its evidence and every decision on it
 POST   /v1/reviews/{id}:approve | :reject     # rejection requires a reason → becomes eval data
 
 # Runs & operations
@@ -448,6 +451,39 @@ convergence, stated as a fact of this schema (one key per run) rather than
 left for a client to discover by retrying.
 `GET /v1/assets` pages by opaque cursor over `(schema, name, id)` — a total
 order, so a scan committing between two pages cannot make a client skip an asset.
+
+**Classification and review** (M1 slice 3b, issue #50). Reads are split by what
+the resource *is*. An asset's classification is catalog state, so it hangs off
+the asset: `GET /v1/assets/{id}/classification` returns the one **approved**
+version and 404s when none is published — there is no request that returns an
+unreviewed proposal as an asset's answer, which is §3.3's gate expressed as a
+resource rather than remembered by each caller. `GET /v1/assets/{id}/classifications`
+returns every version newest first, rejected and superseded included, because
+an append-only table exists so that "why is this column *not* labelled PHI" has
+an answer. Both distinguish an unknown asset (404) from a scanned asset with no
+classifications (200, empty), which are different facts about a client's id.
+A review is a decision, so it hangs off the review queue: `GET /v1/reviews/{id}`
+carries the proposal plus every decision recorded against it, and the decisions
+are `POST /v1/reviews/{id}:approve|:reject` — §8's own colon convention for an
+action on a resource, and two endpoints rather than one carrying `{"outcome":
+...}` because they are opposite governance actions, one of which supersedes an
+asset's published classification and one of which must leave it untouched. A
+body field would make "approve, outcome=rejected" representable at the seam,
+and the version of this that existed recorded a rejection while publishing the
+proposal. The request body is a **reason and nothing else**: outcome comes from
+the path, actor from the caller, time from the database, and a policy id is
+absent because this endpoint is attributed to a human actor and the repository
+refuses a policy attribution from one — auto-approval is a configured policy
+calling the repository, not a request claiming to be one. Both decisions take
+the same `Idempotency-Key` header every other POST does; replaying a key returns
+the decision it settled, and sending it with a *different* one (another
+proposal, the opposite outcome, another reviewer, another reason) is a 409,
+since returning the settled record would tell a reviewer their rejection was
+recorded when an approval is what happened. The refusals are typed rather than
+collapsed into one conflict: `urn:steward:proposal-not-pending`,
+`urn:steward:proposal-stale`, `urn:steward:asset-not-classifiable` and
+`urn:steward:idempotency-key-reused` are four different things for a client to
+do next.
 
 `POST /v1/runs` is M0's entry point: a generic `{goal, payload}` body returning 202. The run row and the tasks its goal plans are written in one transaction (I8), so a 202 is a guarantee that work is queued, not a promise to queue it later; a worker then executes the task and the run's status follows its tasks (`pending → running → succeeded|failed`) in the transaction that settles the last one. The expansion is the goal registry's (§3.1): the endpoint validates `goal` and `payload` against the registration and rejects anything unregistered or schema-invalid with problem details before a run exists (#19). Goal-specific endpoints (`POST /v1/sources/{id}/scan`, above) land in M1 and are expected to become the primary way runs get created; whether `POST /v1/runs` stays as a generic escape hatch or narrows to goal-specific endpoints only is an open question for that milestone.
 

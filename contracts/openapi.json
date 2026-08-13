@@ -123,6 +123,208 @@
         "title": "AssetType",
         "type": "string"
       },
+      "Classification": {
+        "additionalProperties": false,
+        "description": "One stored proposal, projected: what was proposed, and where it stands.\n\nThe proposal is nested rather than flattened because it is already the\ncontract for \"what a classifier proposed\", validated on the way in and\nstored verbatim. Flattening would republish every one of its fields under a\nsecond name, and the day the two disagreed there would be no answer to which\none the reviewer read.\n\nWhat the projection adds is everything the proposal cannot know about\nitself: which row it is, which version of this asset's classification, what\nreview has decided so far, and which run, task and trace produced it. That\nlast group is the provenance an operator follows backwards -- from a label\non a column to the model call that proposed it (I7).",
+        "properties": {
+          "asset_id": {
+            "format": "uuid",
+            "title": "Asset Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "proposal": {
+            "$ref": "#/components/schemas/ClassificationProposal"
+          },
+          "run_id": {
+            "format": "uuid",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProposalStatus"
+          },
+          "task_id": {
+            "format": "uuid",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "trace_id": {
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "asset_id",
+          "version",
+          "status",
+          "proposal",
+          "run_id",
+          "task_id",
+          "trace_id",
+          "created_at"
+        ],
+        "title": "Classification",
+        "type": "object"
+      },
+      "ClassificationDetail": {
+        "additionalProperties": false,
+        "description": "A proposal and every decision recorded against it, oldest first.\n\nThe history is part of the *detail* view and not of the list view because a\nreviewer deciding one proposal needs to see that someone already rejected\nit, while a client listing an asset's versions does not -- and fetching it\nfor each would be a query per row.",
+        "properties": {
+          "classification": {
+            "$ref": "#/components/schemas/Classification"
+          },
+          "reviews": {
+            "items": {
+              "$ref": "#/components/schemas/ClassificationReview"
+            },
+            "title": "Reviews",
+            "type": "array"
+          }
+        },
+        "required": [
+          "classification",
+          "reviews"
+        ],
+        "title": "ClassificationDetail",
+        "type": "object"
+      },
+      "ClassificationHistory": {
+        "additionalProperties": false,
+        "description": "Every classification version of one asset, newest first.\n\nUnpaged, deliberately: versions are bounded by how often an asset is\nre-profiled, so this is tens of rows and not thousands. If that stops being\ntrue it gains a cursor exactly as `AssetPage` has one.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Classification"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "ClassificationHistory",
+        "type": "object"
+      },
+      "ClassificationProposal": {
+        "additionalProperties": false,
+        "description": "One classification of one asset, from one profile, by one prompt.\n\nThe provenance fields are not decoration: they are the answer to \"why does\nthis column say PII\", and they are what makes a proposal reproducible. An\nasset re-profiled next month produces a *new* proposal against the new\nprofile version; this one keeps saying what was true of the old one.",
+        "properties": {
+          "asset_id": {
+            "format": "uuid",
+            "title": "Asset Id",
+            "type": "string"
+          },
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnClassification"
+            },
+            "minItems": 1,
+            "title": "Columns",
+            "type": "array"
+          },
+          "model_alias": {
+            "minLength": 1,
+            "title": "Model Alias",
+            "type": "string"
+          },
+          "profile_version": {
+            "minimum": 1.0,
+            "title": "Profile Version",
+            "type": "integer"
+          },
+          "prompt_version": {
+            "minLength": 1,
+            "title": "Prompt Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "asset_id",
+          "profile_version",
+          "prompt_version",
+          "model_alias",
+          "columns"
+        ],
+        "title": "ClassificationProposal",
+        "type": "object"
+      },
+      "ClassificationReview": {
+        "additionalProperties": false,
+        "description": "One recorded decision. An event: never edited, never deleted.\n\n`actor_kind`/`actor_id` are the trusted actor the repository was given, not\nanything a caller supplied, and they are the same pair the audit row carries\nfor the same action.",
+        "properties": {
+          "actor_id": {
+            "minLength": 1,
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "actor_kind": {
+            "$ref": "#/components/schemas/ReviewerKind"
+          },
+          "decided_at": {
+            "format": "date-time",
+            "title": "Decided At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/ReviewOutcome"
+          },
+          "policy_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Policy Id"
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "title": "Proposal Id",
+            "type": "string"
+          },
+          "reason": {
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "proposal_id",
+          "outcome",
+          "actor_kind",
+          "actor_id",
+          "reason",
+          "decided_at"
+        ],
+        "title": "ClassificationReview",
+        "type": "object"
+      },
       "Column": {
         "additionalProperties": false,
         "description": "A column of an `Asset`. `data_type` is the source engine's own type\nname (e.g. \"varchar\", \"numeric(10,2)\") \u2014 engines disagree on type\nsystems, so this is deliberately a string rather than a closed enum.",
@@ -187,6 +389,98 @@
         "title": "Column",
         "type": "object"
       },
+      "ColumnClassification": {
+        "additionalProperties": false,
+        "description": "One column's proposed labels, with the evidence for each.",
+        "properties": {
+          "column_name": {
+            "minLength": 1,
+            "title": "Column Name",
+            "type": "string"
+          },
+          "confidence": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Confidence",
+            "type": "string"
+          },
+          "evidence": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvidenceRef"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "labels": {
+            "items": {
+              "$ref": "#/components/schemas/SensitivityLabel"
+            },
+            "minItems": 1,
+            "title": "Labels",
+            "type": "array"
+          }
+        },
+        "required": [
+          "column_name",
+          "labels",
+          "confidence"
+        ],
+        "title": "ColumnClassification",
+        "type": "object"
+      },
+      "EvidenceKind": {
+        "description": "Which part of a profile a citation points at.\n\nThe kinds are closed on purpose: an evidence reference has to be resolvable\nback to the exact input, and a free-text \"kind\" would let the model cite\nsomething the resolver cannot look up -- an unresolvable citation being\nindistinguishable, to a reviewer, from a fabricated one.",
+        "enum": [
+          "column_name",
+          "data_type",
+          "masked_sample",
+          "distinct_ratio",
+          "null_ratio",
+          "semantic_type"
+        ],
+        "title": "EvidenceKind",
+        "type": "string"
+      },
+      "EvidenceRef": {
+        "additionalProperties": false,
+        "description": "A pointer into the profile that justified a label.\n\n`profile_version` and `column_name` are part of the reference rather than\nimplied by context, so a reference can be checked against the input it\nclaims to come from. Cross-profile and cross-column citations are the two\nfailure modes worth catching by construction: a model that cites a column\nit was not asked about, or a profile version it never saw, is one whose\noutput is unverifiable however plausible it reads.",
+        "properties": {
+          "column_name": {
+            "minLength": 1,
+            "title": "Column Name",
+            "type": "string"
+          },
+          "detail": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Detail",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/EvidenceKind"
+          },
+          "locator": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Locator",
+            "type": "string"
+          },
+          "profile_version": {
+            "minimum": 1.0,
+            "title": "Profile Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "profile_version",
+          "column_name",
+          "kind",
+          "locator",
+          "detail"
+        ],
+        "title": "EvidenceRef",
+        "type": "object"
+      },
       "ProblemDetails": {
         "additionalProperties": true,
         "description": "A machine-readable error, per RFC 9457 (obsoletes RFC 7807).\n\nDeviates from the package's usual `extra=\"forbid\"` (see `_base.SchemaModel`)\nby design: RFC 9457 defines problem types as extensible with additional\nmembers beyond `type`/`title`/`status`/`detail`/`instance`, and Steward's\nAPI surface uses that \u2014 e.g. a `budget_exceeded` problem carries the\n`RunBudget` that was exceeded as an extension member. Still frozen:\nan error value is a fact about what happened, not something to mutate.",
@@ -235,6 +529,53 @@
         ],
         "title": "ProblemDetails",
         "type": "object"
+      },
+      "ProposalStatus": {
+        "description": "Where a proposal sits in review.\n\n`PENDING_REVIEW` is the only state a proposal is created in. There is no\ntransition to `APPROVED` that is not a recorded `ReviewDecision`, which is\nwhat makes \"no proposal publishes without a review\" a property of the state\nmachine rather than a rule the API remembers to apply.",
+        "enum": [
+          "pending_review",
+          "approved",
+          "rejected",
+          "superseded"
+        ],
+        "title": "ProposalStatus",
+        "type": "string"
+      },
+      "ReviewOutcome": {
+        "enum": [
+          "approved",
+          "rejected"
+        ],
+        "title": "ReviewOutcome",
+        "type": "string"
+      },
+      "ReviewRequest": {
+        "additionalProperties": false,
+        "description": "What a reviewer sends to approve or reject: why, and nothing else.\n\nOutcome comes from the endpoint (`:approve` / `:reject`), actor from the\nauthenticated caller, time from the database -- the three reasons\n`ReviewCommand` refuses them.\n\n`policy_id` is absent for a fourth reason, specific to HTTP. An automatic\napproval must be attributable to the policy that made it, and the repository\nenforces that by requiring the policy actor's own id to match; a request\narriving over this endpoint is attributed to the API's human actor, so any\npolicy id a body could carry is one the repository would refuse. Publishing\nthe field would advertise a way to record a policy decision that cannot\nwork. Auto-approval is a configured policy calling the repository, not a\nrequest claiming to be one (SPEC.md \u00a73.3).",
+        "properties": {
+          "reason": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "ReviewRequest",
+        "type": "object"
+      },
+      "ReviewerKind": {
+        "description": "Who recorded a decision, as the API publishes it.\n\nA deliberate duplicate of `steward_queue.ActorKind`, which this package may\nnot import (I4: `steward-schemas` depends on pydantic and the standard\nlibrary, and everything depends on it). The duplication is not left to\ndrift: `services/api/tests/test_review_routes.py` asserts the two enums have\nthe same members, so adding an actor kind on one side fails on the other\nrather than rendering as a value no client's generated types know.",
+        "enum": [
+          "human",
+          "agent",
+          "policy",
+          "system"
+        ],
+        "title": "ReviewerKind",
+        "type": "string"
       },
       "Run": {
         "additionalProperties": false,
@@ -374,6 +715,17 @@
           "cancelled"
         ],
         "title": "RunStatus",
+        "type": "string"
+      },
+      "SensitivityLabel": {
+        "description": "What a column may be classified as (#50).\n\nFour values, and `NONE` is not one of the sensitive three: it is the\nassertion that none apply. Multiple sensitive labels on one column are\nallowed -- a payments table's `card_holder_name` is plausibly `PII` and\n`FINANCIAL` at once -- because forcing a single label would make the\nclassifier choose between two true statements.",
+        "enum": [
+          "pii",
+          "phi",
+          "financial",
+          "none"
+        ],
+        "title": "SensitivityLabel",
         "type": "string"
       },
       "Source": {
@@ -701,6 +1053,398 @@
         "summary": "Get Asset",
         "tags": [
           "assets"
+        ]
+      }
+    },
+    "/v1/assets/{asset_id}/classification": {
+      "get": {
+        "description": "The asset's *published* classification -- singular, and approved.\n\nOnly ever an approved version: a pending or rejected proposal is\nreadable through `/v1/reviews/{id}` and through the history below, and\nneither is this asset's answer. That is the human-in-the-loop gate\nexpressed as a resource -- there is no request that returns an\nunreviewed classification as the current one (SPEC.md \u00a73.3).\n\nThe two 404s are deliberately different sentences: an unknown asset is\nnot the same fact as an asset nobody has classified yet, and a client\nthat cannot tell them apart retries a typo forever.",
+        "operationId": "get_current_classification_v1_assets__asset_id__classification_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Asset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Classification"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Asset not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "Get Current Classification",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/v1/assets/{asset_id}/classifications": {
+      "get": {
+        "description": "Every version this asset has ever had, newest first.\n\nIncluding the rejected and the superseded, because that is what an\nappend-only table is for: \"why is this column labelled PII\" is answered\nby the version that was approved, and \"why is it not labelled PHI\" often\nonly by the one that was rejected.\n\nAn asset with no proposals answers 200 with an empty list -- it exists\nand has no classifications, which is a fact. An asset that does not\nexist answers 404. An empty list would otherwise be the same response\nfor both, and a client could not tell a scanned-but-unclassified asset\nfrom an id it made up.",
+        "operationId": "get_classification_history_v1_assets__asset_id__classifications_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Asset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassificationHistory"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Asset not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "Get Classification History",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/v1/reviews/{proposal_id}": {
+      "get": {
+        "description": "One proposal with its labels, evidence, provenance and every decision\nrecorded against it -- what a reviewer needs in order to decide.",
+        "operationId": "get_review_v1_reviews__proposal_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassificationDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No such classification proposal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "Get Review",
+        "tags": [
+          "reviews"
+        ]
+      }
+    },
+    "/v1/reviews/{proposal_id}:approve": {
+      "post": {
+        "description": "Publish this classification, superseding whatever it replaces.",
+        "operationId": "approve_review_v1_reviews__proposal_id__approve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Classification"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No such classification proposal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The proposal was already decided, describes a profile the asset has moved past, belongs to an inactive asset, or the idempotency key already settled a different decision"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "Approve Review",
+        "tags": [
+          "reviews"
+        ]
+      }
+    },
+    "/v1/reviews/{proposal_id}:reject": {
+      "post": {
+        "description": "Refuse this classification. What is published stays published.\n\nA reason is required by the contract (`ReviewRequest.reason`, min length\n1) and that is not a formality: SPEC.md \u00a78 exports every rejection with\nits reason to the eval dataset, so a rejection with nothing to say is a\ntraining signal thrown away.",
+        "operationId": "reject_review_v1_reviews__proposal_id__reject_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Classification"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No such classification proposal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The proposal was already decided, describes a profile the asset has moved past, belongs to an inactive asset, or the idempotency key already settled a different decision"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error"
+          }
+        },
+        "summary": "Reject Review",
+        "tags": [
+          "reviews"
         ]
       }
     },

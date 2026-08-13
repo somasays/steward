@@ -101,6 +101,84 @@ def idempotency_key_unbindable(detail: str, *, instance: str | None = None) -> P
     )
 
 
+def proposal_not_pending(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `409` for a review decision on a proposal that was already decided.
+
+    Not a 404 and not a silent success: the proposal exists and the caller's
+    request is well-formed, but somebody -- possibly this same client, retrying
+    without a key -- already settled it. A second approval that quietly returned
+    the record would tell a reviewer their decision was recorded when the
+    recorded one is someone else's.
+    """
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:proposal-not-pending",
+            title="Proposal has already been decided",
+            status=status.HTTP_409_CONFLICT,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
+def stale_proposal(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `409` for approving a classification of data that has since changed.
+
+    Its own type rather than a generic conflict because the remedy is specific
+    and a client can act on it: the asset has been re-profiled, so this proposal
+    describes a profile version that is no longer current and a new
+    classification run is what publishes a label for the data as it now stands.
+    """
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:proposal-stale",
+            title="Proposal describes a profile the asset has moved past",
+            status=status.HTTP_409_CONFLICT,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
+def asset_not_classifiable(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `409` for publishing a classification of an asset that is gone.
+
+    A dropped or retired table keeps its row and its history (the catalog
+    retires, it does not delete), so the proposal is still readable -- but
+    nothing new may be published about an asset that no longer exists in the
+    source.
+    """
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:asset-not-classifiable",
+            title="Asset is inactive or absent",
+            status=status.HTTP_409_CONFLICT,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
+def classification_conflict(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `409` for a review decision another one won.
+
+    The fallback of the conflict family, and it exists so that a
+    `ClassificationConflict` this module does not name specifically still
+    reaches a client as a typed 409 rather than as a 500. The repository raising
+    a *typed* conflict instead of a `UniqueViolation` is what makes that
+    possible at all.
+    """
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:classification-conflict",
+            title="Another decision for this asset won",
+            status=status.HTTP_409_CONFLICT,
+            detail=detail,
+            instance=instance,
+        )
+    )
+
+
 def unknown_goal(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
     """A `422` problem for a `goal` no planner is registered for (issue #19).
 

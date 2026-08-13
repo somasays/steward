@@ -37,6 +37,7 @@ from steward_catalog import (
     InvalidCursor,
     SourceKey,
     SourceRecord,
+    classification,
     decode_cursor,
     encode_cursor,
     get_asset,
@@ -45,10 +46,12 @@ from steward_catalog import (
     list_assets,
     register_source,
 )
+from steward_catalog.classification import ProposalRecord, ReviewRecord
 from steward_orchestration import SCAN_SOURCE_GOAL, plan_run
 from steward_queue import (
     Actor,
     ActorKind,
+    QueueConnection,
     RunRecord,
     bind_idempotency_key,
     claim_single_flight,
@@ -60,7 +63,14 @@ from steward_schemas import (
     Asset,
     AssetDetail,
     AssetPage,
+    Classification,
+    ClassificationDetail,
+    ClassificationHistory,
+    ClassificationReview,
     Column,
+    ReviewCommand,
+    ReviewerKind,
+    ReviewRequest,
     Run,
     RunBudget,
     RunStatus,
@@ -95,6 +105,20 @@ class SourceNotFound(LookupError):
     def __init__(self, source_id: UUID) -> None:
         super().__init__(f"no source registered with id {source_id}")
         self.source_id = source_id
+
+
+class AssetNotFound(LookupError):
+    """A classification read named an asset that was never scanned.
+
+    Distinct from "this asset has no classification", which is the same 404 to a
+    careless reader and a different fact to a client: one means the id is wrong,
+    the other means the work has not happened yet. Collapsing them would have a
+    client retrying a typo forever.
+    """
+
+    def __init__(self, asset_id: UUID) -> None:
+        super().__init__(f"no asset with id {asset_id}")
+        self.asset_id = asset_id
 
 
 class IdempotencyKeyUnbindable(Exception):
@@ -159,6 +183,62 @@ class CatalogStore(Protocol):
         """An asset and its columns, or None."""
         ...
 
+    async def current_classification(self, asset_id: UUID) -> Classification | None:
+        """The published classification of `asset_id`, or None if none is.
+
+        Raises `AssetNotFound` when nothing was ever scanned under that id --
+        which is a different answer from "not classified yet"."""
+        ...
+
+    async def classification_history(self, asset_id: UUID) -> ClassificationHistory:
+        """Every classification version of `asset_id`, newest first, whatever
+        each one's status. Raises `AssetNotFound` as above."""
+        ...
+
+    async def get_classification(self, proposal_id: UUID) -> ClassificationDetail | None:
+        """One classification with every decision recorded against it, or None."""
+        ...
+
+    async def approve_classification(
+        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+    ) -> Classification:
+        """Publish `proposal_id`, superseding whatever it replaces, atomically.
+
+        Raises `LookupError` when no such proposal exists, and the
+        `ClassificationConflict` family when the decision cannot stand: already
+        decided, describing a profile the asset has moved past, on an inactive
+        asset, or under a key that already settled a different decision."""
+        ...
+
+    async def reject_classification(
+        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+    ) -> Classification:
+        """Refuse `proposal_id`, leaving the published version untouched. Same
+        failures as `approve_classification`."""
+        ...
+
+
+class _Decision(Protocol):
+    """`classification.approve` or `classification.reject` -- and nothing else.
+
+    The store passes the repository function itself rather than an outcome flag,
+    for the reason `ReviewCommand` carries no outcome: a parameter says
+    `decide(..., outcome=REJECTED)` is representable through the approve path,
+    and the two functions do genuinely different things -- one supersedes an
+    incumbent, the other must not touch it. There is no value of any argument
+    that turns one into the other.
+    """
+
+    def __call__(
+        self,
+        conn: QueueConnection,
+        proposal_id: UUID,
+        *,
+        command: ReviewCommand,
+        idempotency_key: str | None = None,
+        actor: Actor,
+    ) -> ProposalRecord: ...
+
 
 def source_response(record: SourceRecord) -> Source:
     """Project a `sources` row onto the published contract.
@@ -204,6 +284,47 @@ def column_response(record: ColumnRecord) -> Column:
         lifecycle=record.lifecycle,
         created_at=record.created_at,
         updated_at=record.updated_at,
+    )
+
+
+def classification_response(record: ProposalRecord) -> Classification:
+    """Project a `classification_proposals` row onto the published contract.
+
+    The proposal travels whole rather than field by field: it was validated on
+    the way in and stored verbatim, so re-deriving it here would be a second
+    place for "what the classifier said" to be defined. What this adds is the
+    row's own identity and the run that produced it (I3).
+    """
+    return Classification(
+        id=record.id,
+        asset_id=record.asset_id,
+        version=record.version,
+        status=record.status,
+        proposal=record.proposal,
+        run_id=record.run_id,
+        task_id=record.task_id,
+        trace_id=record.trace_id,
+        created_at=record.created_at,
+    )
+
+
+def review_response(record: ReviewRecord) -> ClassificationReview:
+    """Project a `classification_reviews` row onto the published contract.
+
+    `ReviewerKind` is `steward_schemas`' own enum and `record.actor.kind` is
+    `steward_queue`'s; they carry the same values and the conversion is by
+    value, so a kind added to one and not the other fails here rather than
+    serialising a string no client's generated types know.
+    """
+    return ClassificationReview(
+        id=record.id,
+        proposal_id=record.proposal_id,
+        outcome=record.outcome,
+        actor_kind=ReviewerKind(record.actor.kind.value),
+        actor_id=record.actor.id,
+        reason=record.reason,
+        policy_id=record.policy_id,
+        decided_at=record.decided_at,
     )
 
 
@@ -254,6 +375,29 @@ class PostgresCatalogStore:
 
     async def get_asset(self, asset_id: UUID) -> AssetDetail | None:
         return await asyncio.to_thread(self._get_asset, asset_id)
+
+    async def current_classification(self, asset_id: UUID) -> Classification | None:
+        return await asyncio.to_thread(self._current_classification, asset_id)
+
+    async def classification_history(self, asset_id: UUID) -> ClassificationHistory:
+        return await asyncio.to_thread(self._classification_history, asset_id)
+
+    async def get_classification(self, proposal_id: UUID) -> ClassificationDetail | None:
+        return await asyncio.to_thread(self._get_classification, proposal_id)
+
+    async def approve_classification(
+        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+    ) -> Classification:
+        return await asyncio.to_thread(
+            self._decide, classification.approve, proposal_id, request, idempotency_key
+        )
+
+    async def reject_classification(
+        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+    ) -> Classification:
+        return await asyncio.to_thread(
+            self._decide, classification.reject, proposal_id, request, idempotency_key
+        )
 
     # --- synchronous halves, always called through asyncio.to_thread ---
 
@@ -377,6 +521,80 @@ class PostgresCatalogStore:
             columns=tuple(column_response(column) for column in columns),
         )
 
+    def _current_classification(self, asset_id: UUID) -> Classification | None:
+        with connect(self._dsn) as conn:
+            known = get_asset(conn, asset_id) is not None
+            record = classification.current_classification(conn, asset_id) if known else None
+            conn.rollback()
+        if not known:
+            raise AssetNotFound(asset_id)
+        return classification_response(record) if record is not None else None
+
+    def _classification_history(self, asset_id: UUID) -> ClassificationHistory:
+        """Every version, newest first -- including the rejected and superseded.
+
+        History is the whole point of an append-only table: an operator asking
+        why a column is labelled the way it is needs to see the version that was
+        rejected as much as the one that was published.
+        """
+        with connect(self._dsn) as conn:
+            known = get_asset(conn, asset_id) is not None
+            records = classification.proposal_history(conn, asset_id) if known else ()
+            conn.rollback()
+        if not known:
+            raise AssetNotFound(asset_id)
+        return ClassificationHistory(items=tuple(classification_response(r) for r in records))
+
+    def _get_classification(self, proposal_id: UUID) -> ClassificationDetail | None:
+        with connect(self._dsn) as conn:
+            record = classification.get_proposal(conn, proposal_id)
+            reviews = (
+                classification.record_proposal_reviews(conn, proposal_id)
+                if record is not None
+                else ()
+            )
+            conn.rollback()
+        if record is None:
+            return None
+        return ClassificationDetail(
+            classification=classification_response(record),
+            reviews=tuple(review_response(review) for review in reviews),
+        )
+
+    def _decide(
+        self,
+        decide: _Decision,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+    ) -> Classification:
+        """One review decision, its status changes and its audit rows, committed
+        together or not at all (I8).
+
+        The actor is `API_ACTOR` -- a human, because this endpoint is only ever
+        reached because a person or their client asked. That is also why the
+        command carries no policy id: the repository refuses a policy
+        attribution from a non-policy actor, so there is no policy decision this
+        path could record even if a body tried to describe one (SPEC.md §3.3).
+        """
+        command = ReviewCommand(reason=request.reason)
+        with connect(self._dsn) as conn:
+            try:
+                record = decide(
+                    conn,
+                    proposal_id,
+                    command=command,
+                    idempotency_key=idempotency_key,
+                    actor=API_ACTOR,
+                )
+            except Exception:
+                # A refused decision must leave nothing behind -- not a review
+                # row, not a status change, not an audit entry claiming one.
+                conn.rollback()
+                raise
+            conn.commit()
+        return classification_response(record)
+
 
 class InMemoryCatalogStore:
     """Process-local `CatalogStore` for testing the HTTP layer in isolation.
@@ -447,11 +665,38 @@ class InMemoryCatalogStore:
     async def get_asset(self, asset_id: UUID) -> AssetDetail | None:
         return None
 
+    # Classification needs a catalog, a profile and a worker, none of which this
+    # store has. Every method below therefore answers "no such thing" rather
+    # than an empty success: a stub that returned an empty history for any id
+    # would let a routing test pass while asserting nothing, and would make this
+    # class look briefly like a deployment option. What these do exercise is the
+    # HTTP layer's 404 paths, which is what they are here for.
+
+    async def current_classification(self, asset_id: UUID) -> Classification | None:
+        raise AssetNotFound(asset_id)
+
+    async def classification_history(self, asset_id: UUID) -> ClassificationHistory:
+        raise AssetNotFound(asset_id)
+
+    async def get_classification(self, proposal_id: UUID) -> ClassificationDetail | None:
+        return None
+
+    async def approve_classification(
+        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+    ) -> Classification:
+        raise LookupError(f"no such proposal: {proposal_id}")
+
+    async def reject_classification(
+        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+    ) -> Classification:
+        raise LookupError(f"no such proposal: {proposal_id}")
+
 
 __all__ = [
     "DEFAULT_PAGE_SIZE",
     "MAX_PAGE_SIZE",
     "SOURCE_LOCATION_PREFIX",
+    "AssetNotFound",
     "CatalogStore",
     "IdempotencyKeyUnbindable",
     "InMemoryCatalogStore",
