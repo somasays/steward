@@ -59,6 +59,7 @@ from steward_schemas import (
     ProposalStatus,
     ReviewerKind,
     ReviewOutcome,
+    ReviewRequest,
     SensitivityLabel,
 )
 
@@ -141,12 +142,12 @@ class StubStore(InMemoryCatalogStore):
         self.history: ClassificationHistory | None = None
 
     async def approve_classification(
-        self, proposal_id: UUID, request: object, idempotency_key: str | None
+        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
     ) -> Classification:
         return self._decide("approve", proposal_id, request, idempotency_key)
 
     async def reject_classification(
-        self, proposal_id: UUID, request: object, idempotency_key: str | None
+        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
     ) -> Classification:
         return self._decide("reject", proposal_id, request, idempotency_key)
 
@@ -162,9 +163,9 @@ class StubStore(InMemoryCatalogStore):
         return self.history
 
     def _decide(
-        self, verb: str, proposal_id: UUID, request: object, idempotency_key: str | None
+        self, verb: str, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
     ) -> Classification:
-        reason = getattr(request, "reason", "")
+        reason = request.reason
         self.calls.append((verb, proposal_id, reason, idempotency_key))
         if self._raises is not None:
             raise self._raises

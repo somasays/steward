@@ -49,7 +49,6 @@ from steward_api.catalog import PostgresCatalogStore
 from steward_api.store import PostgresRunStore
 from steward_catalog import (
     CLASSIFIER,
-    CLASSIFY_ASSET_TASK_TYPE,
     ClassificationRequest,
     ClassificationRun,
     ProposedClassification,
@@ -269,9 +268,12 @@ def drain(client: TestClient, dsn: str, run_id: str) -> dict[str, Any]:
     """Run a worker and poll the API until the run stops moving.
 
     The worker claims every registered type, `classify_asset` included, because
-    the classifier fixture has bound the capability — which is the composition
-    root's rule (`steward_workers.__main__.claimable_types`) exercised rather
-    than described.
+    the classifier fixture bound the capability. That a worker *without* one
+    narrows its claim list instead is the composition root's rule, and it is
+    proven where that root lives (`services/workers/tests/test_worker_capabilities.py`,
+    PROOFS row 111) rather than here — this service's tests may not import that
+    one (I4: services do not import each other), and an import in a test tree is
+    invisible to S1 because import-linter scans `src/` only.
     """
     worker = Worker(dsn, "m1-classification-worker", task_types=registered_types())
     deadline = time.monotonic() + POLL_TIMEOUT.total_seconds()
@@ -425,7 +427,7 @@ def test_an_unreviewed_proposal_is_never_the_assets_answer(
 
 
 def test_a_rejected_proposal_is_not_published_either(
-    client: TestClient, conn: QueueConnection, asset_id: str, proposal: dict[str, Any]
+    client: TestClient, asset_id: str, proposal: dict[str, Any]
 ) -> None:
     """Rejection records the decision and publishes nothing."""
     rejected = client.post(
@@ -576,42 +578,6 @@ def test_every_status_change_is_audited(
     assert rows[0][2]["status"] == "pending_review"
     assert rows[1][1]["status"] == "pending_review"
     assert rows[1][2]["status"] == "approved"
-
-
-def test_a_worker_without_a_classifier_leaves_the_task_unclaimed(
-    client: TestClient, dsn: str, conn: QueueConnection, asset_id: str
-) -> None:
-    """The capability is per process, and a process without it does not pretend.
-
-    No classifier is bound here (the `classifier` fixture is absent), so the
-    worker's claim list must exclude `classify_asset` and the task stays
-    pending. A worker that claimed it would fail it on every retry and the
-    backlog would look like a broken classifier instead of an absent one
-    (SPEC §13 D15).
-    """
-    accepted = client.post(
-        "/v1/runs",
-        json={
-            "goal": "classify_asset",
-            "payload": {"asset_id": asset_id, "profile_version": 1},
-        },
-    )
-    assert accepted.status_code == 202
-    assert not CLASSIFIER.bound
-    assert CLASSIFY_ASSET_TASK_TYPE not in _claimable()
-
-    asyncio.run(Worker(dsn, "capability-less-worker", task_types=_claimable()).run_once())
-
-    assert client.get(f"/v1/runs/{accepted.json()['id']}").json()["status"] == "pending"
-    assert client.get(f"/v1/assets/{asset_id}/classifications").json()["items"] == []
-
-
-def _claimable() -> tuple[str, ...]:
-    """The task types this process may claim, decided the way the worker's
-    composition root decides it."""
-    from steward_workers.__main__ import claimable_types
-
-    return claimable_types()
 
 
 def _source_of(client: TestClient, asset_id: str) -> str:
