@@ -22,6 +22,7 @@ repo has shipped the second one before.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -541,6 +542,65 @@ def test_a_column_the_profile_does_not_have_cannot_be_classified(
     assert result.status is TaskStatus.FAILED
     assert result.error is not None and result.error.type == "urn:steward:unresolvable-evidence"
     assert proposal_history(conn, asset_id) == ()
+
+
+@pytest.mark.parametrize(
+    ("kind", "read_locator"),
+    [
+        (EvidenceKind.COLUMN_NAME, lambda column: column["name"]),
+        (EvidenceKind.DATA_TYPE, lambda column: column["data_type"]),
+        (EvidenceKind.NULL_RATIO, lambda column: column["null_ratio"]),
+        (EvidenceKind.DISTINCT_RATIO, lambda column: column["distinct_ratio"]),
+        (EvidenceKind.SEMANTIC_TYPE, lambda column: column["semantic_type"]),
+        (EvidenceKind.MASKED_SAMPLE, lambda column: column["top_values"][0]["value"]["masked"]),
+    ],
+)
+def test_every_kind_of_citation_copied_from_the_prompt_resolves(
+    conn: QueueConnection,
+    asset_id: UUID,
+    kind: EvidenceKind,
+    read_locator: Callable[[dict[str, Any]], str],
+) -> None:
+    """A locator copied verbatim out of what the model was shown must resolve.
+
+    The prompt tells the model to copy the value exactly, and the resolver checks
+    it against the *stored* profile -- so these are two renderings of the same
+    fact and nothing had been asserting they agree. They agree today because
+    Pydantic serialises a `Decimal` to the string `str()` produces; the day that
+    stops being true, every ratio citation becomes unresolvable and only the
+    column-name and masked-sample cases would still have proved anything.
+
+    The locator is read out of the serialised request rather than written down
+    here, because a hand-written locator is the test agreeing with itself.
+    """
+
+    def cites(request: ClassificationRequest) -> ProposedClassification:
+        shown = json.loads(request.model_dump_json())
+        column = next(c for c in shown["profile"]["columns"] if c["name"] == "email")
+        return ProposedClassification(
+            columns=(
+                ColumnClassification(
+                    column_name="email",
+                    labels=(SensitivityLabel.PII,),
+                    confidence=Decimal("0.9"),
+                    evidence=(
+                        EvidenceRef(
+                            profile_version=request.profile_version,
+                            column_name="email",
+                            kind=kind,
+                            locator=read_locator(column),
+                            detail=f"copied from the {kind.value} the prompt showed",
+                        ),
+                    ),
+                ),
+            ),
+            prompt_version=f"{PROMPT_VERSION}+{kind.value}",
+            model_alias=MODEL_ALIAS,
+        )
+
+    result = classify(conn, asset_id, StubClassifier(answer=cites))
+
+    assert result.status is TaskStatus.SUCCEEDED, result.error
 
 
 def test_repeating_the_same_request_converges_on_one_proposal(

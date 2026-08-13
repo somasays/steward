@@ -193,9 +193,9 @@ def run(conn: QueueConnection) -> Iterator[ClassificationRun]:
     )
 
 
-def classifier(dsn: str, replies: list[StubReply], **kwargs: object) -> tuple[
-    AgentColumnClassifier, StubGateway
-]:
+def classifier(
+    dsn: str, replies: list[StubReply], *, reservation: ModelReservation | None = None
+) -> tuple[AgentColumnClassifier, StubGateway]:
     stub = StubGateway({CLASSIFY_MODEL_ALIAS: replies})
     return (
         AgentColumnClassifier(
@@ -203,7 +203,7 @@ def classifier(dsn: str, replies: list[StubReply], **kwargs: object) -> tuple[
             gateway=gateway(),
             transport=stub,
             tracer=NoopTracer(),
-            **kwargs,  # type: ignore[arg-type]
+            reservation=reservation,
         ),
         stub,
     )

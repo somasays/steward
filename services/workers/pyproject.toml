@@ -16,6 +16,12 @@ dependencies = [
     # allowlist never runs (I15), and H12 boots this entry point to prove it. The
     # client an M1 handler calls models with (issue #69) comes from the same package.
     "steward-llm",
+    # The bounded runtime both agent handlers run on. Imported in `src/` since
+    # #69 and undeclared until now: import-linter's contracts forbid edges, they
+    # do not require declared ones, so this resolved on the workspace installing
+    # every member and would have broken the day it did not. #50 adds a second
+    # importer (`classifier.py`), which is what surfaced it.
+    "steward-agents",
 ]
 
 # Test-only, and written down because no tool can see it. #69's acceptance proof
@@ -39,6 +45,7 @@ steward-queue = { workspace = true }
 steward-telemetry = { workspace = true }
 steward-catalog = { workspace = true }
 steward-llm = { workspace = true }
+steward-agents = { workspace = true }
 steward-api = { workspace = true }
 
 [build-system]
