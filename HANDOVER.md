@@ -19,8 +19,10 @@ brief, so fix SPEC first.
 
 ## State
 
-M0 and M1 slices 1–3a are shipped, and #50's persistence layer, Classifier and **review API** with them.
-`main` is at `0619822`; the branch **`m1/50-review-api`** carries steps 7–8 and is open as **PR #83**.
+M0 and M1 slices 1–3a are shipped, and #50's persistence layer and Classifier with them. `main` is at
+`0619822`. **#50 steps 7–8 — the review API — are written and green but not merged**: they are on
+`m1/50-review-api`, open as **PR #83**, CI green on the tip. Everything below that describes the review
+API describes that branch, not `main`.
 Working end to end: register a Postgres source, scan it, persist assets/columns, profile every column
 through a masking layer, run a **bounded agent** through API → queue → worker with per-attempt budget
 accounting, reach a model through a real **LiteLLM proxy HTTP transport** — and now read a proposal, its
@@ -33,7 +35,7 @@ repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
 ### Open: PR #83 (#50 steps 7–8)
 
-Six commits, `make fitness` green on each, `PROOFS.md` rows 118–126. What it landed:
+Eight commits, `make fitness` green on each, `PROOFS.md` rows 118–126. What it landed:
 
 - `GET /v1/assets/{id}/classification` (the approved version) and `/classifications` (every version).
 - `GET /v1/reviews/{id}` and `POST /v1/reviews/{id}:approve|:reject`, with the standard `Idempotency-Key`.
