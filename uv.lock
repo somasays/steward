@@ -1853,6 +1853,7 @@ name = "steward-workers"
 version = "0.1.0"
 source = { editable = "services/workers" }
 dependencies = [
+    { name = "steward-agents" },
     { name = "steward-catalog" },
     { name = "steward-llm" },
     { name = "steward-queue" },
@@ -1866,6 +1867,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "steward-agents", editable = "packages/steward-agents" },
     { name = "steward-catalog", editable = "packages/steward-catalog" },
     { name = "steward-llm", editable = "packages/steward-llm" },
     { name = "steward-queue", editable = "packages/steward-queue" },
