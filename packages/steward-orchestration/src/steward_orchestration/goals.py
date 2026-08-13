@@ -10,6 +10,7 @@ from datetime import timedelta
 from decimal import Decimal
 from uuid import UUID
 
+from pydantic import Field
 from steward_schemas import RunBudget
 
 from steward_orchestration.registry import GoalParams, PlannedTask, goal
@@ -241,6 +242,93 @@ def plan_profile_asset(params: ProfileAssetParams) -> tuple[PlannedTask, ...]:
             task_type=PROFILE_ASSET_TASK_TYPE,
             budget=PROFILE_ASSET_TASK_BUDGET,
             payload={"asset_id": str(params.asset_id)},
+        ),
+    )
+
+
+CLASSIFY_ASSET_GOAL = "classify_asset"
+
+CLASSIFY_ASSET_TASK_TYPE = "classify_asset"
+"""The task type `classify_asset` plans; `steward_catalog` registers its handler
+under the same name. Same seam as `NOOP_TASK_TYPE`, checked the same way.
+
+This is the first goal in the shipped registry whose task calls a model, and it
+took a design decision to make it one. The seam check below requires a
+registered goal's task types to be executable by importing packages, and an
+agent handler needs a gateway only a composition root may validate (I15) -- which
+is why the proof agent's `agent_echo` goal is registered by its acceptance test
+rather than here (SPEC.md §13 D1's consequence note). The Classifier resolves it
+by splitting the two: `steward_catalog` owns and registers the workflow, and the
+model call sits behind a protocol a worker binds an implementation of
+(SPEC.md §13 D15).
+"""
+
+# What a `classify_asset` run may spend (I12). The first goal here with non-zero
+# `tokens` and `cost_usd`, because it is the first whose task calls a model.
+#
+# The figures are the loop's shape multiplied out rather than round numbers: the
+# expected run is one generation and one `submit_result`, SPEC.md §3.2 allows one
+# validation correction, and `steps` is set at six so a correction and its retry
+# fit with room to be refused rather than to be silently afforded. The
+# worker-side `ModelReservation` is chosen to divide into these -- six steps of
+# 18k tokens, $0.08 and 90 seconds each fit inside every dimension below with the
+# margin an overestimate is allowed to cost (`steward_workers.classifier`).
+CLASSIFY_ASSET_BUDGET = RunBudget(
+    steps=6,
+    tokens=120_000,
+    cost_usd=Decimal("0.500000"),
+    wall_clock=timedelta(minutes=10),
+)
+
+CLASSIFY_ASSET_TASK_BUDGET = CLASSIFY_ASSET_BUDGET
+"""What the one task a `classify_asset` run plans may spend: the run's whole
+budget, the degenerate reservation again (#48)."""
+
+
+class ClassifyAssetParams(GoalParams):
+    """`classify_asset`'s parameters: which asset, at which profile version.
+
+    The version is required rather than defaulted to "the latest", because the
+    latest at request time and the latest at claim time are not the same profile,
+    and a classification is a statement about a *specific* one. Naming it makes
+    the run reproducible and makes a re-profile between request and claim a
+    refusal the handler can state (`steward_catalog.classify_handler`) instead of
+    a substitution nobody is told about.
+    """
+
+    asset_id: UUID
+    profile_version: int = Field(ge=1)
+
+
+@goal(
+    CLASSIFY_ASSET_GOAL,
+    params_model=ClassifyAssetParams,
+    allowed_task_types=[CLASSIFY_ASSET_TASK_TYPE],
+    budget=CLASSIFY_ASSET_BUDGET,
+    sample_payload={
+        "asset_id": "00000000-0000-0000-0000-000000000000",
+        "profile_version": 1,
+    },
+)
+def plan_classify_asset(params: ClassifyAssetParams) -> tuple[PlannedTask, ...]:
+    """Expand `classify_asset` into exactly one bounded task.
+
+    One task for the reason `profile_asset` is one, and one more besides. The
+    planner cannot read the catalog, so it cannot know how many columns the
+    profile holds and has nothing to fan out to (ARCHITECTURE.md §4). And a
+    per-column fan-out would be the wrong unit even if it could: the evidence a
+    classifier reasons from is the *table's* profile -- neighbouring column names
+    and the shape of the relation are what distinguish `ssn_hash` from `ssn` --
+    and a proposal is stored per asset, not per column.
+    """
+    return (
+        PlannedTask(
+            task_type=CLASSIFY_ASSET_TASK_TYPE,
+            budget=CLASSIFY_ASSET_TASK_BUDGET,
+            payload={
+                "asset_id": str(params.asset_id),
+                "profile_version": params.profile_version,
+            },
         ),
     )
 
