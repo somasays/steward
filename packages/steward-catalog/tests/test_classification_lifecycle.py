@@ -19,6 +19,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
+from psycopg.rows import dict_row
 from steward_catalog import EnvSecretResolver, build_scan_source, postgres_inspector, register_source
 from steward_catalog.classification import (
     AssetNotClassifiable,
@@ -27,6 +28,7 @@ from steward_catalog.classification import (
     IdempotencyKeyReused,
     ProposalNotPending,
     StaleProposal,
+    _proposal,
     approve,
     current_classification,
     proposal_history,
@@ -64,6 +66,31 @@ from steward_schemas import (
 )
 
 MASKED_EMAIL = "j***@g***.***"
+
+EXPECTED_PROPOSAL_COLUMNS = (
+    "id", "asset_id", "version", "profile_version", "prompt_version", "model_alias",
+    "status", "proposal", "run_id", "task_id", "trace_id", "created_at",
+)
+"""The projection every proposal-reading statement selects, in its usual order.
+
+Written out here rather than imported so that a change to the module's
+statements has to be made deliberately in both places; the tests below assert
+the decoder does not care about this order, not that it matches.
+"""
+
+REVERSED_PROPOSAL_PROJECTION = """
+SELECT created_at, trace_id, task_id, run_id, proposal, status, model_alias,
+       prompt_version, profile_version, version, asset_id, id
+FROM classification_proposals
+WHERE id = %(id)s
+"""
+
+PROPOSAL_PROJECTION_WITHOUT_STATUS = """
+SELECT id, asset_id, version, profile_version, prompt_version, model_alias,
+       proposal, run_id, task_id, trace_id, created_at
+FROM classification_proposals
+WHERE id = %(id)s
+"""
 
 SELECT_ASSET_ID = (
     "SELECT id FROM assets WHERE schema_name = %(schema)s AND name = %(name)s"
@@ -907,3 +934,55 @@ class TestPolicyAttribution:
                 actor=Actor(kind=ActorKind.POLICY, id="policy-a"),
             )
         conn.rollback()
+
+
+class TestDecoding:
+    """Rows are decoded by column name, so a projection cannot drift silently.
+
+    The same twelve columns are written out in seven separate statements in
+    `_classification_sql`, because S608 (the check enforcing I5) cannot tell a
+    column list composed from a module constant from a query composed from user
+    input -- factoring it out would cost a `noqa` on each and disable the
+    SQL-safety gate for the file. So the duplication stays, and the decoder is
+    what stops it being dangerous.
+    """
+
+    def test_the_same_row_decodes_the_same_under_a_different_column_order(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """A reordered projection of one row decodes to an identical record.
+
+        This is the property the seven duplicated column lists depend on. Under
+        positional decoding it does not hold: `status` would be read out of
+        whichever column happens to sit seventh, and the record would come back
+        describing a proposal nobody wrote.
+        """
+        proposal_id = recorded(conn, asset_id)
+        [expected] = proposal_history(conn, asset_id)
+
+        reordered = conn.cursor(row_factory=dict_row).execute(
+            REVERSED_PROPOSAL_PROJECTION, {"id": proposal_id}
+        ).fetchone()
+        assert reordered is not None
+        assert list(reordered) != list(EXPECTED_PROPOSAL_COLUMNS), "the projection was not reordered"
+
+        assert _proposal(reordered) == expected
+
+    def test_a_projection_missing_a_column_fails_loudly(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The drift this guards against, made to happen.
+
+        A statement that forgets `status` is exactly the mistake seven copies
+        invite. By name it is a `KeyError` naming the column; by position it was
+        a silent shift of every field after it.
+        """
+        proposal_id = recorded(conn, asset_id)
+
+        row = conn.cursor(row_factory=dict_row).execute(
+            PROPOSAL_PROJECTION_WITHOUT_STATUS, {"id": proposal_id}
+        ).fetchone()
+        assert row is not None
+
+        with pytest.raises(KeyError, match="status"):
+            _proposal(row)
