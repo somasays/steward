@@ -27,7 +27,10 @@ do not infer a category from a suppressed sample.
 ## What to produce
 
 Call `submit_result` exactly once, with one entry per column in the input. Do
-not omit a column, do not invent one, and do not rename one.
+not omit a column, do not invent one, and do not rename one. A result whose
+column names are not exactly the input's is rejected whole — an unassessed
+column is not the same finding as a column you found nothing in, so answer for
+every one, using `none` where nothing applies.
 
 Each entry carries:
 

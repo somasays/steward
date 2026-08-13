@@ -429,6 +429,55 @@ def _prepare(
     )
 
 
+def _require_full_coverage(
+    request: ClassificationRequest, proposed: ProposedClassification
+) -> ProblemDetails | None:
+    """The proposal must classify **exactly** the profile's columns.
+
+    Set equality, and each half closes a hole nothing else does.
+
+    *Missing columns.* Every other check here is about whether a column's labels
+    are supportable; none of them notices a column that was never labelled at
+    all. Without this, a classifier returning one column of a three-column table
+    produced a `pending_review` proposal, a `SUCCEEDED` task and an asset that
+    reads as classified, while two columns had not been assessed. A reviewer
+    approving it publishes that silence as a finding.
+
+    *Unknown columns.* An invented column labelled `none` carries no evidence --
+    the type only requires it for sensitive labels -- so the resolver, which
+    walks citations, never sees it. Only a column labelled *sensitive* was
+    caught, which means the check that existed covered the case a careless model
+    would fail and missed the one it would pass.
+
+    Names, not counts. A count comparison agrees with itself whenever a model
+    drops one column and invents another, which is the shape most likely to
+    reach here.
+    """
+    profiled = {column.name for column in request.profile.columns}
+    classified = {column.column_name for column in proposed.columns}
+    if classified == profiled:
+        return None
+    missing = sorted(profiled - classified)
+    unknown = sorted(classified - profiled)
+    said = [
+        part
+        for part in (
+            f"never classified {', '.join(missing)}" if missing else "",
+            f"classified {', '.join(unknown)}, which the profile does not contain"
+            if unknown
+            else "",
+        )
+        if part
+    ]
+    return _problem(
+        "urn:steward:classification-column-mismatch",
+        "Classification does not cover the profile",
+        f"a classification of profile version {request.profile_version} must cover "
+        f"exactly its {len(profiled)} column(s); this one {' and '.join(said)}",
+        422,
+    )
+
+
 def _run_of(ctx: TaskContext) -> ClassificationRun:
     return ClassificationRun(
         run_id=ctx.spec.run_id,
@@ -492,6 +541,10 @@ async def _classify(ctx: TaskContext, provider: ClassifierProvider) -> TaskResul
             spec,
             _problem("urn:steward:classifier-failed", "Classifier failed", str(exc), 500),
         )
+
+    mismatch = _require_full_coverage(prepared, proposed)
+    if mismatch is not None:
+        return _failed(spec, mismatch)
 
     try:
         proposal = ClassificationProposal(
