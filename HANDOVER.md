@@ -19,28 +19,35 @@ brief, so fix SPEC first.
 
 ## State
 
-M0 and M1 slices 1–3a are shipped, and #50's persistence layer and Classifier with them. `main` is at
-`6b6f605`, green — `make fitness` re-run on merged main, all checks green (S6 SKIPs on main by design: the
-merge-base is HEAD itself, so there is no divergence to compare).
+M0 and M1 slices 1–3a are shipped, and #50's persistence layer, Classifier and **review API** with them.
+`main` is at `0619822`; the branch **`m1/50-review-api`** carries steps 7–8 and is open as **PR #83**.
 Working end to end: register a Postgres source, scan it, persist assets/columns, profile every column
 through a masking layer, run a **bounded agent** through API → queue → worker with per-attempt budget
-accounting, durable checkpoints and tracing, and reach a model through a real **LiteLLM proxy HTTP
-transport**. Twenty fitness functions active (S1–S9, H1, H3, H4, H6, H7, H11, H12, G1–G5); B-tier eval
+accounting, reach a model through a real **LiteLLM proxy HTTP transport** — and now read a proposal, its
+evidence and its review history over HTTP, approve or reject it, and read the asset's published
+classification. Twenty fitness functions active (S1–S9, H1, H3, H4, H6, H7, H11, H12, G1–G5); B-tier eval
 gates SKIP until M2.
 
 **#69, #48 and #74 are closed.** PR #81 merged the classification schemas, migration `0006`, the
-repository and the review lifecycle.
+repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
-### Nothing is open
+### Open: PR #83 (#50 steps 7–8)
 
-**PR #82 merged at `6b6f605`** (rebase, linear history, branch kept — the style #81 used). It landed
-**#50 steps 1–6**: `POST /v1/runs` → queue → worker → bounded agent → typed evidence-backed proposal in
-`pending_review`. It went through three review rounds and every one found something real; read the PR body
-and its two review-response comments before touching any of it — the reasoning behind the split is in
-**SPEC §13 D15** and the reasoning behind the three defects is in the comments.
+Six commits, `make fitness` green on each, `PROOFS.md` rows 118–126. What it landed:
 
-`PROOFS.md` rows 106–117 landed with it. **#50 itself is still open** — steps 7–8 remain, which is why the
-PR said "Part of #50" rather than `Closes`.
+- `GET /v1/assets/{id}/classification` (the approved version) and `/classifications` (every version).
+- `GET /v1/reviews/{id}` and `POST /v1/reviews/{id}:approve|:reject`, with the standard `Idempotency-Key`.
+- Eight new published contracts in `steward-schemas` (`review.py`), snapshotted by S6.
+- The acceptance scenario: profile → agent → `pending_review` → approval → published version, against real
+  PostgreSQL. The model is the only stub, and it names no column — it classifies whatever the real
+  profiler put in the request.
+- One refactor, in its own commit: `classification.py` decoded rows **positionally** across seven
+  duplicated column lists. Now by name (`dict_row`), so a drifted projection is a `KeyError` rather than
+  `status` read out of `model_alias`. The duplication itself is forced — ruff S608 flags a column list
+  composed from a module constant exactly as it flags one composed from user input.
+
+**#50 is still open** after this: B2 and the live gateway smoke test remain, which is why the PR says
+"Part of #50".
 
 ## What #82 decided, so you don't relitigate it
 
@@ -67,25 +74,22 @@ Resolved by splitting the workflow from the capability:
 Rejected, with reasons in D15: a `packages/steward-classifier`, and teaching the goal registry about
 entry-point-provided task types.
 
-## What to do next: #50 steps 7–8
+## What to do next: B2 and the live gateway smoke test
 
-Still one narrow vertical slice. **Do not put steps 7–8 and B2 in one PR.**
+Both were deferred because both need the completed agent path, and both are now unblocked. **Do not put
+them in one PR with anything else.** #50's own text specifies them in detail — read the issue, not this
+summary:
 
-1. **Step 7 — API behaviour.** Read a proposal with its labels, confidence, evidence, provenance, status
-   and review history; read the current approved classification for an asset; read prior versions; submit
-   an approve/reject decision through a dedicated review endpoint using the API's idempotency convention.
-2. **Step 8 — the acceptance scenario.** API → queue → worker → classifier → `pending_review` → approval →
-   published current version, against real PostgreSQL, marked `acceptance` so H11 runs it.
-
-Everything the API needs already exists in `steward_catalog.classification`: `propose`, `approve`,
-`reject`, `current_classification`, `proposal_history`, `record_proposal_reviews`. The approval lifecycle
-is **done and specified in SPEC §13 D14** — one atomic supersession, serialised per asset by an advisory
-lock, with the partial unique index as the final fence; the repository owns outcome, actor and decision
-time. Don't redesign it; expose it.
-
-**The increment after that** is B2 plus the live gateway smoke test — both were deferred because both need
-the completed agent path, and both are now unblocked. See "Known gaps" below: B2's absence is the one place
-this branch bends an invariant.
+1. **B2.** A versioned labelled fixture with difficult negatives (`ssn_hash`, `email_domain`, synthetic
+   data, misleading names, sparse evidence); PII recall ≥ 0.95 and precision ≥ 0.90; evidence validity
+   scored **separately**, so a correct label with an unsupported citation still fails. Three pinned runs,
+   **each independently** over threshold, 100% evidence validity in every run, per-column disagreement
+   reported rather than averaged away. An absent fixture, an empty prediction set or a skipped model
+   execution must not report PASS. This is the one place the shipped work bends an invariant (I11).
+2. **The live smoke test.** One environment-gated test calling `steward-classify` through the real
+   LiteLLM proxy: alias routing, auth, streaming tool calls, usage extraction, **non-zero cost**, typed
+   completion. Missing proxy configuration is INCONCLUSIVE locally and a **failure** in the release job —
+   #74's distinction, applied here.
 
 **Nothing else belongs in either increment.** No lifecycle redesign, no new runtime abstraction, no
 automatic scheduling (#72), no Documentarian (#51).
@@ -146,6 +150,17 @@ edit, which merged missing and surfaced only when its proof row's command select
 > **Compare names, not counts.** A coverage check comparing lengths agrees with itself whenever a model
 > drops one column and invents another — which is the shape a model is most likely to produce.
 
+**#83 added one, and it is a gate blind spot rather than a hollow check:**
+
+> **An import in a `tests/` tree is invisible to the check that forbids it.** The acceptance scenario
+> imported `steward_workers.__main__` from `services/api/tests` to assert the worker's claim list —
+> a services-import-services edge I4 forbids. S1 never saw it: import-linter's `root_packages` are the
+> `src/` trees, and the import resolves anyway because uv installs every workspace member into one venv.
+> `make fitness` was green on it through four commits. Found by reading the diff against I4 by hand,
+> which is what the `architecture-guardian`'s own instructions warn to do — two of #49's rounds found the
+> same shape. The property was already proven where it belongs
+> (`services/workers/tests/test_worker_capabilities.py`), so the fix was deleting the test.
+
 And one that is not a hollow check but a contradiction worth naming:
 
 > **An unsatisfiable contract fails in the wrong place.** Postgres permits a relation with no columns and
@@ -160,7 +175,12 @@ broken path it will vouch for the hole.
 
 ## Known gaps, stated rather than hidden
 
-**New with #82:**
+**New with #83:**
+
+- **The `ruff` gap below is unchanged and still needs an issue.** It was not touched in #83 either, for
+  the same reason: 19 files of formatting churn would bury a feature diff.
+
+**Carried from #82:**
 
 - **B2 is not implemented.** #50 asks for the eval gate with this capability and I11 asks for eval coverage
   on LLM-dependent behaviour. The B tier activates in M2 and the build order deferred B2 to the increment
