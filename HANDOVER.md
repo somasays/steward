@@ -35,7 +35,7 @@ repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
 ### Open: PR #83 (#50 steps 7–8)
 
-Thirteen commits, `make fitness` green on each, `PROOFS.md` rows 118–135. What it landed:
+Fourteen commits, `make fitness` green on each, `PROOFS.md` rows 118–136. What it landed:
 
 - `GET /v1/assets/{id}/classification` (the approved version) and `/classifications` (every version).
 - `GET /v1/reviews/{id}` and `POST /v1/reviews/{id}:approve|:reject`, with the standard `Idempotency-Key`.
@@ -183,6 +183,14 @@ edit, which merged missing and surfaced only when its proof row's command select
 > not the first. **When a repair touches a comparison that decides identity, ask what it now treats
 > as equal**, and give the fix its own adversarial pass rather than assuming a fix inherits the
 > scrutiny the bug got.
+
+> **Fixing one operand of a comparison fixes half a defect.** The repair above settled the
+> *presented* credential and left the *configured* one encoding inside the request loop, where a
+> lone surrogate raises — restoring all three properties the original fix removed, through the
+> operand nobody sends. Reachable, not theoretical: `os.environ` decodes an undecodable byte with
+> `surrogateescape`, so a non-UTF-8 key file produces exactly that value. **When a defect is about
+> normalising a value, enumerate every value that reaches the comparison, not the one in the bug
+> report.** Three review rounds landed on the same line for three different reasons.
 
 And a process one, which bit twice in one PR:
 

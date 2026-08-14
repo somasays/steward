@@ -787,3 +787,63 @@ class TestCredentialNormalisation:
 
         assert len(calls) == 3, f"{label} took a different path from the others"
         assert [right for _, right in calls] == [b"secret-one", b"secret-two", b"secret-three"]
+
+
+class TestConfiguredSecretValidation:
+    """The other operand. Both have to be settled before a request is served.
+
+    Fixing only the presented side left the same three defects reachable through
+    the configured one: `secret.encode("utf-8")` inside the comparison loop
+    raises on a lone surrogate, which is a 500 instead of a 401, an exhaustive
+    loop that aborts partway, and behaviour that depends on what is configured.
+
+    Not a type-system curiosity. `os.environ` on Unix decodes an undecodable byte
+    with `surrogateescape` — `os.fsdecode(b"secret\\xff")` is `"secret\\udcff"` —
+    so an operator whose key file is not UTF-8 produces exactly this value.
+    """
+
+    UNENCODABLE = "\udcff"
+
+    def test_from_env_refuses_an_unencodable_secret_without_echoing_it(self) -> None:
+        with pytest.raises(MalformedApiKeys) as raised:
+            ApiKeyRegistry.from_env(f"victim:{self.UNENCODABLE}")
+
+        assert self.UNENCODABLE not in str(raised.value)
+        assert "victim" in str(raised.value), "the principal id is useful and is not the secret"
+
+    def test_direct_construction_cannot_retain_one_either(self) -> None:
+        """`from_env` is not the only door: `ApiKeyRegistry({...})` is public and
+        is what the tests and the app factory use."""
+        with pytest.raises(MalformedApiKeys):
+            ApiKeyRegistry({"victim": self.UNENCODABLE})
+
+    def test_an_unencodable_principal_id_is_refused_and_not_quoted(self) -> None:
+        """An id that cannot be encoded cannot be written to the log the error
+        goes to, so the message must not contain it — and it could never name
+        the author of a decision anyway."""
+        with pytest.raises(MalformedApiKeys) as raised:
+            ApiKeyRegistry({self.UNENCODABLE: "a-secret"})
+
+        assert self.UNENCODABLE not in str(raised.value)
+
+    def test_the_comparison_loop_holds_only_prevalidated_bytes(self) -> None:
+        """The structural assertion behind the three above.
+
+        If what is stored is already `bytes`, the loop has nothing left to
+        encode and therefore nothing left that can raise. An `encode` call
+        restored inside `principal` is not a smaller version of this bug; it is
+        this bug.
+        """
+        registry = ApiKeyRegistry.from_env("alice:one-secret,bob:another-secret")
+
+        stored = dict(registry._secrets)  # noqa: SLF001 -- the point is the stored form
+
+        assert stored == {"alice": b"one-secret", "bob": b"another-secret"}
+        assert all(isinstance(secret, bytes) for secret in stored.values())
+
+    def test_a_configured_registry_still_authenticates_after_all_this(self) -> None:
+        """The positive case. Every test in this class is a refusal, and a
+        registry that refused everything would satisfy all of them."""
+        registry = ApiKeyRegistry.from_env("alice:one-secret")
+
+        assert registry.principal("one-secret") == Principal(id="alice")
