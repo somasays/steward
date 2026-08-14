@@ -39,7 +39,13 @@ from steward_workers.evals.classification import AFFECTING_PATHS, CLASSIFICATION
 pytestmark = pytest.mark.invariants
 
 PREFLIGHT_CONFIG = "evals/config/litellm.preflight-ollama.yaml"
-LOCAL_ENDPOINT = "http://localhost:11434/v1"
+LOCAL_ENDPOINT = "http://host.docker.internal:11434/v1"
+"""Must equal the `api_base` in the preflight config — see the test below.
+
+The proxy runs in a container and reaches Ollama on the host, so the endpoint
+the allowlist governs is the one the *proxy* dials, not the one Steward does.
+These two drifting apart is a refusal at startup, which is the right failure
+and a confusing one to debug from a test that hard-codes the wrong half."""
 
 
 @pytest.fixture(autouse=True)
@@ -142,6 +148,28 @@ def test_every_affecting_path_exists() -> None:
     missing = [path for path in AFFECTING_PATHS if not (root / path).exists()]
 
     assert missing == []
+
+
+def test_the_preflight_config_and_its_allowlist_agree() -> None:
+    """The `api_base` in the config must be the endpoint the allowlist approves.
+
+    They are set in two different places — a YAML file and an environment
+    variable — and I15 refuses at startup when they disagree. That refusal is
+    correct, but it reads as "the gateway is misconfigured" rather than "these
+    two strings drifted", so the agreement is asserted where it can be read.
+    """
+    import yaml
+
+    config = yaml.safe_load(
+        (Path(__file__).resolve().parents[3] / PREFLIGHT_CONFIG).read_text()
+    )
+    bases = {
+        entry["litellm_params"]["api_base"]
+        for entry in config["model_list"]
+        if entry["model_name"] == "steward-classify"
+    }
+
+    assert bases == {LOCAL_ENDPOINT}
 
 
 def test_the_declared_entry_point_is_the_one_the_gate_calls() -> None:

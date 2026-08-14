@@ -54,7 +54,7 @@ model_list:
   - model_name: steward-classify
     litellm_params:
       model: openai/qwen2.5:14b-instruct
-      api_base: http://localhost:11434/v1
+      api_base: http://host.docker.internal:11434/v1
       api_key: os.environ/STEWARD_LOCAL_MODEL_KEY
       temperature: 0
       seed: 20260814
@@ -65,7 +65,7 @@ model_list:
   - model_name: steward-reasoning
     litellm_params:
       model: openai/qwen2.5:14b-instruct
-      api_base: http://localhost:11434/v1
+      api_base: http://host.docker.internal:11434/v1
       api_key: os.environ/STEWARD_LOCAL_MODEL_KEY
       temperature: 0
       seed: 20260814
@@ -76,7 +76,7 @@ model_list:
   - model_name: steward-fast
     litellm_params:
       model: openai/qwen2.5:14b-instruct
-      api_base: http://localhost:11434/v1
+      api_base: http://host.docker.internal:11434/v1
       api_key: os.environ/STEWARD_LOCAL_MODEL_KEY
       temperature: 0
       seed: 20260814
@@ -87,7 +87,7 @@ model_list:
   - model_name: steward-embed
     litellm_params:
       model: openai/nomic-embed-text
-      api_base: http://localhost:11434/v1
+      api_base: http://host.docker.internal:11434/v1
       api_key: os.environ/STEWARD_LOCAL_MODEL_KEY
     model_info:
       input_cost_per_token: 0.00000001
