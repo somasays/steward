@@ -39,6 +39,10 @@ dev = [
 
 [project.scripts]
 steward-worker = "steward_workers.__main__:main"
+# The eval runner Tier B invokes (SPEC.md §9). Declared here rather than in a
+# package because an eval composes the real classifier with a validated gateway,
+# which is composition-root work (I15) a package may not do (I4).
+steward = "steward_workers.evals.__main__:main"
 
 [tool.uv.sources]
 steward-queue = { workspace = true }

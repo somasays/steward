@@ -145,8 +145,17 @@ def main() -> int:
         _tool_check("H11", "acceptance scenarios", ["uv", "run", "pytest", "-q", "-m", "acceptance"],
                     not_installed or ("" if has_tests else "no tests yet"), no_harness),
         # Tier B — benchmarks & evals
+        # Exit 3 is the eval runner's "a suite was selected and no model is
+        # reachable" (steward_workers.evals.EXIT_NO_ENDPOINT). It is neither a
+        # pass nor a failure of this code, so it is reported as a SKIP carrying
+        # its reason -- the #74 distinction, one level down. Anything else
+        # non-zero is a real failure. The release job sets
+        # STEWARD_EVALS_REQUIRED=1, which makes the runner exit 1 instead, so
+        # "no endpoint" cannot be skipped where the evidence is required.
         _tool_check("B*", "eval gates", ["uv", "run", "steward", "evals", "run", "--changed"],
-                    "" if has_evals else "activates in M2 (no evals/ yet)"),
+                    "" if has_evals else "activates in M2 (no evals/ yet)",
+                    skip_exits={3: "eval suite selected but no model endpoint is reachable "
+                                   "(not a pass -- see `uv run steward evals run --changed`)"}),
         # Hygiene
         _tool_check("G1", "lint & format", ["uv", "run", "ruff", "check", "."], not_installed),
         _tool_check("G2", "strict types", ["uv", "run", "mypy", "--strict", "packages", "services"],
