@@ -31,6 +31,7 @@ from decimal import Decimal
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from psycopg import IsolationLevel
 from steward_catalog import (
     AssetRecord,
     ColumnRecord,
@@ -79,6 +80,7 @@ from steward_schemas import (
 )
 from steward_telemetry import NoopTracer, Tracer, new_trace_id
 
+from steward_api.auth import Principal
 from steward_api.store import IdempotencyKeyReused, to_response
 
 DEFAULT_PAGE_SIZE = 50
@@ -87,11 +89,18 @@ MAX_PAGE_SIZE = 200
 SOURCE_LOCATION_PREFIX = "/v1/sources/"
 
 API_ACTOR = Actor(kind=ActorKind.HUMAN, id="api")
-"""Who a registration is attributed to on its audit row.
+"""Who a *registration* or a scan is attributed to on its audit row.
 
 `human` rather than `system`: `POST /v1/sources` is only ever reached because a
-person or their client asked for it. Real identity lands with authentication;
-until then, saying "the API" is honest and saying "the system" would not be.
+person or their client asked for it. Saying "the API" is honest about how much
+this knows and saying "the system" would not be.
+
+**Not used for review decisions.** Those are attributed to the authenticated
+`Principal` (`auth.py`), because a governance action recorded against a constant
+answers "who approved this" with a fiction. The endpoints still using this
+constant are unauthenticated and predate that requirement; extending
+authentication across the rest of the surface is tracked separately, and until
+it happens this name is exactly as informative as it looks.
 """
 
 
@@ -200,18 +209,35 @@ class CatalogStore(Protocol):
         ...
 
     async def approve_classification(
-        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
     ) -> Classification:
-        """Publish `proposal_id`, superseding whatever it replaces, atomically.
+        """Publish `proposal_id`, superseding whatever it replaces, atomically,
+        attributed to `reviewer`.
+
+        The reviewer is a parameter and not a constant because it is the answer
+        to "who approved this": the repository refuses a caller-supplied actor
+        precisely so that this one, proven by a credential, is the only one that
+        can be recorded.
 
         Raises `LookupError` when no such proposal exists, and the
         `ClassificationConflict` family when the decision cannot stand: already
         decided, describing a profile the asset has moved past, on an inactive
-        asset, or under a key that already settled a different decision."""
+        asset, or under a key that already settled a different decision -- which
+        now includes a key that settled *another reviewer's* decision."""
         ...
 
     async def reject_classification(
-        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
     ) -> Classification:
         """Refuse `proposal_id`, leaving the published version untouched. Same
         failures as `approve_classification`."""
@@ -386,17 +412,27 @@ class PostgresCatalogStore:
         return await asyncio.to_thread(self._get_classification, proposal_id)
 
     async def approve_classification(
-        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
     ) -> Classification:
         return await asyncio.to_thread(
-            self._decide, classification.approve, proposal_id, request, idempotency_key
+            self._decide, classification.approve, proposal_id, request, idempotency_key, reviewer
         )
 
     async def reject_classification(
-        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
     ) -> Classification:
         return await asyncio.to_thread(
-            self._decide, classification.reject, proposal_id, request, idempotency_key
+            self._decide, classification.reject, proposal_id, request, idempotency_key, reviewer
         )
 
     # --- synchronous halves, always called through asyncio.to_thread ---
@@ -546,16 +582,25 @@ class PostgresCatalogStore:
         return ClassificationHistory(items=tuple(classification_response(r) for r in records))
 
     def _get_classification(self, proposal_id: UUID) -> ClassificationDetail | None:
+        """The proposal and its decisions, from one snapshot.
+
+        `REPEATABLE READ` is set on the connection before the transaction opens,
+        because the two reads have to agree with each other: under the default
+        `READ COMMITTED` each statement takes its own snapshot, and an approval
+        committing between them returns `pending_review` with an approved review
+        beside it. `proposal_detail` refuses to run without it rather than trust
+        this line to stay here.
+
+        Read-only, so the stronger level costs nothing: a transaction that never
+        writes cannot lose a serialisation race.
+        """
         with connect(self._dsn) as conn:
-            record = classification.get_proposal(conn, proposal_id)
-            reviews = (
-                classification.record_proposal_reviews(conn, proposal_id)
-                if record is not None
-                else ()
-            )
+            conn.isolation_level = IsolationLevel.REPEATABLE_READ
+            detail = classification.proposal_detail(conn, proposal_id)
             conn.rollback()
-        if record is None:
+        if detail is None:
             return None
+        record, reviews = detail
         return ClassificationDetail(
             classification=classification_response(record),
             reviews=tuple(review_response(review) for review in reviews),
@@ -567,15 +612,19 @@ class PostgresCatalogStore:
         proposal_id: UUID,
         request: ReviewRequest,
         idempotency_key: str | None,
+        reviewer: Principal,
     ) -> Classification:
         """One review decision, its status changes and its audit rows, committed
         together or not at all (I8).
 
-        The actor is `API_ACTOR` -- a human, because this endpoint is only ever
-        reached because a person or their client asked. That is also why the
-        command carries no policy id: the repository refuses a policy
-        attribution from a non-policy actor, so there is no policy decision this
-        path could record even if a body tried to describe one (SPEC.md §3.3).
+        The actor is the authenticated `reviewer`, not `API_ACTOR`: a decision
+        recorded against a constant would attribute every reviewer's approval to
+        the same fictitious person, and the review table, the audit row and the
+        idempotency key would all agree with each other about someone who does
+        not exist. The command still carries no policy id, because a principal
+        proven by an API key is a human and the repository refuses a policy
+        attribution from one -- auto-approval is a configured policy calling the
+        repository, never a request claiming to be one (SPEC.md §3.3).
         """
         command = ReviewCommand(reason=request.reason)
         with connect(self._dsn) as conn:
@@ -585,7 +634,7 @@ class PostgresCatalogStore:
                     proposal_id,
                     command=command,
                     idempotency_key=idempotency_key,
-                    actor=API_ACTOR,
+                    actor=reviewer.actor,
                 )
             except Exception:
                 # A refused decision must leave nothing behind -- not a review
@@ -682,12 +731,22 @@ class InMemoryCatalogStore:
         return None
 
     async def approve_classification(
-        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
     ) -> Classification:
         raise LookupError(f"no such proposal: {proposal_id}")
 
     async def reject_classification(
-        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
     ) -> Classification:
         raise LookupError(f"no such proposal: {proposal_id}")
 

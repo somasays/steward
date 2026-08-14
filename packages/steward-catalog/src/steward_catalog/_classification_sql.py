@@ -24,6 +24,14 @@ SELECT pg_advisory_xact_lock(hashtextextended(%(asset_id)s::text, 2))
 # The read a *reader* gets: no `FOR UPDATE`. Serving a GET through the locking
 # variant would make every reader queue behind whichever decision holds the row,
 # and would leave a lock held for the length of an HTTP response.
+# What isolation the caller's transaction is running under. `proposal_detail`
+# reads a proposal and its reviews in two statements, and under READ COMMITTED
+# each statement takes its *own* snapshot -- so a decision committing between
+# them yields a reply that says `pending_review` and carries an approval.
+SELECT_ISOLATION_LEVEL = """
+SELECT current_setting('transaction_isolation')
+"""
+
 SELECT_PROPOSAL = """
 SELECT id, asset_id, version, profile_version, prompt_version, model_alias, status,
        proposal, run_id, task_id, trace_id, created_at

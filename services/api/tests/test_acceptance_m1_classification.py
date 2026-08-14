@@ -45,7 +45,9 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from steward_api.app import create_app
+from steward_api.auth import ApiKeyRegistry
 from steward_api.catalog import PostgresCatalogStore
+from steward_api.problem_details import API_KEY_HEADER
 from steward_api.store import PostgresRunStore
 from steward_catalog import (
     CLASSIFIER,
@@ -71,6 +73,15 @@ TERMINAL_RUN_STATES = {"succeeded", "failed", "cancelled"}
 SOURCE_DATABASE = "classification_source"
 READER_ROLE = "classification_reader"
 SECRET_ENV = "STEWARD_CLASSIFICATION_SOURCE_DSN"
+
+# Two reviewers, because one cannot demonstrate attribution: an endpoint that
+# recorded every decision against a constant would satisfy every assertion a
+# single reviewer could make.
+REVIEWER, REVIEWER_KEY = "dana-the-steward", "dana-secret-value"
+SECOND_REVIEWER, SECOND_KEY = "erin-the-steward", "erin-secret-value"
+API_KEYS = ApiKeyRegistry({REVIEWER: REVIEWER_KEY, SECOND_REVIEWER: SECOND_KEY})
+AS_REVIEWER = {API_KEY_HEADER: REVIEWER_KEY}
+AS_SECOND_REVIEWER = {API_KEY_HEADER: SECOND_KEY}
 
 PROMPT_VERSION = "acceptance-classify@v1"
 MODEL_ALIAS = "steward-classify"
@@ -250,7 +261,7 @@ def clean(dsn: str, source_admin_dsn: str) -> Iterator[None]:
 
 @pytest.fixture
 def client(dsn: str) -> Iterator[TestClient]:
-    app = create_app(PostgresRunStore(dsn), PostgresCatalogStore(dsn))
+    app = create_app(PostgresRunStore(dsn), PostgresCatalogStore(dsn), api_keys=API_KEYS)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -389,7 +400,7 @@ def test_the_exit_criterion_whole(
     approved = client.post(
         f"/v1/reviews/{pending['id']}:approve",
         json={"reason": "the citation resolves to the profiled column"},
-        headers={"Idempotency-Key": "acceptance-approve"},
+        headers={**AS_REVIEWER, "Idempotency-Key": "acceptance-approve"},
     )
     assert approved.status_code == 200
     assert approved.json()["status"] == "approved"
@@ -405,7 +416,7 @@ def test_the_exit_criterion_whole(
     [decision] = reviewed["reviews"]
     assert decision["outcome"] == "approved"
     assert decision["actor_kind"] == "human"
-    assert decision["actor_id"] == "api"
+    assert decision["actor_id"] == REVIEWER  # the credential, not a constant
     assert decision["reason"] == "the citation resolves to the profiled column"
     assert decision["policy_id"] is None
     assert decision["decided_at"] is not None
@@ -433,6 +444,7 @@ def test_a_rejected_proposal_is_not_published_either(
     rejected = client.post(
         f"/v1/reviews/{proposal['id']}:reject",
         json={"reason": "the confidence does not justify the label"},
+        headers=AS_REVIEWER,
     )
 
     assert rejected.status_code == 200
@@ -450,10 +462,18 @@ def test_a_decided_proposal_cannot_be_decided_again(
     client: TestClient, proposal: dict[str, Any]
 ) -> None:
     """The second decision is refused with a type a client can act on."""
-    first = client.post(f"/v1/reviews/{proposal['id']}:approve", json={"reason": "correct"})
+    first = client.post(
+        f"/v1/reviews/{proposal['id']}:approve",
+        json={"reason": "correct"},
+        headers=AS_REVIEWER,
+    )
     assert first.status_code == 200
 
-    second = client.post(f"/v1/reviews/{proposal['id']}:reject", json={"reason": "on reflection"})
+    second = client.post(
+        f"/v1/reviews/{proposal['id']}:reject",
+        json={"reason": "on reflection"},
+        headers=AS_REVIEWER,
+    )
 
     assert second.status_code == 409
     assert second.json()["type"] == "urn:steward:proposal-not-pending"
@@ -471,7 +491,7 @@ def test_replaying_a_decision_under_its_key_records_one_review(
     response would look identical either way — the failure this catches is two
     audit rows for one governance decision.
     """
-    headers = {"Idempotency-Key": "acceptance-replay"}
+    headers = {**AS_REVIEWER, "Idempotency-Key": "acceptance-replay"}
     body = {"reason": "the citation resolves"}
 
     first = client.post(f"/v1/reviews/{proposal['id']}:approve", json=body, headers=headers)
@@ -491,7 +511,7 @@ def test_the_same_key_cannot_carry_the_opposite_decision(
     Without this refusal the rejection would return the *approved* record and a
     reviewer would read 200 while nothing they asked for had happened.
     """
-    headers = {"Idempotency-Key": "acceptance-opposite"}
+    headers = {**AS_REVIEWER, "Idempotency-Key": "acceptance-opposite"}
     client.post(f"/v1/reviews/{proposal['id']}:approve", json={"reason": "yes"}, headers=headers)
 
     reversed_decision = client.post(
@@ -521,7 +541,9 @@ def test_a_new_profile_supersedes_the_published_version_in_one_action(
     leave one.
     """
     approved_first = client.post(
-        f"/v1/reviews/{proposal['id']}:approve", json={"reason": "correct for now"}
+        f"/v1/reviews/{proposal['id']}:approve",
+        json={"reason": "correct for now"},
+        headers=AS_REVIEWER,
     )
     assert approved_first.status_code == 200
 
@@ -541,7 +563,9 @@ def test_a_new_profile_supersedes_the_published_version_in_one_action(
 
     newest = versions[0]
     assert client.post(
-        f"/v1/reviews/{newest['id']}:approve", json={"reason": "covers the new column"}
+        f"/v1/reviews/{newest['id']}:approve",
+        json={"reason": "covers the new column"},
+        headers=AS_REVIEWER,
     ).status_code == 200
 
     published = client.get(f"/v1/assets/{asset_id}/classification").json()
@@ -569,7 +593,7 @@ def test_every_status_change_is_audited(
     proposal attributed to the task that made it and the publication to the
     person who decided it.
     """
-    client.post(f"/v1/reviews/{proposal['id']}:approve", json={"reason": "correct"})
+    client.post(f"/v1/reviews/{proposal['id']}:approve", json={"reason": "correct"}, headers=AS_REVIEWER)
 
     rows = conn.execute(SELECT_REVIEW_AUDIT).fetchall()
     conn.rollback()
@@ -583,3 +607,100 @@ def test_every_status_change_is_audited(
 def _source_of(client: TestClient, asset_id: str) -> str:
     source: str = client.get(f"/v1/assets/{asset_id}").json()["asset"]["source_id"]
     return source
+
+
+def test_an_unauthenticated_request_cannot_decide_anything(
+    client: TestClient, conn: QueueConnection, asset_id: str, proposal: dict[str, Any]
+) -> None:
+    """The governance gate needs a name behind it, end to end.
+
+    Asserted against the database rather than the response: a 401 that had
+    nevertheless written a review row would look identical from outside.
+    """
+    refused = client.post(f"/v1/reviews/{proposal['id']}:approve", json={"reason": "let me in"})
+
+    assert refused.status_code == 401
+    assert conn.execute(COUNT_REVIEWS).fetchone() == (0,)
+    conn.rollback()
+    assert client.get(f"/v1/assets/{asset_id}/classification").status_code == 404
+
+
+def test_a_decision_is_attributed_to_the_reviewer_who_made_it(
+    client: TestClient,
+    dsn: str,
+    asset_id: str,
+    proposal: dict[str, Any],
+    source_admin_dsn: str,
+) -> None:
+    """Two reviewers, two attributions — the property a constant actor cannot have.
+
+    The second decision has to be on a *second* version: one proposal is decided
+    once, and repeating the same classification request converges on the row the
+    first one wrote rather than creating a rival. So the table gains a column and
+    is re-profiled, which is the real way a second version comes to exist.
+
+    Deliberately no `skip` here. An earlier draft re-ran the same request and
+    skipped when convergence (correctly) produced nothing new — a test that
+    reports success while asserting nothing, which is this repo's signature
+    defect wearing a different hat.
+    """
+    approved = client.post(
+        f"/v1/reviews/{proposal['id']}:approve",
+        json={"reason": "dana checked the citation"},
+        headers=AS_REVIEWER,
+    )
+    assert approved.status_code == 200
+
+    with psycopg.connect(source_admin_dsn, autocommit=True) as source:
+        source.execute(ADD_COLUMN)
+    start(client, dsn, "scan_source", {"source_id": _source_of(client, asset_id)})
+    start(client, dsn, "profile_asset", {"asset_id": asset_id})
+    start(client, dsn, "classify_asset", {"asset_id": asset_id, "profile_version": 2})
+
+    versions = client.get(f"/v1/assets/{asset_id}/classifications").json()["items"]
+    [pending] = [v for v in versions if v["status"] == "pending_review"]
+    rejected = client.post(
+        f"/v1/reviews/{pending['id']}:reject",
+        json={"reason": "erin disagrees about the new column"},
+        headers=AS_SECOND_REVIEWER,
+    )
+    assert rejected.status_code == 200
+
+    assert [r["actor_id"] for r in client.get(f"/v1/reviews/{proposal['id']}").json()["reviews"]] == [
+        REVIEWER
+    ]
+    assert [r["actor_id"] for r in client.get(f"/v1/reviews/{pending['id']}").json()["reviews"]] == [
+        SECOND_REVIEWER
+    ]
+
+
+def test_one_reviewers_key_cannot_carry_another_reviewers_decision(
+    client: TestClient, conn: QueueConnection, proposal: dict[str, Any]
+) -> None:
+    """An idempotency key identifies a whole command, and the actor is part of it.
+
+    Dana approves under key K. Erin then sends the *same* key with the same
+    verb and the same reason. Without the actor in the comparison this replays
+    as Dana's decision and Erin is told hers succeeded; with it, it is the 409
+    it always was. This is the assertion that proves the authenticated principal
+    reaches the repository rather than stopping at the route.
+    """
+    key = {"Idempotency-Key": "acceptance-shared-key"}
+    reason = {"reason": "the citation resolves"}
+
+    dana = client.post(
+        f"/v1/reviews/{proposal['id']}:approve", json=reason, headers={**AS_REVIEWER, **key}
+    )
+    erin = client.post(
+        f"/v1/reviews/{proposal['id']}:approve",
+        json=reason,
+        headers={**AS_SECOND_REVIEWER, **key},
+    )
+
+    assert dana.status_code == 200
+    assert erin.status_code == 409
+    assert erin.json()["type"] == "urn:steward:idempotency-key-reused"
+    assert conn.execute(COUNT_REVIEWS).fetchone() == (1,)
+    conn.rollback()
+    [decision] = client.get(f"/v1/reviews/{proposal['id']}").json()["reviews"]
+    assert decision["actor_id"] == REVIEWER

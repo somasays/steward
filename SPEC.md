@@ -471,10 +471,40 @@ asset's published classification and one of which must leave it untouched. A
 body field would make "approve, outcome=rejected" representable at the seam,
 and the version of this that existed recorded a rejection while publishing the
 proposal. The request body is a **reason and nothing else**: outcome comes from
-the path, actor from the caller, time from the database, and a policy id is
-absent because this endpoint is attributed to a human actor and the repository
-refuses a policy attribution from one — auto-approval is a configured policy
-calling the repository, not a request claiming to be one. Both decisions take
+the path, actor from the **authenticated caller**, time from the database, and a
+policy id is absent because an API key proves a human and the repository refuses
+a policy attribution from one — auto-approval is a configured policy calling the
+repository, not a request claiming to be one.
+
+**The decision endpoints authenticate; nothing else does yet.** §2 puts API keys
+in v1, and a review is where that stops being optional: `ReviewCommand` carries
+no actor precisely so a caller cannot name one, and the repository writes the
+actor it is *given* to both the review row and the audit row. An unauthenticated
+endpoint recording a constant `human:api` makes that whole chain terminate in a
+fiction — every reviewer becomes the same person, and "nothing publishes without
+human review" degrades to "nothing publishes without an HTTP request". So
+`POST /v1/reviews/{id}:approve|:reject` require an `X-API-Key` naming a
+principal configured in `STEWARD_API_KEYS` (`id:secret` pairs), and that
+principal becomes the `Actor`. A key can only ever produce a **human** principal:
+a `policy` one would let anything holding a secret record an automatic approval,
+which §3.3 requires to resolve to a configured policy. No credential and an
+unrecognised credential are the same 401 with the same sentence, since telling
+them apart reports whether a guessed key exists, and the presented secret is
+never echoed into a body or a log (N7). An API started with no keys configured
+authenticates nobody — every decision 401s — and says so in its startup log
+rather than looking healthy; a *malformed* value is fatal at boot, because an
+operator who tried to configure credentials and mistyped must not end up with a
+deployment that silently accepts none. **The reads and the older mutations
+(`POST /v1/sources`, `POST /v1/sources/{id}/scan`, `POST /v1/runs`) remain
+unauthenticated** — that is a real gap, stated rather than hidden, and closing it
+across the surface is its own change.
+
+`GET /v1/reviews/{id}` reads the proposal and its decisions in a **repeatable-read**
+transaction. Two statements under the default `READ COMMITTED` take two
+snapshots, so a decision committing between them returns a proposal that says
+`pending_review` beside the approval that already happened — each query correct,
+the pair incoherent. The repository operation refuses to run at a weaker
+isolation level rather than trusting its callers to set one. Both decisions take
 the same `Idempotency-Key` header every other POST does; replaying a key returns
 the decision it settled, and sending it with a *different* one (another
 proposal, the opposite outcome, another reviewer, another reason) is a 409,

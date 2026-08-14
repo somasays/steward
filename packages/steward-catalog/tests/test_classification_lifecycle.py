@@ -19,6 +19,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
+from psycopg import IsolationLevel
 from psycopg.rows import dict_row
 from steward_catalog import EnvSecretResolver, build_scan_source, postgres_inspector, register_source
 from steward_catalog.classification import (
@@ -27,11 +28,13 @@ from steward_catalog.classification import (
     EvidenceNotResolvable,
     IdempotencyKeyReused,
     ProposalNotPending,
+    ReadCommittedDetail,
     StaleProposal,
     _proposal,
     approve,
     current_classification,
     get_proposal,
+    proposal_detail,
     proposal_history,
     propose,
     record_proposal_reviews,
@@ -1031,3 +1034,109 @@ class TestDecoding:
 
         with pytest.raises(KeyError, match="status"):
             _proposal(row)
+
+
+class TestDetailConsistency:
+    """A proposal and its reviews must come from one moment, not two.
+
+    `proposal_detail` runs two statements. Under PostgreSQL's default READ
+    COMMITTED each takes its own snapshot, so a decision committing between them
+    yields a reply that says `pending_review` and carries an `approved` review —
+    each query correct, the pair incoherent. These tests are about the pair.
+    """
+
+    def test_a_decision_committing_mid_read_cannot_split_the_answer(
+        self, conn: QueueConnection, other: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The interleaving, performed rather than imagined.
+
+        `conn` opens a repeatable-read transaction and takes its snapshot. `other`
+        then approves and commits. `conn` reads the reviews. Both halves must
+        describe the world *before* the decision — that is what "one snapshot"
+        means, and it is the whole fix.
+        """
+        proposal_id = recorded(conn, asset_id)
+        conn.commit()
+        conn.isolation_level = IsolationLevel.REPEATABLE_READ
+
+        # First statement of the transaction: this is where the snapshot is taken.
+        before = get_proposal(conn, proposal_id)
+        assert before is not None and before.status is ProposalStatus.PENDING_REVIEW
+
+        approve(other, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
+        other.commit()
+
+        reviews = record_proposal_reviews(conn, proposal_id)
+        still_pending = get_proposal(conn, proposal_id)
+
+        assert reviews == (), "the decision leaked into a snapshot taken before it"
+        assert still_pending is not None
+        assert still_pending.status is ProposalStatus.PENDING_REVIEW
+        conn.rollback()
+
+        # And a transaction opened afterwards sees all of it — otherwise the
+        # assertions above would also pass against a reader that sees nothing.
+        after = proposal_detail(conn, proposal_id)
+        assert after is not None
+        decided, decisions = after
+        assert decided.status is ProposalStatus.APPROVED
+        assert [review.outcome for review in decisions] == [ReviewOutcome.APPROVED]
+        conn.rollback()
+
+    def test_read_committed_really_does_split_it(
+        self, conn: QueueConnection, other: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The defect, reproduced — so the guard above is not guarding a myth.
+
+        The same interleaving under the default isolation level produces exactly
+        the contradiction: a proposal read as `pending_review` beside the
+        approval that has already happened.
+        """
+        proposal_id = recorded(conn, asset_id)
+        conn.commit()
+
+        before = get_proposal(conn, proposal_id)
+        assert before is not None and before.status is ProposalStatus.PENDING_REVIEW
+
+        approve(other, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
+        other.commit()
+
+        reviews = record_proposal_reviews(conn, proposal_id)
+
+        assert [review.outcome for review in reviews] == [ReviewOutcome.APPROVED]
+        assert before.status is ProposalStatus.PENDING_REVIEW  # the pair disagrees
+        conn.rollback()
+
+    def test_the_detail_read_refuses_a_transaction_that_cannot_answer_it(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The guard, on the pathology rather than on a convention.
+
+        A caller that forgets the isolation level gets a refusal, not a subtly
+        wrong answer under load. Documenting the requirement instead would leave
+        it true only while everyone remembers.
+        """
+        proposal_id = recorded(conn, asset_id)
+
+        with pytest.raises(ReadCommittedDetail, match="read committed"):
+            proposal_detail(conn, proposal_id)
+        conn.rollback()
+
+    def test_the_detail_read_returns_both_halves(
+        self, conn: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The positive case beside the refusals: it does return the thing."""
+        proposal_id = recorded(conn, asset_id)
+        approve(conn, proposal_id, command=a_command(), actor=SYSTEM_ACTOR)
+        conn.commit()
+        conn.isolation_level = IsolationLevel.REPEATABLE_READ
+
+        detail = proposal_detail(conn, proposal_id)
+
+        assert detail is not None
+        record, reviews = detail
+        assert record.id == proposal_id
+        assert record.status is ProposalStatus.APPROVED
+        assert [review.reason for review in reviews] == ["looks right"]
+        assert proposal_detail(conn, uuid4()) is None
+        conn.rollback()

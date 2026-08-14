@@ -67,12 +67,14 @@ __all__ = [
     "ClassificationConflict",
     "ProposalNotPending",
     "ProposalRecord",
+    "ReadCommittedDetail",
     "ReviewRecord",
     "StaleProposal",
     "approve",
     "current_classification",
     "get_proposal",
     "propose",
+    "proposal_detail",
     "proposal_history",
     "record_proposal_reviews",
     "reject",
@@ -413,6 +415,50 @@ def get_proposal(conn: QueueConnection, proposal_id: UUID) -> ProposalRecord | N
     """
     row = _one(conn, _sql.SELECT_PROPOSAL, {"id": proposal_id})
     return _proposal(row) if row is not None else None
+
+
+SNAPSHOT_ISOLATION_LEVELS = frozenset({"repeatable read", "serializable"})
+"""Isolation levels under which one transaction's statements share a snapshot."""
+
+
+class ReadCommittedDetail(RuntimeError):
+    """`proposal_detail` was called in a transaction that cannot answer it.
+
+    A guard on the pathology rather than a note in a docstring, because the
+    failure it prevents is invisible in testing and wrong only under
+    concurrency: the caller gets a proposal and its reviews from two *different*
+    snapshots and cannot tell.
+    """
+
+
+def proposal_detail(
+    conn: QueueConnection, proposal_id: UUID
+) -> tuple[ProposalRecord, tuple[ReviewRecord, ...]] | None:
+    """A proposal and every decision on it, as of one moment.
+
+    Two statements, and they must agree with each other. Under PostgreSQL's
+    default READ COMMITTED each statement takes a fresh snapshot, so an approval
+    committing between them produces a reply that is internally contradictory --
+    `status` still `pending_review`, with an `approved` review beside it. Each
+    query is correct; the pair is not.
+
+    So the transaction must hold one snapshot across both, and this refuses to
+    run in one that does not. The check is the transaction's *first* statement,
+    which is also when a REPEATABLE READ snapshot is taken, so the guard and the
+    guarantee are established together rather than one hoping for the other.
+    """
+    row = conn.execute(_sql.SELECT_ISOLATION_LEVEL).fetchone()
+    level = row[0] if row is not None else "unknown"
+    if level not in SNAPSHOT_ISOLATION_LEVELS:
+        raise ReadCommittedDetail(
+            f"proposal_detail needs a snapshot that spans its two reads, but this "
+            f"transaction is {level!r}; a decision committing between them would return "
+            "a proposal and a review that disagree about what has happened"
+        )
+    record = get_proposal(conn, proposal_id)
+    if record is None:
+        return None
+    return record, record_proposal_reviews(conn, proposal_id)
 
 
 def current_classification(conn: QueueConnection, asset_id: UUID) -> ProposalRecord | None:
