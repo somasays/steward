@@ -136,6 +136,20 @@ Branch **`m1/50-b2-and-smoke`** (pushed, `make fitness` green on every commit) c
    `EvaluationResult`: a completed run with an unusable answer, never retried. Unknown exceptions
    fail immediately rather than being guessed at. The scorer produces results only.
 
+   **Exercised against the real proxy**, not only in unit tests:
+
+   | shape | observed | classification |
+   |---|---|---|
+   | connection refused (closed port) | `ConnectError` | infrastructure, retryable |
+   | proxy killed mid-stream | `RemoteProtocolError` | infrastructure, retryable |
+   | completed 502/503 response | `CompletionFailed` | **result — fails immediately** |
+
+   The third is deliberate and documented. `LiteLLMProxyTransport` turns any status >= 400 into
+   `CompletionFailed`, a `steward-llm` type rather than an `httpx` transport error, so a 5xx from the
+   proxy is not retried. That is the conservative direction; making it retryable requires a **typed
+   status** on the failure, not reading the code back out of a message — which is the inspection this
+   boundary exists to remove.
+
    The old rule grepped the message, which made "a threshold miss is never retried" depend on
    wording. Two tests pin the difference: a model failure whose text *contains* "connection" and one
    containing "timeout" must both be results. Reverting to message matching fails exactly those two
