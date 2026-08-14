@@ -36,11 +36,11 @@ recorded when an approval is what actually happened.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from typing import Annotated, Any
+from collections.abc import Callable
+from typing import Annotated, Any, Protocol
 from uuid import UUID
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header
 from steward_catalog.classification import (
     AssetNotClassifiable,
     ClassificationConflict,
@@ -55,6 +55,7 @@ from steward_schemas import (
     ReviewRequest,
 )
 
+from steward_api.auth import ApiKeyRegistry, Principal, authenticator
 from steward_api.catalog import CatalogStore
 from steward_api.problem_details import (
     ProblemDetailsError,
@@ -70,10 +71,31 @@ IdempotencyKey = Annotated[str | None, Header(alias="Idempotency-Key")]
 
 REVIEWS_PATH = "/v1/reviews"
 
-Decide = Callable[[UUID, ReviewRequest, str | None], Awaitable[Classification]]
+class Decide(Protocol):
+    """`store.approve_classification` or `store.reject_classification`.
+
+    A protocol rather than a `Callable` alias so that `reviewer` stays a named,
+    typed argument across the seam: it is the answer to "who approved this", and
+    a positional `Any` would be the easiest possible place to lose it.
+    """
+
+    async def __call__(
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
+    ) -> Classification: ...
 
 _NOT_FOUND_RESPONSE: dict[int | str, dict[str, Any]] = {
     404: {"model": ProblemDetails, "description": "No such classification proposal"}
+}
+_UNAUTHENTICATED_RESPONSE: dict[int | str, dict[str, Any]] = {
+    401: {
+        "model": ProblemDetails,
+        "description": "No credential, or not one this deployment accepts",
+    }
 }
 _VALIDATION_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
     422: {"model": ProblemDetails, "description": "Validation error"}
@@ -109,24 +131,32 @@ what to *call* it, not a prerequisite for the endpoint continuing to work.
 """
 
 
-def build_router(store: CatalogStore) -> APIRouter:
+def build_router(store: CatalogStore, api_keys: ApiKeyRegistry) -> APIRouter:
     """Bind the `/v1/reviews` router to `store` -- a closure, not app state, so
-    every handler's dependency is explicit and typed."""
+    every handler's dependency is explicit and typed.
+
+    `api_keys` is a second explicit dependency for the same reason. The two
+    decision endpoints require a credential and record the principal it proves;
+    the reads do not, which matches the rest of this API's read surface and is
+    stated as a gap rather than as a decision that reads are public information.
+    """
 
     router = APIRouter(prefix=REVIEWS_PATH, tags=["reviews"])
+    authenticate = authenticator(api_keys)
 
     async def decided(
         decide: Decide,
         proposal_id: UUID,
         body: ReviewRequest,
         idempotency_key: str | None,
+        reviewer: Principal,
     ) -> Classification:
         """Run one decision and translate its refusals. Shared by both verbs
         because the *translation* is identical; the decision is not, which is
         why `decide` is the store method itself rather than an outcome flag."""
         instance = f"{REVIEWS_PATH}/{proposal_id}"
         try:
-            return await decide(proposal_id, body, idempotency_key)
+            return await decide(proposal_id, body, idempotency_key, reviewer=reviewer)
         except LookupError as exc:
             raise not_found(f"no classification proposal {proposal_id}", instance=instance) from exc
         except ClassificationConflict as exc:
@@ -153,6 +183,7 @@ def build_router(store: CatalogStore) -> APIRouter:
         "/{proposal_id}:approve",
         response_model=Classification,
         responses={
+            **_UNAUTHENTICATED_RESPONSE,
             **_NOT_FOUND_RESPONSE,
             **_CONFLICT_RESPONSE,
             **_VALIDATION_ERROR_RESPONSE,
@@ -162,15 +193,30 @@ def build_router(store: CatalogStore) -> APIRouter:
     async def approve_review(
         proposal_id: UUID,
         body: ReviewRequest,
+        # `Depends` as a default rather than inside `Annotated`: this module uses
+        # `from __future__ import annotations`, so FastAPI resolves the annotation
+        # from module globals, where `authenticate` -- a closure variable bound to
+        # *this app's* key registry -- does not exist. The Annotated form silently
+        # degraded `reviewer` into a query parameter, which is a 422 rather than a
+        # hole, but only because the type has no default.
+        reviewer: Principal = Depends(authenticate),
         idempotency_key: IdempotencyKey = None,
     ) -> Classification:
-        """Publish this classification, superseding whatever it replaces."""
-        return await decided(store.approve_classification, proposal_id, body, idempotency_key)
+        """Publish this classification, superseding whatever it replaces.
+
+        Recorded against `reviewer`, which is the point of requiring one: the
+        repository will not accept an actor from the request body, so the
+        credential is the only thing that can say who approved this.
+        """
+        return await decided(
+            store.approve_classification, proposal_id, body, idempotency_key, reviewer
+        )
 
     @router.post(
         "/{proposal_id}:reject",
         response_model=Classification,
         responses={
+            **_UNAUTHENTICATED_RESPONSE,
             **_NOT_FOUND_RESPONSE,
             **_CONFLICT_RESPONSE,
             **_VALIDATION_ERROR_RESPONSE,
@@ -180,6 +226,13 @@ def build_router(store: CatalogStore) -> APIRouter:
     async def reject_review(
         proposal_id: UUID,
         body: ReviewRequest,
+        # `Depends` as a default rather than inside `Annotated`: this module uses
+        # `from __future__ import annotations`, so FastAPI resolves the annotation
+        # from module globals, where `authenticate` -- a closure variable bound to
+        # *this app's* key registry -- does not exist. The Annotated form silently
+        # degraded `reviewer` into a query parameter, which is a 422 rather than a
+        # hole, but only because the type has no default.
+        reviewer: Principal = Depends(authenticate),
         idempotency_key: IdempotencyKey = None,
     ) -> Classification:
         """Refuse this classification. What is published stays published.
@@ -189,6 +242,8 @@ def build_router(store: CatalogStore) -> APIRouter:
         its reason to the eval dataset, so a rejection with nothing to say is a
         training signal thrown away.
         """
-        return await decided(store.reject_classification, proposal_id, body, idempotency_key)
+        return await decided(
+            store.reject_classification, proposal_id, body, idempotency_key, reviewer
+        )
 
     return router

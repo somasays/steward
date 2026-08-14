@@ -32,6 +32,16 @@ exclude = ["scripts/fitness/*.py"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "S608", "TID251"]
 
+# B008 exists to catch a mutable or side-effecting value evaluated once at import and
+# shared by every call. `fastapi.Depends` is neither: it is an inert marker FastAPI
+# reads off the signature, and it is the only way to attach a dependency when a module
+# uses `from __future__ import annotations` and the dependency is a closure -- the
+# `Annotated` form resolves the annotation against module globals, where a closure
+# variable does not exist, and silently degrades the parameter into a query field.
+# Scoped to `Depends` alone so B008 keeps doing its real job everywhere else.
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends"]
+
 [tool.ruff.lint.per-file-ignores]
 # scripts/fitness stays stdlib-only for Python 3.9+ (GUARDRAILS.md build-vs-buy rule) --
 # style/upgrade rules don't apply there, but S608 (S3, SQL safety) still scans it,

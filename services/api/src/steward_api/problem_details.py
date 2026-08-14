@@ -11,7 +11,7 @@ build a JSON error body by hand.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -25,6 +25,14 @@ PROBLEM_CONTENT_TYPE = "application/problem+json"
 
 _logger = logging.getLogger(__name__)
 
+API_KEY_HEADER = "X-API-Key"
+"""The header a credential is presented in (SPEC.md §2: API keys in v1).
+
+Named here rather than in `auth` because the `401` this module builds has to
+tell a caller which header to use, and a challenge that names the wrong header
+is worse than none.
+"""
+
 INTERNAL_ERROR_TYPE = "urn:steward:internal-error"
 """Every unexpected server error's `type`, whatever raised it -- deliberately
 one type for all of them, since the body carries no exception message and no
@@ -32,11 +40,43 @@ goal or planner detail (SPEC.md §8); the real detail goes to the log only."""
 
 
 class ProblemDetailsError(Exception):
-    """Raise from a route handler to produce a problem-details response."""
+    """Raise from a route handler to produce a problem-details response.
 
-    def __init__(self, problem: ProblemDetails) -> None:
+    `headers` exists for the one status code that is incomplete without them:
+    RFC 9110 requires a `401` to say *how* to authenticate, and a body alone
+    cannot. Everything else leaves it empty.
+    """
+
+    def __init__(self, problem: ProblemDetails, headers: Mapping[str, str] | None = None) -> None:
         super().__init__(problem.title)
         self.problem = problem
+        self.headers: Mapping[str, str] = headers if headers is not None else {}
+
+
+def unauthenticated(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
+    """A `401` for a request that presented no usable credential.
+
+    One status for "no key" and "not a key we accept", and one `detail` phrasing
+    for both, deliberately: distinguishing them tells an unauthenticated caller
+    whether a guessed key exists, which is the one thing a credential check must
+    not report. The presented secret never appears in the body, the title or the
+    log — the same rule `sanitized_errors` applies to a rejected field (N7).
+
+    `403` is deliberately absent. It would mean "authenticated, but not
+    permitted", and there is no permission model yet to be refused by; inventing
+    roles here so the API had a 403 to return would be a governance claim with
+    nothing behind it.
+    """
+    return ProblemDetailsError(
+        ProblemDetails(
+            type="urn:steward:unauthenticated",
+            title="Authentication required",
+            status=status.HTTP_401_UNAUTHORIZED,
+            detail=detail,
+            instance=instance,
+        ),
+        headers={"WWW-Authenticate": f'ApiKey realm="steward", header="{API_KEY_HEADER}"'},
+    )
 
 
 def not_found(detail: str, *, instance: str | None = None) -> ProblemDetailsError:
@@ -236,11 +276,14 @@ def invalid_goal_payload(
     )
 
 
-def _problem_response(problem: ProblemDetails) -> JSONResponse:
+def _problem_response(
+    problem: ProblemDetails, headers: Mapping[str, str] | None = None
+) -> JSONResponse:
     return JSONResponse(
         status_code=problem.status,
         content=jsonable_encoder(problem.model_dump(mode="json")),
         media_type=PROBLEM_CONTENT_TYPE,
+        headers=dict(headers) if headers else None,
     )
 
 
@@ -251,7 +294,7 @@ def install_problem_details(app: FastAPI) -> None:
 
     @app.exception_handler(ProblemDetailsError)
     async def _handle_problem_details_error(_: Request, exc: ProblemDetailsError) -> JSONResponse:
-        return _problem_response(exc.problem)
+        return _problem_response(exc.problem, exc.headers)
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

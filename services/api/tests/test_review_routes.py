@@ -33,12 +33,14 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from steward_api.app import create_app
+from steward_api.auth import ApiKeyRegistry, MalformedApiKeys, Principal
 from steward_api.catalog import (
     AssetNotFound,
     InMemoryCatalogStore,
     classification_response,
     review_response,
 )
+from steward_api.problem_details import API_KEY_HEADER, ProblemDetailsError
 from steward_catalog.classification import (
     AssetNotClassifiable,
     ClassificationConflict,
@@ -71,6 +73,11 @@ REVIEW_ID = UUID("55555555-5555-5555-5555-555555555555")
 NOW = datetime(2026, 8, 13, 12, 0, 0, tzinfo=UTC)
 
 A_REASON = {"reason": "the evidence resolves"}
+
+REVIEWER, REVIEWER_KEY = "alice", "alice-secret-value"
+SECOND_REVIEWER, SECOND_KEY = "bob", "bob-secret-value"
+KEYS = ApiKeyRegistry({REVIEWER: REVIEWER_KEY, SECOND_REVIEWER: SECOND_KEY})
+AUTH = {API_KEY_HEADER: REVIEWER_KEY}
 
 
 def a_proposal(asset_id: UUID = ASSET_ID) -> ClassificationProposal:
@@ -137,19 +144,29 @@ class StubStore(InMemoryCatalogStore):
     def __init__(self, *, raises: Exception | None = None) -> None:
         super().__init__()
         self._raises = raises
-        self.calls: list[tuple[str, UUID, str, str | None]] = []
+        self.calls: list[tuple[str, UUID, str, str | None, str]] = []
         self.current: Classification | None = None
         self.history: ClassificationHistory | None = None
 
     async def approve_classification(
-        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
     ) -> Classification:
-        return self._decide("approve", proposal_id, request, idempotency_key)
+        return self._decide("approve", proposal_id, request, idempotency_key, reviewer)
 
     async def reject_classification(
-        self, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        *,
+        reviewer: Principal,
     ) -> Classification:
-        return self._decide("reject", proposal_id, request, idempotency_key)
+        return self._decide("reject", proposal_id, request, idempotency_key, reviewer)
 
     async def current_classification(self, asset_id: UUID) -> Classification | None:
         if self._raises is not None:
@@ -163,18 +180,22 @@ class StubStore(InMemoryCatalogStore):
         return self.history
 
     def _decide(
-        self, verb: str, proposal_id: UUID, request: ReviewRequest, idempotency_key: str | None
+        self,
+        verb: str,
+        proposal_id: UUID,
+        request: ReviewRequest,
+        idempotency_key: str | None,
+        reviewer: Principal,
     ) -> Classification:
-        reason = request.reason
-        self.calls.append((verb, proposal_id, reason, idempotency_key))
+        self.calls.append((verb, proposal_id, request.reason, idempotency_key, reviewer.id))
         if self._raises is not None:
             raise self._raises
         status = ProposalStatus.APPROVED if verb == "approve" else ProposalStatus.REJECTED
         return classification_response(a_record(status))
 
 
-def client_for(store: StubStore) -> Iterator[TestClient]:
-    with TestClient(create_app(catalog_store=store)) as test_client:
+def client_for(store: StubStore, api_keys: ApiKeyRegistry = KEYS) -> Iterator[TestClient]:
+    with TestClient(create_app(catalog_store=store, api_keys=api_keys)) as test_client:
         yield test_client
 
 
@@ -195,14 +216,14 @@ class TestDecisions:
     def test_approving_publishes_and_answers_with_the_published_version(
         self, review_client: TestClient, store: StubStore
     ) -> None:
-        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:approve", json=A_REASON)
+        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:approve", json=A_REASON, headers=AUTH)
 
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "approved"
         assert body["id"] == str(PROPOSAL_ID)
         assert body["version"] == 2
-        assert store.calls == [("approve", PROPOSAL_ID, A_REASON["reason"], None)]
+        assert store.calls == [("approve", PROPOSAL_ID, A_REASON["reason"], None, REVIEWER)]
 
     def test_rejecting_calls_reject_and_answers_rejected(
         self, review_client: TestClient, store: StubStore
@@ -214,11 +235,11 @@ class TestDecisions:
         the endpoint would still answer 200 with a plausible body, and it would
         publish the classification it was asked to refuse.
         """
-        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:reject", json=A_REASON)
+        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:reject", json=A_REASON, headers=AUTH)
 
         assert response.status_code == 200
         assert response.json()["status"] == "rejected"
-        assert store.calls == [("reject", PROPOSAL_ID, A_REASON["reason"], None)]
+        assert store.calls == [("reject", PROPOSAL_ID, A_REASON["reason"], None, REVIEWER)]
 
     def test_the_idempotency_key_reaches_the_store(
         self, review_client: TestClient, store: StubStore
@@ -227,16 +248,16 @@ class TestDecisions:
         review_client.post(
             f"/v1/reviews/{PROPOSAL_ID}:approve",
             json=A_REASON,
-            headers={"Idempotency-Key": "review-42"},
+            headers={**AUTH, "Idempotency-Key": "review-42"},
         )
 
-        assert store.calls == [("approve", PROPOSAL_ID, A_REASON["reason"], "review-42")]
+        assert store.calls == [("approve", PROPOSAL_ID, A_REASON["reason"], "review-42", REVIEWER)]
 
     def test_the_response_carries_the_evidence_and_the_provenance(
         self, review_client: TestClient
     ) -> None:
         """What a reviewer reads must include what they are meant to check."""
-        body = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:approve", json=A_REASON).json()
+        body = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:approve", json=A_REASON, headers=AUTH).json()
 
         assert body["trace_id"] == "0123456789abcdef0123456789abcdef"
         assert body["run_id"] == str(RUN_ID)
@@ -249,7 +270,7 @@ class TestDecisions:
     def test_a_decision_without_a_reason_is_refused(self, review_client: TestClient) -> None:
         """SPEC §8 exports every rejection with its reason as eval data; a
         decision with nothing to say is that signal thrown away."""
-        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:reject", json={"reason": ""})
+        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:reject", json={"reason": ""}, headers=AUTH)
 
         assert response.status_code == 422
         assert response.json()["type"] == "urn:steward:validation-error"
@@ -278,7 +299,7 @@ def test_each_refusal_reaches_the_client_as_its_own_409(
     """
     store = StubStore(raises=error)
     for review_client in client_for(store):
-        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:{verb}", json=A_REASON)
+        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:{verb}", json=A_REASON, headers=AUTH)
 
     assert response.status_code == 409
     body = response.json()
@@ -291,7 +312,7 @@ def test_each_refusal_reaches_the_client_as_its_own_409(
 def test_deciding_a_proposal_that_does_not_exist_is_a_404(verb: str) -> None:
     store = StubStore(raises=LookupError(f"no such proposal: {PROPOSAL_ID}"))
     for review_client in client_for(store):
-        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:{verb}", json=A_REASON)
+        response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:{verb}", json=A_REASON, headers=AUTH)
 
     assert response.status_code == 404
     assert response.json()["type"] == "urn:steward:not-found"
@@ -395,3 +416,165 @@ class TestProjection:
         for kind in ActorKind:
             policy = "some-policy" if kind is ActorKind.POLICY else None
             assert review_response(a_review(kind, policy_id=policy)).actor_kind.value == kind.value
+
+
+class TestAuthentication:
+    """A decision is recorded against whoever proved they may make it (SPEC §2).
+
+    This is not a generic auth suite: it is the set of ways an unauthenticated
+    or misattributed decision could still be recorded. The repository refuses a
+    caller-supplied actor so that the credential is the *only* thing that can
+    say who approved a classification — which makes these tests the other half
+    of that guarantee.
+    """
+
+    @pytest.mark.parametrize("verb", ["approve", "reject"])
+    def test_a_decision_without_a_credential_is_refused(
+        self, store: StubStore, verb: str
+    ) -> None:
+        for review_client in client_for(store):
+            response = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:{verb}", json=A_REASON)
+
+        assert response.status_code == 401
+        assert response.json()["type"] == "urn:steward:unauthenticated"
+        assert "ApiKey" in response.headers["WWW-Authenticate"]
+        # Nothing reached the store: an unauthenticated request must not decide.
+        assert store.calls == []
+
+    @pytest.mark.parametrize(
+        "presented",
+        ["wrong-secret-value", REVIEWER_KEY[:-1], REVIEWER_KEY + "x", ""],
+        ids=["unrelated", "prefix-of-a-valid-key", "valid-key-plus-a-character", "empty"],
+    )
+    def test_a_credential_this_deployment_does_not_accept_is_refused(
+        self, store: StubStore, presented: str
+    ) -> None:
+        """Including the near-misses. A comparison that stopped at the first
+        differing character would still reject these, but a check that
+        `startswith` or truncated would not."""
+        for review_client in client_for(store):
+            response = review_client.post(
+                f"/v1/reviews/{PROPOSAL_ID}:approve",
+                json=A_REASON,
+                headers={API_KEY_HEADER: presented},
+            )
+
+        assert response.status_code == 401
+        assert store.calls == []
+
+    def test_a_rejected_credential_is_never_echoed_or_described(
+        self, store: StubStore
+    ) -> None:
+        """Two rules in one response.
+
+        The secret must not come back — a body that echoed it would put it in
+        the client's logs and any proxy in between (N7, the rule
+        `sanitized_errors` applies to a rejected field). And "no key" and "wrong
+        key" must read identically, because telling them apart tells an
+        unauthenticated caller whether a guessed secret exists.
+        """
+        secret = "a-guessed-secret-value"
+        for review_client in client_for(store):
+            rejected = review_client.post(
+                f"/v1/reviews/{PROPOSAL_ID}:approve",
+                json=A_REASON,
+                headers={API_KEY_HEADER: secret},
+            )
+            absent = review_client.post(f"/v1/reviews/{PROPOSAL_ID}:approve", json=A_REASON)
+
+        assert secret not in rejected.text
+        assert rejected.json() == absent.json()
+
+    def test_an_unconfigured_deployment_accepts_nobody(self, store: StubStore) -> None:
+        """Fail closed. An API with no credentials configured cannot record a
+        decision on anyone's behalf, rather than recording every decision on
+        behalf of nobody in particular."""
+        for review_client in client_for(store, ApiKeyRegistry({})):
+            response = review_client.post(
+                f"/v1/reviews/{PROPOSAL_ID}:approve",
+                json=A_REASON,
+                headers={API_KEY_HEADER: REVIEWER_KEY},
+            )
+
+        assert response.status_code == 401
+        assert store.calls == []
+
+    def test_two_reviewers_are_two_actors(self, store: StubStore) -> None:
+        """The point of the whole exercise: distinct keys attribute distinctly.
+
+        Without this, every assertion above is satisfied by an implementation
+        that authenticates correctly and then records `human:api` regardless.
+        """
+        for review_client in client_for(store):
+            review_client.post(
+                f"/v1/reviews/{PROPOSAL_ID}:approve",
+                json=A_REASON,
+                headers={API_KEY_HEADER: REVIEWER_KEY},
+            )
+            review_client.post(
+                f"/v1/reviews/{PROPOSAL_ID}:reject",
+                json=A_REASON,
+                headers={API_KEY_HEADER: SECOND_KEY},
+            )
+
+        assert [(call[0], call[4]) for call in store.calls] == [
+            ("approve", REVIEWER),
+            ("reject", SECOND_REVIEWER),
+        ]
+
+    def test_a_credential_never_produces_a_policy_actor(self) -> None:
+        """SPEC §3.3: an automatic approval must resolve to a configured policy.
+
+        No configuration of this registry yields a `policy` principal, so an API
+        key cannot be used to record "a policy approved this" — which the
+        repository would then have to either trust or refuse on the strength of
+        two free-form strings agreeing.
+        """
+        for identifier in (REVIEWER, SECOND_REVIEWER, "auto-approve-none"):
+            assert Principal(id=identifier).actor.kind is ActorKind.HUMAN
+
+
+class TestKeyConfiguration:
+    """`STEWARD_API_KEYS` is parsed at the composition root, where a mistake is
+    an operator's to see — and every mistake is refused rather than dropped."""
+
+    def test_credentials_are_read_from_the_configured_value(self) -> None:
+        registry = ApiKeyRegistry.from_env("alice:one-secret,bob:another-secret")
+
+        assert registry.configured
+        assert registry.principal("one-secret") == Principal(id="alice")
+        assert registry.principal("another-secret") == Principal(id="bob")
+
+    @pytest.mark.parametrize(
+        "raw", [None, "", "   "], ids=["unset", "empty", "whitespace"]
+    )
+    def test_an_absent_configuration_authenticates_nobody(self, raw: str | None) -> None:
+        registry = ApiKeyRegistry.from_env(raw)
+
+        assert not registry.configured
+        with pytest.raises(ProblemDetailsError):
+            registry.principal("anything")
+
+    @pytest.mark.parametrize(
+        ("raw", "reason"),
+        [
+            ("alice", "no-separator"),
+            ("alice:", "no-secret"),
+            (":secret", "no-id"),
+            ("alice:one,alice:two", "duplicate-id"),
+            ("alice:same,bob:same", "shared-secret"),
+        ],
+        ids=["no-separator", "no-secret", "no-id", "duplicate-id", "shared-secret"],
+    )
+    def test_a_malformed_configuration_is_refused_at_startup(self, raw: str, reason: str) -> None:
+        """Refused, not skipped. A dropped entry leaves a reviewer quietly
+        without a credential; a duplicate id or a shared secret makes an audit
+        row unable to say which of two people acted."""
+        with pytest.raises(MalformedApiKeys):
+            ApiKeyRegistry.from_env(raw)
+
+    def test_a_configuration_error_does_not_quote_the_secret(self) -> None:
+        with pytest.raises(MalformedApiKeys) as raised:
+            ApiKeyRegistry.from_env("this-entry-has-no-separator-and-is-secret")
+
+        assert "this-entry-has-no-separator-and-is-secret" not in str(raised.value)

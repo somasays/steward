@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from steward_api.auth import ApiKeyRegistry
 from steward_api.catalog import CatalogStore, InMemoryCatalogStore
 from steward_api.problem_details import install_problem_details
 from steward_api.routes.assets import build_router as build_assets_router
@@ -14,7 +15,11 @@ from steward_api.routes.sources import build_router as build_sources_router
 from steward_api.store import InMemoryRunStore, RunStore
 
 
-def create_app(run_store: RunStore | None = None, catalog_store: CatalogStore | None = None) -> FastAPI:
+def create_app(
+    run_store: RunStore | None = None,
+    catalog_store: CatalogStore | None = None,
+    api_keys: ApiKeyRegistry | None = None,
+) -> FastAPI:
     """Build the API app around a `RunStore` and a `CatalogStore`.
 
     The defaults are the in-memory stores, which is what the OpenAPI export and
@@ -22,6 +27,14 @@ def create_app(run_store: RunStore | None = None, catalog_store: CatalogStore | 
     Every deployment passes the Postgres-backed pair instead -- see
     `steward_api.__main__`, which is the composition root and the only place
     that reads the environment.
+
+    `api_keys` defaults to an **empty** registry, which authenticates nobody, so
+    an app built without one answers 401 to every review decision. Fail-closed is
+    the right default for a governance endpoint: the alternative -- accepting
+    decisions when no credentials are configured -- is exactly the state this
+    parameter exists to end. The OpenAPI export and the HTTP-layer tests build
+    the app this way and still see the routes, because a 401 is a response, not a
+    missing endpoint.
 
     There is deliberately no module-level `app` to point an ASGI server at.
     One would default to the in-memory stores, and a deployment started the
@@ -38,5 +51,7 @@ def create_app(run_store: RunStore | None = None, catalog_store: CatalogStore | 
     app.include_router(build_runs_router(run_store if run_store is not None else InMemoryRunStore()))
     app.include_router(build_sources_router(catalog))
     app.include_router(build_assets_router(catalog))
-    app.include_router(build_reviews_router(catalog))
+    app.include_router(
+        build_reviews_router(catalog, api_keys if api_keys is not None else ApiKeyRegistry({}))
+    )
     return app
