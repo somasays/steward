@@ -84,10 +84,17 @@ from steward_queue.tasks import (
     mark_running,
     requeue_stale,
 )
-from steward_queue.usage import NOTHING_SPENT, UsageLedger
+from steward_queue.usage import (
+    LEDGER_COST_SCALE,
+    NOTHING_SPENT,
+    UsageLedger,
+    ledger_cost,
+)
 from steward_queue.worker import Worker
 
 __all__ = [
+    "LEDGER_COST_SCALE",
+    "ledger_cost",
     "DEFAULT_LEASE",
     "DSN_ENV",
     "NOOP_TASK_TYPE",
