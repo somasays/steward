@@ -218,6 +218,24 @@ class TestRetryBoundary:
 
         assert isinstance(_classify_failure(ClassifierFailed(message)), EvaluationResult)
 
+    def test_a_completed_5xx_fails_immediately_rather_than_retrying(self) -> None:
+        """Documented, chosen behaviour — not an oversight.
+
+        The transport turns any status >= 400 into `CompletionFailed`, a
+        `steward-llm` type rather than a transport error, so a 502/503 from the
+        proxy is a result and the run fails at once. Retrying it would mean
+        recovering the status from a rendered message, which is exactly the
+        inspection this boundary replaced. Supporting it properly needs a typed
+        status on the failure.
+        """
+        from steward_catalog import ClassifierFailed
+        from steward_workers.evals.classification import EvaluationResult
+        from steward_workers.evals.harness import _classify_failure
+
+        wrapped = ClassifierFailed("gateway returned 503 for 'steward-classify': unavailable")
+
+        assert isinstance(_classify_failure(wrapped), EvaluationResult)
+
     def test_an_exhausted_budget_is_a_result_not_infrastructure(self) -> None:
         """A cap is the product working, and re-rolling it would spend the next
         cap too."""

@@ -41,6 +41,19 @@ RETRYABLE = (httpx.TransportError, TimeoutError, ConnectionError)
 connection failure beneath them. Matching on types rather than on message text is
 the whole point: it is the difference between a rule and a coincidence.
 
+**A completed 5xx response is deliberately *not* retryable.** `LiteLLMProxyTransport`
+turns any status >= 400 into `CompletionFailed` (`proxy.py`), which is a
+`steward-llm` type and not an `httpx.TransportError` — so a 502 or 503 from the
+proxy is classified as a result and fails the run immediately. That is the
+conservative direction and it is chosen, not overlooked: the alternative is
+reading the status back out of a rendered message, which is the message
+inspection this boundary exists to remove. Making it retryable needs typed status
+metadata on the failure — a status field on `CompletionFailed` — at which point
+`RETRYABLE` gains a predicate rather than a substring.
+
+Verified against the real proxy: a refused connection surfaces `ConnectError` and
+a proxy killed mid-stream surfaces `RemoteProtocolError`, both retryable.
+
 The chain is walked because the seam wraps them — `AgentColumnClassifier`
 converts a transport failure into `ClassifierFailed` so that `steward-catalog`
 never sees a `steward-agents` type (I4), and `raise ... from exc` keeps the
