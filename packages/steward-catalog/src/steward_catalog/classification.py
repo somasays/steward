@@ -72,6 +72,7 @@ __all__ = [
     "StaleProposal",
     "approve",
     "current_classification",
+    "evidence_problems",
     "get_proposal",
     "propose",
     "proposal_detail",
@@ -502,28 +503,55 @@ def _require_resolvable_evidence(conn: QueueConnection, proposal: Classification
             "to resolve this proposal's evidence against"
         )
     profile = TableProfile.model_validate(row["profile"])
+    unresolvable = evidence_problems(proposal, profile)
+    if unresolvable:
+        raise EvidenceNotResolvable(unresolvable[0])
+
+
+def evidence_problems(
+    proposal: ClassificationProposal, profile: TableProfile
+) -> tuple[str, ...]:
+    """Every way `proposal`'s citations fail to resolve against `profile`, in order.
+
+    Pure, and public, because two callers must agree about what "the evidence
+    resolves" means. `_require_resolvable_evidence` fetches the stored profile
+    and refuses a proposal on the first problem; **B2 scores evidence validity
+    with this same function** (`evals/`). Two implementations of this check would
+    let the eval report a passing evidence score for citations production would
+    refuse to persist -- an eval measuring something the product does not enforce
+    is worse than no eval, because it reports confidence.
+
+    Returns problems rather than raising: a gate scoring a run needs all of them,
+    and a repository refusing a write needs only the first. The caller chooses.
+    """
     columns = {column.name: column for column in profile.columns}
+    problems: list[str] = []
     for classification in proposal.columns:
         profiled = columns.get(classification.column_name)
         if profiled is None:
-            raise EvidenceNotResolvable(
+            problems.append(
                 f"profile version {proposal.profile_version} has no column "
                 f"{classification.column_name!r}; a citation that resolves to nothing is "
                 "one a reviewer cannot check"
             )
+            continue
         for reference in classification.evidence:
-            _resolve(reference, profiled, proposal.profile_version)
+            problem = _resolve(reference, profiled, proposal.profile_version)
+            if problem is not None:
+                problems.append(problem)
+    return tuple(problems)
 
 
-def _resolve(reference: EvidenceRef, column: ColumnProfile, version: int) -> None:
+def _resolve(reference: EvidenceRef, column: ColumnProfile, version: int) -> str | None:
     """Check one citation's locator against the fact it names."""
     stored = _stored_values(column)[reference.kind]
     if reference.locator not in stored:
-        raise EvidenceNotResolvable(
+        return (
             f"{column.name}: {reference.kind.value} evidence cites {reference.locator!r}, "
             f"which profile version {version} does not contain "
             f"({', '.join(sorted(stored)) or 'nothing of that kind is recorded'})"
         )
+    return None
 
 
 def _stored_values(column: ColumnProfile) -> dict[EvidenceKind, set[str]]:
