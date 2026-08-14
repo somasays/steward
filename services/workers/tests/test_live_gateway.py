@@ -64,6 +64,7 @@ from steward_queue import (
     connect,
     create_run,
     enqueue,
+    ledger_cost,
     upgrade_to_head,
 )
 from steward_schemas import (
@@ -108,16 +109,12 @@ SELECT_RUN_LEDGER = """
 SELECT used_steps, used_tokens, used_cost_usd, used_wall_clock FROM runs WHERE id = %(run_id)s
 """
 
-LEDGER_COST_SCALE = Decimal("0.000001")
-"""What `numeric(14, 6)` can hold.
-
-The checkpoint keeps the cost the gateway computed at full precision
-(`0.00005572`); the ledger columns round it to six places (`0.000056`). Asserting
-raw equality between them fails on a *correct* run, so the comparison quantises
-the checkpoint's figure to the ledger's scale rather than loosening to
-"approximately equal" -- which would stop catching the thing this assertion is
-for.
-"""
+# The checkpoint keeps the cost the gateway computed at full precision
+# (`0.00005572`); the ledger columns store six places (`0.000056`). The
+# comparison rounds the checkpoint's figure with `steward_queue.ledger_cost`
+# rather than a local `quantize`, because the two disagree on exact halves --
+# Python rounds ties to even, PostgreSQL away from zero -- and a local quantize
+# would fail on a *correct* run whenever the sixth decimal landed on a half.
 
 def _required() -> bool:
     """Whether this environment must produce evidence rather than skip."""
@@ -436,7 +433,7 @@ def _assert_charged_once(conn: QueueConnection, run_id: UUID) -> None:
         task_tokens,
         task_wall,
     ), "the checkpoint and the task ledger disagree about what this attempt spent"
-    assert task_cost == recorded.cost_usd.quantize(LEDGER_COST_SCALE), (
+    assert task_cost == ledger_cost(recorded.cost_usd), (
         f"task ledger charged {task_cost}, checkpoint recorded {recorded.cost_usd}"
     )
     assert (run_steps, run_tokens, run_cost, run_wall) == (

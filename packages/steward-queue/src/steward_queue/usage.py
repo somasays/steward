@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import threading
 from datetime import timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from steward_schemas import RunBudget
 
@@ -69,3 +69,27 @@ class UsageLedger:
         """This attempt's spend so far. Safe to call while the handler runs."""
         with self._lock:
             return self._total
+
+LEDGER_COST_SCALE = Decimal("0.000001")
+"""The precision `runs.used_cost_usd` and `tasks.used_cost_usd` can hold.
+
+`numeric(14, 6)`. A cost computed at full precision is rounded to this on its way
+into the ledger, so anything comparing a computed figure against a stored one has
+to round the same way first.
+"""
+
+
+def ledger_cost(value: Decimal) -> Decimal:
+    """`value` as the ledger will store it.
+
+    **`ROUND_HALF_UP`, not Python's default.** `Decimal.quantize` rounds ties to
+    even; PostgreSQL's `numeric` rounds ties away from zero. They agree on almost
+    every figure and disagree on exact halves, so a correct cost of `0.0000565`
+    stores as `0.000057` and quantised the default way compares as `0.000056` --
+    a comparison that fails on a *correct* run, occasionally, depending on the
+    sixth decimal place of whatever the model happened to charge.
+
+    Costs here are non-negative, so away-from-zero and half-up are the same rule;
+    the name is chosen because that is the property being matched.
+    """
+    return value.quantize(LEDGER_COST_SCALE, rounding=ROUND_HALF_UP)
