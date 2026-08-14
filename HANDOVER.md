@@ -19,10 +19,9 @@ brief, so fix SPEC first.
 
 ## State
 
-M0 and M1 slices 1–3a are shipped, and #50's persistence layer and Classifier with them. `main` is at
-`0619822`. **#50 steps 7–8 — the review API — are written and green but not merged**: they are on
-`m1/50-review-api`, open as **PR #83**, CI green on the tip. Everything below that describes the review
-API describes that branch, not `main`.
+M0 and M1 slices 1–3b are shipped — #50's persistence layer, Classifier and **review API** with them.
+`main` is at `1be2a02`, green: `make fitness` re-run on merged main, all checks green (S6 SKIPs on main
+by design — the merge-base is HEAD itself, so there is no divergence to compare).
 Working end to end: register a Postgres source, scan it, persist assets/columns, profile every column
 through a masking layer, run a **bounded agent** through API → queue → worker with per-attempt budget
 accounting, reach a model through a real **LiteLLM proxy HTTP transport** — and now read a proposal, its
@@ -33,7 +32,13 @@ gates SKIP until M2.
 **#69, #48 and #74 are closed.** PR #81 merged the classification schemas, migration `0006`, the
 repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
-### Open: PR #83 (#50 steps 7–8)
+### Nothing is open
+
+**PR #83 merged at `1be2a02`** (rebase, linear history, branch kept — the style #81 and #82 used). It
+landed **#50 steps 7–8**. It went through **five review rounds**, and rounds 3, 4 and 5 each found a
+defect in the previous round's *fix*, all on one line of `auth.py` — read the PR comments before
+touching authentication, and read "the failure mode this project keeps hitting" below, which those
+rounds extended.
 
 Fourteen commits, `make fitness` green on each, `PROOFS.md` rows 118–136. What it landed:
 
@@ -60,8 +65,13 @@ Fourteen commits, `make fitness` green on each, `PROOFS.md` rows 118–136. What
   `status` read out of `model_alias`. The duplication itself is forced — ruff S608 flags a column list
   composed from a module constant exactly as it flags one composed from user input.
 
-**#50 is still open** after this: B2 and the live gateway smoke test remain, which is why the PR says
-"Part of #50".
+`PROOFS.md` rows 118–136 landed with it. **#50 itself is still open** — B2 and the live gateway smoke
+test remain, which is why the PR said "Part of #50" rather than `Closes`.
+
+**#84 is open and is a release blocker**: authenticate the rest of the API surface (`POST /v1/sources`,
+the scan endpoint, `POST /v1/runs`), retire `API_ACTOR`, decide whether the reads need a credential, and
+publish the resulting OpenAPI `security`. Steward should not be exposed outside a trusted local
+environment until it is done. It is deliberately *not* a prerequisite for B2.
 
 ## What #82 decided, so you don't relitigate it
 
