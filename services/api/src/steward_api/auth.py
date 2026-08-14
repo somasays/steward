@@ -172,12 +172,37 @@ class ApiKeyRegistry:
         how many characters of a wrong secret were right. `hmac.compare_digest`
         does the same within a single comparison. A dict lookup keyed on the
         secret would be the obvious implementation and leaks both.
+
+        **Compared as bytes, and the two encodings differ on purpose.**
+        `hmac.compare_digest` refuses `str` arguments containing any character
+        above U+007F -- it raises `TypeError` rather than returning False -- so
+        a credential with one non-ASCII byte in it used to abort the loop on its
+        first iteration and leave the route with an unhandled exception. That was
+        three defects at once: a 500 where the contract promises a 401, a
+        constant-time claim this docstring made and the code did not keep, and an
+        oracle telling an anonymous caller whether *any* key is configured (a
+        deployment with none never reaches the comparison and answered 401).
+
+        The encodings are not symmetric because the two strings did not arrive
+        the same way. An ASGI server decodes header bytes as latin-1, so
+        `presented` is one character per wire byte and `latin-1` recovers exactly
+        what the client sent; a configured secret came from the environment,
+        which Python decodes as UTF-8, so `utf-8` recovers exactly what the
+        operator set. For an all-ASCII credential -- every realistic one -- both
+        produce identical bytes; for a non-ASCII one they now agree instead of
+        raising, which also means a secret with a non-ASCII character in it works
+        rather than being accepted at startup and failing every request.
         """
+        if not presented:
+            raise unauthenticated(
+                f"a valid {API_KEY_HEADER} is required to record a review decision"
+            )
+        candidate = presented.encode("latin-1", errors="replace")
         matched: str | None = None
         for identifier, secret in self._secrets:
-            if hmac.compare_digest(presented or "", secret):
+            if hmac.compare_digest(candidate, secret.encode("utf-8")):
                 matched = identifier
-        if matched is None or not presented:
+        if matched is None:
             raise unauthenticated(
                 f"a valid {API_KEY_HEADER} is required to record a review decision"
             )

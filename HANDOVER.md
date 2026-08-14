@@ -35,7 +35,7 @@ repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
 ### Open: PR #83 (#50 steps 7–8)
 
-Eleven commits, `make fitness` green on each, `PROOFS.md` rows 118–132. What it landed:
+Twelve commits, `make fitness` green on each, `PROOFS.md` rows 118–134. What it landed:
 
 - `GET /v1/assets/{id}/classification` (the approved version) and `/classifications` (every version).
 - `GET /v1/reviews/{id}` and `POST /v1/reviews/{id}:approve|:reject`, with the standard `Idempotency-Key`.
@@ -163,6 +163,26 @@ edit, which merged missing and surfaced only when its proof row's command select
 
 > **Compare names, not counts.** A coverage check comparing lengths agrees with itself whenever a model
 > drops one column and invents another — which is the shape a model is most likely to produce.
+
+**#83 added a second, from its independent review — a claim the code did not keep:**
+
+> **A constant-time comparison that raises is not constant-time, and not a comparison.**
+> `hmac.compare_digest` *raises* `TypeError` on a `str` holding any character above U+007F rather
+> than returning False. So a credential with one high byte aborted the "never breaks early" loop on
+> its first iteration and escaped as a 500 — where the contract promises a 401, and where a
+> deployment *with* keys answered 500 while one with *none* answered 401, handing an anonymous
+> caller an oracle. `httpx` refuses to send such a header, so no test using the test client could
+> reach it; it took a raw ASGI probe. The module's own docstring asserted the property the code
+> broke. **Prose in a docstring is not enforcement — if a guarantee matters, something has to fail
+> when it stops holding.**
+
+And a process one, which bit twice in one PR:
+
+> **A count in a proof row is stale the moment you add a test.** Rows 123/124 said "8 passed" and
+> "5 of the file's 8"; the file had grown to 11 by the time review ran. Both times the drift came
+> from editing the suite *after* writing the row. Re-run every row's command against the tip before
+> pushing, not once when the row is written. The same edit-after-claim drift put a scenario in
+> GUARDRAILS' H11 row that `-m acceptance` does not execute.
 
 **#83 added one, and it is a gate blind spot rather than a hollow check:**
 

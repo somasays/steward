@@ -658,3 +658,63 @@ class TestPublishedSecurity:
         for verb in ("approve", "reject"):
             path = f"/v1/reviews/{{proposal_id}}:{verb}"
             assert committed["paths"][path]["post"]["security"] == [{API_KEY_SCHEME_NAME: []}]
+
+
+class TestNonAsciiCredentials:
+    """A credential with a byte above U+007F in it.
+
+    `hmac.compare_digest` *raises* on such a `str` rather than returning False,
+    so the obvious implementation turns a wrong key into an unhandled exception:
+    a 500 where the contract promises a 401, a constant-time guarantee broken by
+    an early abort, and an oracle — a deployment with keys configured answered
+    500 while one with none answered 401, telling an anonymous caller which it
+    was talking to.
+
+    HTTP headers legally carry those bytes and an ASGI server hands them over as
+    latin-1 text, so this is reachable input, not a curiosity. `httpx` refuses to
+    send it, which is exactly why the near-miss parametrization above could not
+    have caught it — these go at the registry, where the comparison happens.
+    """
+
+    @pytest.mark.parametrize(
+        "presented",
+        ["café-secret", "alice-secretÿ", "é", "ключ"],
+        ids=["latin1-accent", "valid-key-plus-high-byte", "single-high-byte", "cyrillic"],
+    )
+    def test_a_non_ascii_credential_is_refused_like_any_other(self, presented: str) -> None:
+        registry = ApiKeyRegistry({REVIEWER: REVIEWER_KEY})
+
+        with pytest.raises(ProblemDetailsError) as raised:
+            registry.principal(presented)
+
+        assert raised.value.problem.status == 401
+        assert raised.value.problem.type == "urn:steward:unauthenticated"
+
+    def test_it_is_refused_identically_whether_or_not_keys_are_configured(self) -> None:
+        """The oracle, closed. These two must be indistinguishable, or an
+        anonymous caller learns whether the deployment has any credentials."""
+        configured = ApiKeyRegistry({REVIEWER: REVIEWER_KEY})
+        empty = ApiKeyRegistry({})
+
+        with pytest.raises(ProblemDetailsError) as with_keys:
+            configured.principal("café-secret")
+        with pytest.raises(ProblemDetailsError) as without_keys:
+            empty.principal("café-secret")
+
+        assert with_keys.value.problem == without_keys.value.problem
+
+    def test_a_secret_that_is_not_ascii_still_authenticates_its_principal(self) -> None:
+        """The positive case, and the second half of the same defect.
+
+        A non-ASCII secret was accepted at startup and then failed *every*
+        request including the correct one — a deployment that authenticated
+        nobody while reporting an internal error. It has to work, not merely
+        fail politely: the presented value arrives latin-1-decoded off the wire
+        and the configured one comes UTF-8-decoded from the environment, so the
+        comparison has to reconcile the two encodings rather than compare text.
+        """
+        secret = "café-secret"
+        registry = ApiKeyRegistry({"chloé": secret})
+        as_sent_over_http = secret.encode("utf-8").decode("latin-1")
+
+        assert registry.principal(as_sent_over_http) == Principal(id="chloé")

@@ -22,6 +22,7 @@ import pytest
 from psycopg import IsolationLevel
 from psycopg.rows import dict_row
 from steward_catalog import EnvSecretResolver, build_scan_source, postgres_inspector, register_source
+from steward_catalog import _classification_sql as _sql
 from steward_catalog.classification import (
     AssetNotClassifiable,
     ClassificationConflict,
@@ -30,6 +31,7 @@ from steward_catalog.classification import (
     ProposalNotPending,
     ReadCommittedDetail,
     StaleProposal,
+    _lock_by_proposal,
     _proposal,
     approve,
     current_classification,
@@ -1140,3 +1142,36 @@ class TestDetailConsistency:
         assert [review.reason for review in reviews] == ["looks right"]
         assert proposal_detail(conn, uuid4()) is None
         conn.rollback()
+
+
+class TestLockOrder:
+    """Decisions take this module's locks in one order: asset first, row second.
+
+    `_lock_by_proposal` reads a proposal only to learn which asset to lock. If
+    that read takes a row lock, the order inverts — a decision would hold a row
+    another decision needs while waiting for the advisory lock that decision
+    holds — and Postgres resolves the cycle by aborting one with
+    `DeadlockDetected`. That is an `OperationalError` no caller catches, so it
+    reaches an API client as a 500: a raw database error in exactly the place
+    this module's advisory lock exists to produce a typed conflict instead.
+    """
+
+    def test_finding_the_asset_does_not_take_a_row_lock(
+        self, conn: QueueConnection, other: QueueConnection, asset_id: UUID
+    ) -> None:
+        """The property, as a bounded wait rather than a deadlock.
+
+        `other` holds the proposal row under `FOR UPDATE`. A lock-free read gets
+        past it and goes on to take the (uncontended) advisory lock; a
+        `FOR UPDATE` read blocks there and, under the timeout, fails. So this
+        passes in two seconds or fails in two — it cannot hang the suite, which
+        is the constraint `TestConcurrency` states.
+        """
+        proposal_id = recorded(conn, asset_id)
+        other.execute(_sql.SELECT_PROPOSAL_FOR_UPDATE, {"id": proposal_id})  # held, uncommitted
+
+        conn.execute("SET LOCAL statement_timeout = '2s'")
+        _lock_by_proposal(conn, proposal_id)  # must not wait on the row lock
+
+        conn.rollback()
+        other.rollback()

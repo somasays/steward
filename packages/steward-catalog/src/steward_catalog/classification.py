@@ -552,8 +552,18 @@ def _lock_by_proposal(conn: QueueConnection, proposal_id: UUID) -> None:
     Read without a lock first, purely to learn which asset to lock -- the
     authoritative read happens afterwards, under it. A decision made on this
     first read would be exactly the race the lock exists to remove.
+
+    **Without a lock, and that is load-bearing.** Row-locking here inverts this
+    module's lock order: `approve` takes the advisory lock first and only then
+    row-locks the incumbent it is about to demote, so a decision that grabbed a
+    row lock *before* the advisory lock could hold what another decision needs
+    while waiting for what that decision holds. Postgres resolves that by
+    aborting one of them with `DeadlockDetected` -- an `OperationalError` no
+    caller catches, so it reaches an API client as a 500. That is precisely the
+    raw-database-error-where-a-decision-belongs failure the advisory lock exists
+    to prevent (see this module's header).
     """
-    row = _one(conn, _sql.SELECT_PROPOSAL_FOR_UPDATE, {"id": proposal_id})
+    row = _one(conn, _sql.SELECT_PROPOSAL, {"id": proposal_id})
     if row is None:
         raise LookupError(f"no such proposal: {proposal_id}")
     _lock(conn, _proposal(row).asset_id)
