@@ -1,0 +1,49 @@
+# The LiteLLM proxy, pinned to its own runtime (#50 preflight).
+#
+# Why a container and not `uv run litellm`: sharing Steward's environment makes
+# the gateway's dependencies Steward's problem. Running it that way failed
+# outright — the proxy imports `fastapi.dependencies.utils.get_flat_dependant`,
+# which the FastAPI this workspace resolves does not have — and "the gateway and
+# the API service must agree on a FastAPI version" is not a constraint either of
+# them should carry. The proxy is a *deployed component* with its own release
+# cadence, so it gets its own pinned artifact here exactly as it would in the
+# cluster.
+#
+# Pinned by digest, not by tag. `main-stable` moves; a preflight that silently
+# changed proxy version between two runs would make a streaming-protocol
+# regression look like a model regression.
+#
+#   ghcr.io/berriai/litellm:main-stable
+#   @sha256:154e23bb5f31b1f10e16392a8ef299bd2cde08de3a64a6849002cfcc25ce3c63
+#
+# **This is the preflight topology, not the deployed one.** It routes to Ollama on
+# the host so the streaming tool-call path can be exercised on a laptop. The
+# evidence of record for #50 runs the same proxy against **vLLM**; only the
+# `api_base` and the model change, which is the point of pinning the proxy
+# separately from what it routes to.
+#
+#   docker compose -f evals/config/docker-compose.preflight.yml up -d
+#   export STEWARD_LITELLM_CONFIG=evals/config/litellm.preflight-ollama.yaml
+#   export STEWARD_LLM_APPROVED_ENDPOINTS=http://host.docker.internal:11434/v1
+#   export STEWARD_LLM_PROXY_URL=http://localhost:4000
+#   export STEWARD_LLM_PROXY_KEY=preflight-not-a-secret
+#
+# The approved-endpoints value names where the *proxy* sends prompts, which is
+# what the allowlist governs (I15) — Steward itself only ever talks to the proxy.
+# It must match the `api_base` in the config, or Steward refuses to start.
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm@sha256:154e23bb5f31b1f10e16392a8ef299bd2cde08de3a64a6849002cfcc25ce3c63
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--detailed_debug"]
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./litellm.preflight-ollama.yaml:/etc/litellm/config.yaml:ro
+    environment:
+      # Ollama ignores the key; the transport requires one, and a proxy that
+      # accepted an empty credential would be a worse preflight than a real one.
+      STEWARD_LOCAL_MODEL_KEY: preflight-not-a-secret
+      LITELLM_MASTER_KEY: preflight-not-a-secret
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
