@@ -1,6 +1,6 @@
 {
   "version": "classification-fixture@v1",
-  "description": "Labelled columns for B2 (GUARDRAILS.md Tier B, issue #50). Each table is one ClassificationRequest; each column carries the labels a correct classifier must produce. Hard negatives are the point: a fixture of obvious positives measures nothing a regex could not do.",
+  "description": "Labelled columns for B2 (GUARDRAILS.md Tier B, issue #50). Each table is one ClassificationRequest; each column carries the labels a correct classifier must produce. Hard negatives are the point: a fixture of obvious positives measures nothing a regex could not do. Expected labels express Steward's product policy as the prompt states it; where a fixture and the prompt disagree, the fixture is wrong until the policy changes.",
   "tables": [
     {
       "name": "customers",
@@ -12,8 +12,16 @@
           "semantic_type": "email",
           "null_ratio": "0.000000",
           "distinct_ratio": "0.998000",
-          "masked_samples": [{"masked": "a***@e***.***", "semantic_type": "email", "length": 22}],
-          "expected": ["pii"],
+          "masked_samples": [
+            {
+              "masked": "a***@e***.***",
+              "semantic_type": "email",
+              "length": 22
+            }
+          ],
+          "expected": [
+            "pii"
+          ],
           "why": "a direct contact identifier; name, format and semantic type all agree"
         },
         {
@@ -22,7 +30,13 @@
           "semantic_type": "text",
           "null_ratio": "0.000000",
           "distinct_ratio": "0.000180",
-          "masked_samples": [{"masked": "e*******.***", "semantic_type": "text", "length": 11}],
+          "masked_samples": [
+            {
+              "masked": "e*******.***",
+              "semantic_type": "text",
+              "length": 11
+            }
+          ],
           "expected": [],
           "why": "HARD NEGATIVE. The name contains 'email' and the values look like domains, but 9 distinct values over 48k rows cannot re-identify anyone. Low cardinality is the evidence; a classifier keying on the name alone labels this pii."
         },
@@ -32,9 +46,15 @@
           "semantic_type": "text",
           "null_ratio": "0.000000",
           "distinct_ratio": "1.000000",
-          "masked_samples": [{"masked": "****************", "semantic_type": "text", "length": 64}],
+          "masked_samples": [
+            {
+              "masked": "****************",
+              "semantic_type": "text",
+              "length": 64
+            }
+          ],
           "expected": [],
-          "why": "HARD NEGATIVE. 'ssn' in the name, but a 64-character opaque digest at full cardinality is a hash, not a national identifier. Decided from name, length and shape together — the semantic type deliberately says only 'text' and gives nothing away."
+          "why": "HARD NEGATIVE. 'ssn' in the name, but a 64-character opaque digest at full cardinality is a hash, not a national identifier. Decided from name, length and shape together \u2014 the semantic type deliberately says only 'text' and gives nothing away."
         },
         {
           "name": "full_name",
@@ -42,8 +62,16 @@
           "semantic_type": "text",
           "null_ratio": "0.012000",
           "distinct_ratio": "0.940000",
-          "masked_samples": [{"masked": "A*** B****", "semantic_type": "text", "length": 11}],
-          "expected": ["pii"],
+          "masked_samples": [
+            {
+              "masked": "A*** B****",
+              "semantic_type": "text",
+              "length": 11
+            }
+          ],
+          "expected": [
+            "pii"
+          ],
           "why": "a person's name; no semantic type identifies it, so it must be read from the name and the masked shape"
         },
         {
@@ -52,7 +80,13 @@
           "semantic_type": "text",
           "null_ratio": "0.030000",
           "distinct_ratio": "0.000100",
-          "masked_samples": [{"masked": "o******", "semantic_type": "text", "length": 7}],
+          "masked_samples": [
+            {
+              "masked": "o******",
+              "semantic_type": "text",
+              "length": 7
+            }
+          ],
           "expected": [],
           "why": "a low-cardinality enum; nothing about a person"
         }
@@ -68,8 +102,17 @@
           "semantic_type": "credit_card",
           "null_ratio": "0.000000",
           "distinct_ratio": "0.310000",
-          "masked_samples": [{"masked": "****-****-****-****", "semantic_type": "credit_card", "length": 19}],
-          "expected": ["financial", "pii"],
+          "masked_samples": [
+            {
+              "masked": "****-****-****-****",
+              "semantic_type": "credit_card",
+              "length": 19
+            }
+          ],
+          "expected": [
+            "financial",
+            "pii"
+          ],
           "why": "MULTI-LABEL. A payment instrument and, tied to a cardholder, re-identifying. A classifier forced to pick one label loses information the schema allows it to keep."
         },
         {
@@ -79,7 +122,9 @@
           "null_ratio": "0.000000",
           "distinct_ratio": "0.220000",
           "masked_samples": [],
-          "expected": ["financial"],
+          "expected": [
+            "financial"
+          ],
           "why": "a transaction amount tied to a party"
         },
         {
@@ -88,7 +133,13 @@
           "semantic_type": "text",
           "null_ratio": "0.000000",
           "distinct_ratio": "0.000050",
-          "masked_samples": [{"masked": "U**", "semantic_type": "text", "length": 3}],
+          "masked_samples": [
+            {
+              "masked": "U**",
+              "semantic_type": "text",
+              "length": 3
+            }
+          ],
           "expected": [],
           "why": "HARD NEGATIVE. Sits in a financial table beside financial columns, but a currency code is not itself financial data about anyone. Guilt by association is the error this catches."
         },
@@ -98,9 +149,17 @@
           "semantic_type": "credit_card",
           "null_ratio": "0.000000",
           "distinct_ratio": "0.000040",
-          "masked_samples": [{"masked": "****-****-****-****", "semantic_type": "credit_card", "length": 19}],
-          "expected": [],
-          "why": "HARD NEGATIVE. Synthetic data: the semantic type says credit_card and the shape matches, but 5 distinct values across 121k rows in a column named 'test_' is a fixture, not a customer's card. The strongest signal (semantic_type) points the wrong way on purpose."
+          "masked_samples": [
+            {
+              "masked": "****-****-****-****",
+              "semantic_type": "credit_card",
+              "length": 19
+            }
+          ],
+          "expected": [
+            "financial"
+          ],
+          "why": "POLICY. Steward classifies what a column is *for*, not whether today's sample happens to be synthetic \u2014 the prompt says so in as many words ('values that are obviously placeholder do not make a column non-sensitive; the column will hold real values in production'). So a column named test_card_number holding card-shaped values is financial. It is not pii: a fixture card is tied to no cardholder, which is what distinguishes it from card_number above. An earlier version of this fixture expected 'none' here and would have scored a model that correctly followed Steward's own prompt as a false positive."
         },
         {
           "name": "settled_at",
@@ -111,6 +170,22 @@
           "masked_samples": [],
           "expected": [],
           "why": "a timestamp; not sensitive on its own"
+        },
+        {
+          "name": "synthetic_row_id",
+          "data_type": "text",
+          "semantic_type": "uuid",
+          "null_ratio": "0.000000",
+          "distinct_ratio": "1.000000",
+          "masked_samples": [
+            {
+              "masked": "********-****-****-****-************",
+              "semantic_type": "uuid",
+              "length": 36
+            }
+          ],
+          "expected": [],
+          "why": "HARD NEGATIVE, replacing the synthetic-data case above. A surrogate identifier with no meaning outside this dataset: full cardinality, uuid-shaped, and it re-identifies nobody because it refers to nothing beyond a row. The prompt draws exactly this line \u2014 'a surrogate key with no meaning outside this database is not pii' \u2014 so the negative tests a rule Steward actually holds, rather than one it contradicts."
         }
       ]
     },
@@ -124,8 +199,17 @@
           "semantic_type": "text",
           "null_ratio": "0.000000",
           "distinct_ratio": "0.720000",
-          "masked_samples": [{"masked": "M*******", "semantic_type": "text", "length": 8}],
-          "expected": ["phi", "pii"],
+          "masked_samples": [
+            {
+              "masked": "M*******",
+              "semantic_type": "text",
+              "length": 8
+            }
+          ],
+          "expected": [
+            "phi",
+            "pii"
+          ],
           "why": "MULTI-LABEL. A medical record number identifies a patient in a clinical context: a provider identifier and a person identifier at once."
         },
         {
@@ -134,8 +218,16 @@
           "semantic_type": "text",
           "null_ratio": "0.040000",
           "distinct_ratio": "0.019000",
-          "masked_samples": [{"masked": "E**.*", "semantic_type": "text", "length": 5}],
-          "expected": ["phi"],
+          "masked_samples": [
+            {
+              "masked": "E**.*",
+              "semantic_type": "text",
+              "length": 5
+            }
+          ],
+          "expected": [
+            "phi"
+          ],
           "why": "a diagnosis about an identifiable person; phi without being pii on its own"
         },
         {
@@ -144,7 +236,13 @@
           "semantic_type": "text",
           "null_ratio": "0.000000",
           "distinct_ratio": "0.002000",
-          "masked_samples": [{"masked": "C**", "semantic_type": "text", "length": 3}],
+          "masked_samples": [
+            {
+              "masked": "C**",
+              "semantic_type": "text",
+              "length": 3
+            }
+          ],
           "expected": [],
           "why": "HARD NEGATIVE. A clinical table's low-cardinality organisational code. Sits beside phi and is not phi."
         },

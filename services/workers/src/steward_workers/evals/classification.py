@@ -52,6 +52,8 @@ __all__ = [
     "CLASSIFICATION_SUITE",
     "EvalReport",
     "NoFixture",
+    "EvaluationInfrastructureError",
+    "EvaluationResult",
     "NoGatewayConfigured",
     "Suite",
     "run_classification",
@@ -135,21 +137,25 @@ verdicts is the honest response to that; one run plus a claim of determinism is
 not.
 """
 
-INFRASTRUCTURE_SIGNATURES = (
-    "connection", "timeout", "timed out", "refused", "unreachable",
-    "502", "503", "504", "bad gateway", "temporarily unavailable",
-)
-"""What makes a failure the network's rather than the model's.
+class EvaluationInfrastructureError(RuntimeError):
+    """The run could not reach a working model. **The only retryable failure.**
 
-Matched on the message because the seam collapses both into `ClassifierFailed`:
-`steward-catalog` may not import `steward-agents`, so a refused connection and a
-model that would not answer arrive as the same type (`classify_handler`). This is
-a heuristic and is deliberately biased: anything unmatched is treated as a
-**result**, so an unrecognised infrastructure blip costs a failed eval, while a
-misread quality failure would cost a retry #50 explicitly forbids ("a
-quality-threshold failure is not retried until green"). The safe direction is the
-one that never retries a real finding.
-"""
+    Raised by the gateway harness alone, from failure *types* it can name —
+    a refused connection, a timeout, an unavailable endpoint. Never inferred
+    from the text of an exception: a message-matching rule ("did the error
+    mention 'timeout'?") makes "a threshold miss is never retried" a property of
+    string formatting, and a model whose refusal happened to contain the word
+    would be re-rolled until it read better. #50 forbids exactly that.
+    """
+
+
+class EvaluationResult(RuntimeError):
+    """The run completed and the answer was unusable. **Never retryable.**
+
+    Malformed output, an invalid citation, a missed threshold — these are what
+    the evaluation *found*. Retrying them is not evaluation; it is sampling until
+    the number is acceptable.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +165,10 @@ class RunOutcome:
     index: int
     scores: tuple[TableScore, ...]
     infrastructure_error: str | None = None
+    result_error: str | None = None
+    """A completed run whose answer was unusable. Separate from
+    `infrastructure_error` because only one of the two may be retried, and a
+    single field would make that distinction a matter of how it was spelled."""
 
     @property
     def passed(self) -> bool:
@@ -168,6 +178,8 @@ class RunOutcome:
     def reasons(self) -> tuple[str, ...]:
         if self.infrastructure_error is not None:
             return (f"infrastructure: {self.infrastructure_error}",)
+        if self.result_error is not None:
+            return (f"result: {self.result_error}",)
         outcomes = tuple(o for score in self.scores for o in score.outcomes)
         failures: list[str] = []
         for score in self.scores:
@@ -228,10 +240,14 @@ def _one_run(
     for attempt in (1, 2):
         try:
             scores = tuple(_classify_and_score(gateway, table) for table in requests)
-        except _Infrastructure as exc:
+        except EvaluationInfrastructureError as exc:
             if attempt == 2:
                 return RunOutcome(index=index, scores=(), infrastructure_error=str(exc))
             continue
+        except EvaluationResult as exc:
+            # A completed run with an unusable answer. Not retried, and not
+            # dressed up as infrastructure: it is this run's finding.
+            return RunOutcome(index=index, scores=(), result_error=str(exc))
         return RunOutcome(index=index, scores=scores)
     raise AssertionError("unreachable")  # pragma: no cover
 
@@ -282,10 +298,6 @@ class _FixtureTable:
     name: str
     profile: TableProfile
     expected: dict[str, frozenset[SensitivityLabel]]
-
-
-class _Infrastructure(RuntimeError):
-    """A failure of the network rather than of the model. Retried once."""
 
 
 def _request(table: FixtureTableSpec) -> _FixtureTable:
