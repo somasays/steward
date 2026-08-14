@@ -165,18 +165,41 @@ Branch **`m1/50-b2-and-smoke`** (pushed, `make fitness` green on every commit) c
 
    Fixture is now 15 columns: 7 sensitive, 8 negative, 6 hard negatives.
 
+### The retry policy, as characterised against the real proxy
+
+- Connection and streaming transport failures **retry**.
+- Completed HTTP failures (any status >= 400) **do not retry**.
+- **No message text influences classification** — only failure types found in the `__cause__` chain.
+- The conservative direction cannot inflate B2 quality: a misread infrastructure blip fails the
+  evaluation, and no quality failure can be retried into a better answer.
+
+One negative result is worth keeping. A first attempt at the 502/503 shape used a *stub* HTTP server
+and reported `ReadError` → retryable, which is the **opposite** of what the real transport does: the
+stub's non-streaming body broke the stream read, so it exercised a transport path rather than a
+completed response. Taking that at face value would have recorded 5xx as already-retryable. Classify
+failures from the real transport path; an approximate server fixture answers a different question.
+
 ### Then, in order
 
-1. Three preflight runs to prove the harness executes. **Label the artifacts non-release** — Ollama
-   is a plumbing preflight and its scores characterise a model no deployment runs.
-2. Inspect coverage, metrics, evidence validation, the disagreement output and retry behaviour.
-3. Run against pinned LiteLLM → **vLLM**. vLLM is not an interchangeable backend: its chat template,
-   tool parser, streamed frames, usage reporting and model revision are what the release evidence
-   validates.
-4. Require pinned provenance and **independently** passing thresholds on all three runs — recall
-   ≥ 0.95, precision ≥ 0.90, evidence validity 100%, exact coverage, no infrastructure error. No
-   averaging, no majority vote.
-5. Commit the evidence of record, and only then close #50.
+1. **Run the three preflight evaluations** (`uv run steward evals run classification` against the
+   pinned LiteLLM → Ollama preflight). The harness has never executed end to end — expect defects.
+2. **Confirm every artifact is explicitly non-release.** Ollama scores characterise a model no
+   deployment runs; an artifact that does not say so will eventually be read as if it did.
+3. **Inspect each independent verdict**, coverage, evidence validity, metrics, retries and
+   column-level disagreements. Read the disagreement output specifically: it is the part no single
+   run can show, and the reason #50 asks for three.
+4. **Resolve harness defects only.** Do **not** tune the prompt or the fixture in response to
+   preflight scores without recording a product/evaluation decision first. Changing the expected
+   labels until the model agrees with them is how an eval stops measuring anything — and this
+   fixture has already had one expectation corrected *on policy grounds* (`test_card_number`), which
+   is the legitimate version of that move: the prompt was the authority, not the score.
+5. **Run the same gate against pinned LiteLLM → vLLM.** Not an interchangeable backend: its chat
+   template, tool parser, streamed frames, usage reporting and model revision are what the release
+   evidence validates.
+6. **Commit immutable provenance and all three independently passing release verdicts** — pinned
+   proxy image digest, vLLM image and model revision, gateway config digest, fixture version, prompt
+   version, per-run metrics and per-column disagreement.
+7. **Close #50 only then.**
 
 **#84** (authenticate the rest of the API surface) is a release blocker before external exposure, and
 is deliberately not a prerequisite for B2. **#85** (a failed checkpoint save replaces the agent
