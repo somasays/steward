@@ -35,7 +35,7 @@ repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
 ### Open: PR #83 (#50 steps 7–8)
 
-Eight commits, `make fitness` green on each, `PROOFS.md` rows 118–126. What it landed:
+Ten commits, `make fitness` green on each, `PROOFS.md` rows 118–131. What it landed:
 
 - `GET /v1/assets/{id}/classification` (the approved version) and `/classifications` (every version).
 - `GET /v1/reviews/{id}` and `POST /v1/reviews/{id}:approve|:reject`, with the standard `Idempotency-Key`.
@@ -43,6 +43,16 @@ Eight commits, `make fitness` green on each, `PROOFS.md` rows 118–126. What it
 - The acceptance scenario: profile → agent → `pending_review` → approval → published version, against real
   PostgreSQL. The model is the only stub, and it names no column — it classifies whatever the real
   profiler put in the request.
+- **API-key authentication on the two decision endpoints**, added after review. `X-API-Key` names a
+  principal from `STEWARD_API_KEYS`, and that principal becomes the `Actor` — the repository refuses a
+  caller-supplied actor precisely so the credential is the only thing that can say who approved a
+  classification, and an unauthenticated endpoint recording a constant `human:api` made that whole chain
+  terminate in a fiction. A key can only produce a *human* principal (a policy one would let anything
+  holding a secret record an automatic approval). Reads and the older mutations are still
+  unauthenticated — a real gap, stated in SPEC §8, not closed here.
+- **`GET /v1/reviews/{id}` reads from one snapshot.** Its two statements under the default READ COMMITTED
+  took two, so a decision committing between them returned `pending_review` beside an approval. The
+  repository operation now refuses a transaction that cannot answer it.
 - One refactor, in its own commit: `classification.py` decoded rows **positionally** across seven
   duplicated column lists. Now by name (`dict_row`), so a drifted projection is a `KeyError` rather than
   `status` read out of `model_alias`. The duplication itself is forced — ruff S608 flags a column list
