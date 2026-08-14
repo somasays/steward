@@ -862,6 +862,14 @@
         "title": "SourceEngine",
         "type": "string"
       }
+    },
+    "securitySchemes": {
+      "StewardApiKey": {
+        "description": "A credential naming a principal configured in STEWARD_API_KEYS. Required by the review decision endpoints, which record the principal it proves as the actor on the decision and its audit row.",
+        "in": "header",
+        "name": "X-API-Key",
+        "type": "apiKey"
+      }
     }
   },
   "info": {
@@ -1278,22 +1286,6 @@
               ],
               "title": "Idempotency-Key"
             }
-          },
-          {
-            "in": "header",
-            "name": "X-API-Key",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
           }
         ],
         "requestBody": {
@@ -1368,6 +1360,11 @@
             "description": "Unexpected server error"
           }
         },
+        "security": [
+          {
+            "StewardApiKey": []
+          }
+        ],
         "summary": "Approve Review",
         "tags": [
           "reviews"
@@ -1404,22 +1401,6 @@
               ],
               "title": "Idempotency-Key"
             }
-          },
-          {
-            "in": "header",
-            "name": "X-API-Key",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
           }
         ],
         "requestBody": {
@@ -1494,6 +1475,11 @@
             "description": "Unexpected server error"
           }
         },
+        "security": [
+          {
+            "StewardApiKey": []
+          }
+        ],
         "summary": "Reject Review",
         "tags": [
           "reviews"

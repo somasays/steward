@@ -40,7 +40,7 @@ select = ["E", "F", "I", "UP", "B", "S608", "TID251"]
 # variable does not exist, and silently degrades the parameter into a query field.
 # Scoped to `Depends` alone so B008 keeps doing its real job everywhere else.
 [tool.ruff.lint.flake8-bugbear]
-extend-immutable-calls = ["fastapi.Depends"]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Security"]
 
 [tool.ruff.lint.per-file-ignores]
 # scripts/fitness stays stdlib-only for Python 3.9+ (GUARDRAILS.md build-vs-buy rule) --
