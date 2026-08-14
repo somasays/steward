@@ -35,7 +35,7 @@ repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
 ### Open: PR #83 (#50 steps 7–8)
 
-Twelve commits, `make fitness` green on each, `PROOFS.md` rows 118–134. What it landed:
+Thirteen commits, `make fitness` green on each, `PROOFS.md` rows 118–135. What it landed:
 
 - `GET /v1/assets/{id}/classification` (the approved version) and `/classifications` (every version).
 - `GET /v1/reviews/{id}` and `POST /v1/reviews/{id}:approve|:reject`, with the standard `Idempotency-Key`.
@@ -175,6 +175,14 @@ edit, which merged missing and surfaced only when its proof row's command select
 > reach it; it took a raw ASGI probe. The module's own docstring asserted the property the code
 > broke. **Prose in a docstring is not enforcement — if a guarantee matters, something has to fail
 > when it stops holding.**
+
+> **A fix for a crash can be worse than the crash.** The repair for the above encoded the credential
+> with `errors="replace"`, which maps every non-Latin-1 character to `?` — so `"ключ"` became
+> `b"????"` and authenticated a principal whose secret was literally `"????"`. The crash failed
+> closed; the fix authenticated the wrong person. Caught by the *second* bounded review of the delta,
+> not the first. **When a repair touches a comparison that decides identity, ask what it now treats
+> as equal**, and give the fix its own adversarial pass rather than assuming a fix inherits the
+> scrutiny the bug got.
 
 And a process one, which bit twice in one PR:
 
