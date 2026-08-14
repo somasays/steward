@@ -35,7 +35,7 @@ repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
 ### Open: PR #83 (#50 steps 7–8)
 
-Ten commits, `make fitness` green on each, `PROOFS.md` rows 118–131. What it landed:
+Eleven commits, `make fitness` green on each, `PROOFS.md` rows 118–132. What it landed:
 
 - `GET /v1/assets/{id}/classification` (the approved version) and `/classifications` (every version).
 - `GET /v1/reviews/{id}` and `POST /v1/reviews/{id}:approve|:reject`, with the standard `Idempotency-Key`.
@@ -48,8 +48,10 @@ Ten commits, `make fitness` green on each, `PROOFS.md` rows 118–131. What it l
   caller-supplied actor precisely so the credential is the only thing that can say who approved a
   classification, and an unauthenticated endpoint recording a constant `human:api` made that whole chain
   terminate in a fiction. A key can only produce a *human* principal (a policy one would let anything
-  holding a secret record an automatic approval). Reads and the older mutations are still
-  unauthenticated — a real gap, stated in SPEC §8, not closed here.
+  holding a secret record an automatic approval). The credential is published as an OpenAPI **security
+  scheme**, not an optional header — invisible at runtime, decisive in the contract, since SPEC §8
+  generates the SDK from it. Reads and the older mutations are still unauthenticated — a real gap,
+  stated in SPEC §8, not closed here.
 - **`GET /v1/reviews/{id}` reads from one snapshot.** Its two statements under the default READ COMMITTED
   took two, so a decision committing between them returned `pending_review` beside an approval. The
   repository operation now refuses a transaction that cannot answer it.

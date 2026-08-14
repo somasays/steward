@@ -485,7 +485,13 @@ fiction — every reviewer becomes the same person, and "nothing publishes witho
 human review" degrades to "nothing publishes without an HTTP request". So
 `POST /v1/reviews/{id}:approve|:reject` require an `X-API-Key` naming a
 principal configured in `STEWARD_API_KEYS` (`id:secret` pairs), and that
-principal becomes the `Actor`. A key can only ever produce a **human** principal:
+principal becomes the `Actor`. The credential is published as an OpenAPI
+**security scheme** (`StewardApiKey`, `apiKey` in header) with an operation-level
+`security` requirement on both decisions and on neither read — not as an ordinary
+header parameter. That distinction is invisible at runtime and decisive in the
+contract: this spec generates the SDK's types, and a key described as an optional
+header describes an *unsecured* operation with a spare field, so a generated
+client offers nowhere to configure a key and sends none. A key can only ever produce a **human** principal:
 a `policy` one would let anything holding a secret record an automatic approval,
 which §3.3 requires to resolve to a configured policy. No credential and an
 unrecognised credential are the same 401 with the same sentence, since telling

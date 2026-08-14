@@ -45,9 +45,9 @@ import hmac
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Annotated
 
-from fastapi import Header
+from fastapi import Security
+from fastapi.security import APIKeyHeader
 from steward_queue import Actor, ActorKind
 
 from steward_api.problem_details import API_KEY_HEADER, unauthenticated
@@ -55,6 +55,7 @@ from steward_api.problem_details import API_KEY_HEADER, unauthenticated
 __all__ = [
     "API_KEYS_ENV",
     "API_KEY_HEADER",
+    "API_KEY_SCHEME_NAME",
     "ApiKeyRegistry",
     "MalformedApiKeys",
     "Principal",
@@ -183,6 +184,42 @@ class ApiKeyRegistry:
         return Principal(id=matched)
 
 
+API_KEY_SCHEME_NAME = "StewardApiKey"
+"""What the published contract calls this credential.
+
+The name a generated client sees, so it is stable and descriptive rather than
+FastAPI's default (the class name, `APIKeyHeader`).
+"""
+
+API_KEY_SCHEME = APIKeyHeader(
+    name=API_KEY_HEADER,
+    scheme_name=API_KEY_SCHEME_NAME,
+    auto_error=False,
+    description=(
+        "A credential naming a principal configured in STEWARD_API_KEYS. Required by "
+        "the review decision endpoints, which record the principal it proves as the "
+        "actor on the decision and its audit row."
+    ),
+)
+"""The credential as a *security scheme*, not as a header parameter.
+
+The distinction is the whole reason this exists rather than a plain `Header`.
+Both read the same request header and both produce the same 401 at runtime, but
+only this one is published as `securitySchemes` with an operation-level
+`security` requirement — and SPEC.md §8 generates the SDK's types from that
+document. A credential published as an ordinary optional header describes an
+*unsecured* operation with a spare parameter: generated clients offer no place
+to configure a key and send none, and every caller discovers the requirement by
+receiving a 401.
+
+`auto_error=False` because FastAPI's own error for a missing key is a bare 403
+with a `detail` string, which would bypass both the RFC 9457 shape this API
+serves and the deliberate indistinguishability of "no key" from "wrong key".
+Registering the scheme and owning the failure are separable, and this takes the
+first without the second.
+"""
+
+
 def authenticator(registry: ApiKeyRegistry) -> Callable[[str | None], Principal]:
     """A FastAPI dependency that resolves the request's credential.
 
@@ -190,11 +227,13 @@ def authenticator(registry: ApiKeyRegistry) -> Callable[[str | None], Principal]
     reason every other seam in this service is a closure: the dependency's own
     dependency is explicit and typed, with no `Any` escape hatch to read
     configuration back out of a request.
+
+    The scheme is a `Security` sub-dependency rather than a `Header` parameter so
+    the requirement reaches the published contract; FastAPI propagates a
+    sub-dependency's security requirement to every operation that depends on it.
     """
 
-    def authenticate(
-        api_key: Annotated[str | None, Header(alias=API_KEY_HEADER)] = None,
-    ) -> Principal:
-        return registry.principal(api_key)
+    def authenticate(presented: str | None = Security(API_KEY_SCHEME)) -> Principal:
+        return registry.principal(presented)
 
     return authenticate

@@ -25,15 +25,23 @@ risk, so every negative below has a positive beside it: a stub that raised on
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from steward_api.app import create_app
-from steward_api.auth import ApiKeyRegistry, MalformedApiKeys, Principal
+from steward_api.auth import (
+    API_KEY_SCHEME_NAME,
+    ApiKeyRegistry,
+    MalformedApiKeys,
+    Principal,
+)
 from steward_api.catalog import (
     AssetNotFound,
     InMemoryCatalogStore,
@@ -78,6 +86,9 @@ REVIEWER, REVIEWER_KEY = "alice", "alice-secret-value"
 SECOND_REVIEWER, SECOND_KEY = "bob", "bob-secret-value"
 KEYS = ApiKeyRegistry({REVIEWER: REVIEWER_KEY, SECOND_REVIEWER: SECOND_KEY})
 AUTH = {API_KEY_HEADER: REVIEWER_KEY}
+
+OPENAPI_SNAPSHOT = Path(__file__).resolve().parents[3] / "contracts" / "openapi.json"
+"""The committed contract, so a stale snapshot is a failure here too."""
 
 
 def a_proposal(asset_id: UUID = ASSET_ID) -> ClassificationProposal:
@@ -578,3 +589,72 @@ class TestKeyConfiguration:
             ApiKeyRegistry.from_env("this-entry-has-no-separator-and-is-secret")
 
         assert "this-entry-has-no-separator-and-is-secret" not in str(raised.value)
+
+
+class TestPublishedSecurity:
+    """The credential has to be *published* as a credential, not just enforced.
+
+    SPEC §8 generates the SDK's types from `contracts/openapi.json`, so what the
+    document says about authentication is what every generated client believes.
+    A key described as an ordinary optional header describes an unsecured
+    operation with a spare parameter: the client offers nowhere to configure a
+    key, sends none, and every caller finds out by receiving a 401. Runtime was
+    already correct when this was wrong, which is exactly why it needs its own
+    test — no behavioural assertion could have caught it.
+    """
+
+    @pytest.fixture
+    def schema(self) -> dict[str, Any]:
+        return dict(create_app(api_keys=KEYS).openapi())
+
+    def test_the_credential_is_published_as_a_security_scheme(
+        self, schema: dict[str, Any]
+    ) -> None:
+        schemes = schema["components"]["securitySchemes"]
+
+        scheme = schemes[API_KEY_SCHEME_NAME]
+        assert (scheme["type"], scheme["in"], scheme["name"]) == ("apiKey", "header", API_KEY_HEADER)
+        assert scheme["description"], "a generated client shows this to whoever configures the key"
+
+    @pytest.mark.parametrize("verb", ["approve", "reject"])
+    def test_both_decision_operations_require_it(self, schema: dict[str, Any], verb: str) -> None:
+        operation = schema["paths"][f"/v1/reviews/{{proposal_id}}:{verb}"]["post"]
+
+        assert operation["security"] == [{API_KEY_SCHEME_NAME: []}]
+
+    @pytest.mark.parametrize("verb", ["approve", "reject"])
+    def test_the_credential_is_not_also_an_ordinary_parameter(
+        self, schema: dict[str, Any], verb: str
+    ) -> None:
+        """Published twice would be worse than published once wrongly: a
+        generated client would send the key as a security credential *and*
+        expose a nullable header field for it."""
+        operation = schema["paths"][f"/v1/reviews/{{proposal_id}}:{verb}"]["post"]
+
+        assert API_KEY_HEADER not in [p["name"] for p in operation.get("parameters", [])]
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/reviews/{proposal_id}",
+            "/v1/assets/{asset_id}/classification",
+            "/v1/assets/{asset_id}/classifications",
+        ],
+        ids=["review-detail", "current-classification", "history"],
+    )
+    def test_the_reads_do_not_claim_to_require_one(
+        self, schema: dict[str, Any], path: str
+    ) -> None:
+        """The positive case's opposite, and the one that stops this test class
+        from passing against an app that secured everything indiscriminately."""
+        assert "security" not in schema["paths"][path]["get"]
+
+    def test_the_committed_contract_says_the_same(self, schema: dict[str, Any]) -> None:
+        """S6 diffs the snapshot for compatibility; this asserts the snapshot is
+        not stale in the one respect a client's authentication depends on."""
+        committed = json.loads(OPENAPI_SNAPSHOT.read_text())
+
+        assert committed["components"]["securitySchemes"] == schema["components"]["securitySchemes"]
+        for verb in ("approve", "reject"):
+            path = f"/v1/reviews/{{proposal_id}}:{verb}"
+            assert committed["paths"][path]["post"]["security"] == [{API_KEY_SCHEME_NAME: []}]
