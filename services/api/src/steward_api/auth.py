@@ -167,46 +167,72 @@ class ApiKeyRegistry:
     def principal(self, presented: str | None) -> Principal:
         """The principal `presented` proves, or a 401 that describes neither.
 
-        The loop compares against *every* configured secret and never breaks
-        early, so the work done does not depend on which principal matched or on
-        how many characters of a wrong secret were right. `hmac.compare_digest`
-        does the same within a single comparison. A dict lookup keyed on the
-        secret would be the obvious implementation and leaks both.
+        Every configured secret is compared, with `hmac.compare_digest`, and the
+        loop does not stop early — so neither the answer nor the work done
+        depends on which principal matched or on how much of a wrong secret was
+        right. A dict lookup keyed on the secret would be the obvious
+        implementation and leaks both.
 
-        **Compared as bytes, and the two encodings differ on purpose.**
-        `hmac.compare_digest` refuses `str` arguments containing any character
-        above U+007F -- it raises `TypeError` rather than returning False -- so
-        a credential with one non-ASCII byte in it used to abort the loop on its
-        first iteration and leave the route with an unhandled exception. That was
-        three defects at once: a 500 where the contract promises a 401, a
-        constant-time claim this docstring made and the code did not keep, and an
-        oracle telling an anonymous caller whether *any* key is configured (a
-        deployment with none never reaches the comparison and answered 401).
+        **Every rejection takes the same path.** No credential, an empty one, one
+        that is not encodable, and an ordinary wrong one all reach the same loop
+        and perform the same number of comparisons against the same fixed
+        sentinel. An early return for the missing case would have made "you sent
+        nothing" measurably cheaper than "you sent something wrong".
 
-        The encodings are not symmetric because the two strings did not arrive
-        the same way. An ASGI server decodes header bytes as latin-1, so
-        `presented` is one character per wire byte and `latin-1` recovers exactly
-        what the client sent; a configured secret came from the environment,
-        which Python decodes as UTF-8, so `utf-8` recovers exactly what the
-        operator set. For an all-ASCII credential -- every realistic one -- both
-        produce identical bytes; for a non-ASCII one they now agree instead of
-        raising, which also means a secret with a non-ASCII character in it works
-        rather than being accepted at startup and failing every request.
+        **The conversion to bytes is strict, and that is the point.**
+        `compare_digest` raises `TypeError` on a `str` holding any character
+        above U+007F, so the comparison has to happen on bytes; but a *lossy*
+        conversion is worse than the crash it replaces. Encoding with
+        `errors="replace"` mapped every non-Latin-1 character to `?`, so `"ключ"`
+        became `b"????"` and authenticated a principal whose configured secret
+        was literally `"????"` — distinct credentials collapsing onto one is the
+        single thing a credential verifier must never do. Anything that does not
+        encode is not a credential this deployment holds, so it is compared
+        against the sentinel and refused.
+
+        The encodings on the two sides are deliberately different because the two
+        strings did not arrive the same way: an ASGI server decodes header bytes
+        as latin-1, so `latin-1` recovers exactly what the client sent, while a
+        configured secret came from the environment as UTF-8. For an all-ASCII
+        credential — every realistic one — both produce identical bytes.
         """
-        if not presented:
-            raise unauthenticated(
-                f"a valid {API_KEY_HEADER} is required to record a review decision"
-            )
-        candidate = presented.encode("latin-1", errors="replace")
+        candidate, usable = _as_wire_bytes(presented)
         matched: str | None = None
         for identifier, secret in self._secrets:
             if hmac.compare_digest(candidate, secret.encode("utf-8")):
                 matched = identifier
-        if matched is None:
+        if matched is None or not usable:
             raise unauthenticated(
                 f"a valid {API_KEY_HEADER} is required to record a review decision"
             )
         return Principal(id=matched)
+
+
+NO_CREDENTIAL = b"\x00" * 64
+"""What is compared when there is nothing usable to compare.
+
+A fixed value, so the absent, empty and unencodable cases do the same work as a
+wrong one rather than skipping the loop. `usable` is tracked separately rather
+than trusting this never to collide with a configured secret: a registry built
+directly (rather than from the environment, which refuses empty secrets) could
+hold anything, and "no credential authenticated somebody" must not be reachable
+through a coincidence.
+"""
+
+
+def _as_wire_bytes(presented: str | None) -> tuple[bytes, bool]:
+    """The bytes a credential was actually sent as, and whether it is one at all.
+
+    Strict: a string that does not encode is not the credential anyone
+    configured, and guessing at what it meant is how two different credentials
+    become one.
+    """
+    if not presented:
+        return NO_CREDENTIAL, False
+    try:
+        return presented.encode("latin-1"), True
+    except UnicodeEncodeError:
+        return NO_CREDENTIAL, False
 
 
 API_KEY_SCHEME_NAME = "StewardApiKey"

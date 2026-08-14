@@ -25,6 +25,7 @@ risk, so every negative below has a positive beside it: a stub that raised on
 
 from __future__ import annotations
 
+import hmac
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -718,3 +719,71 @@ class TestNonAsciiCredentials:
         as_sent_over_http = secret.encode("utf-8").decode("latin-1")
 
         assert registry.principal(as_sent_over_http) == Principal(id="chloé")
+
+
+class TestCredentialNormalisation:
+    """Converting a credential to bytes must not lose information.
+
+    The comparison has to happen on bytes, because `hmac.compare_digest` raises
+    on non-ASCII `str`. The first repair encoded with `errors="replace"`, which
+    mapped every non-Latin-1 character to `?` — so `"ключ"` became `b"????"` and
+    authenticated a principal whose secret was literally `"????"`. Two distinct
+    credentials collapsing onto one is the single thing a credential verifier
+    must never do, and it is strictly worse than the crash it replaced: that
+    failed closed, this authenticated the wrong person.
+    """
+
+    def test_an_unencodable_credential_cannot_collide_with_a_configured_one(self) -> None:
+        """The regression, named. Every character of `"ключ"` is outside
+        Latin-1; under lossy encoding all four became `?`."""
+        registry = ApiKeyRegistry({"victim": "????"})
+
+        with pytest.raises(ProblemDetailsError) as raised:
+            registry.principal("ключ")
+
+        assert raised.value.problem.status == 401
+
+    def test_the_colliding_secret_still_authenticates_its_own_holder(self) -> None:
+        """The positive case beside it: `"????"` is a legal secret and the
+        principal holding it must still get in. Otherwise the test above is
+        satisfied by a verifier that rejects that secret outright."""
+        registry = ApiKeyRegistry({"holder": "????"})
+
+        assert registry.principal("????") == Principal(id="holder")
+
+    @pytest.mark.parametrize(
+        ("label", "presented"),
+        [
+            ("missing", None),
+            ("empty", ""),
+            ("unencodable", "ключ"),
+            ("ordinary-wrong", "not-the-secret"),
+            ("prefix", REVIEWER_KEY[:-1]),
+        ],
+    )
+    def test_every_rejection_does_the_same_work(
+        self, monkeypatch: pytest.MonkeyPatch, label: str, presented: str | None
+    ) -> None:
+        """Each refusal performs one comparison per configured secret.
+
+        An early return for the missing case made "you sent nothing" measurably
+        cheaper than "you sent something wrong", and a raise mid-loop made a
+        malformed credential cheaper than a wrong one. Counted at
+        `hmac.compare_digest` rather than timed, because a wall-clock assertion
+        on a three-entry loop measures the machine, not the code.
+        """
+        registry = ApiKeyRegistry({"a": "secret-one", "b": "secret-two", "c": "secret-three"})
+        calls: list[tuple[bytes, bytes]] = []
+        real = hmac.compare_digest
+
+        def counting(left: object, right: object) -> bool:
+            calls.append((bytes(left), bytes(right)))  # type: ignore[arg-type]
+            return bool(real(left, right))  # type: ignore[arg-type]
+
+        monkeypatch.setattr(hmac, "compare_digest", counting)
+
+        with pytest.raises(ProblemDetailsError):
+            registry.principal(presented)
+
+        assert len(calls) == 3, f"{label} took a different path from the others"
+        assert [right for _, right in calls] == [b"secret-one", b"secret-two", b"secret-three"]
