@@ -98,25 +98,74 @@ Resolved by splitting the workflow from the capability:
 Rejected, with reasons in D15: a `packages/steward-classifier`, and teaching the goal registry about
 entry-point-provided task types.
 
-## What to do next: B2 and the live gateway smoke test
+## What to do next: finish B2 — but read these two checks first
 
-Both were deferred because both need the completed agent path, and both are now unblocked. **Do not put
-them in one PR with anything else.** #50's own text specifies them in detail — read the issue, not this
-summary:
+**#50 is open and must stay open.** B2 has a fixture, a scorer and a three-run gate; it has
+**never executed against a model**, so there are no B2 quality results. Do not quote a number that
+does not exist, and do not close #50 on the machinery being present.
 
-1. **B2.** A versioned labelled fixture with difficult negatives (`ssn_hash`, `email_domain`, synthetic
-   data, misleading names, sparse evidence); PII recall ≥ 0.95 and precision ≥ 0.90; evidence validity
-   scored **separately**, so a correct label with an unsupported citation still fails. Three pinned runs,
-   **each independently** over threshold, 100% evidence validity in every run, per-column disagreement
-   reported rather than averaged away. An absent fixture, an empty prediction set or a skipped model
-   execution must not report PASS. This is the one place the shipped work bends an invariant (I11).
-2. **The live smoke test.** One environment-gated test calling `steward-classify` through the real
-   LiteLLM proxy: alias routing, auth, streaming tool calls, usage extraction, **non-zero cost**, typed
-   completion. Missing proxy configuration is INCONCLUSIVE locally and a **failure** in the release job —
-   #74's distinction, applied here.
+Branch **`m1/50-b2-and-smoke`** (pushed, `make fitness` green on every commit) carries:
 
-**Nothing else belongs in either increment.** No lifecycle redesign, no new runtime abstraction, no
-automatic scheduling (#72), no Documentarian (#51).
+- `evidence_problems()` — one definition of "this citation resolves", shared by the repository and
+  the scorer, so the eval cannot pass what production refuses.
+- The eval gate invoking a command that exists, with tri-state semantics: nothing affected → 0;
+  selected with no endpoint → 3, reported SKIP with its reason and **never PASS**; the same under
+  `STEWARD_EVALS_REQUIRED=1` → 1, which is what the release job sets; an absent or empty fixture → 1
+  regardless. 21 tests, no model needed.
+- The LiteLLM proxy pinned **by digest** to its own runtime — running it inside Steward's environment
+  fails outright on a FastAPI incompatibility, which is the argument for the pin.
+- The live gateway smoke test asserting **durable state**: run succeeded within every budget
+  dimension, persisted tokens and cost non-zero, exactly one `pending_review` proposal, exact column
+  coverage, evidence resolving through production code, alias and prompt version, trace/run/task
+  provenance, and an artifact naming the images and config digest it ran against.
+- Checkpoint == task == run usage **exactly**, across steps, tokens, cost and recorded latency.
+  Non-zero on all three would miss both a double charge and a missing debit; equality catches both,
+  and both were mutation-proven.
+- `steward_queue.ledger_cost()` — `ROUND_HALF_UP`, because PostgreSQL rounds ties away from zero and
+  Python's default rounds to even. Two of four tie cases would have failed the accounting assertion
+  **on a correct run**, intermittently. The scale is read from `information_schema` and ties are
+  round-tripped through the real column, so a migration widening it fails loudly.
+
+### Two checks before running any model
+
+1. **The infrastructure-retry rule matches on message text.** `INFRASTRUCTURE_SIGNATURES` in
+   `evals/classification.py` greps a `ClassifierFailed` message for "connection", "timeout", "503"
+   and friends, because the seam collapses transport failures and model failures into one type (I4
+   stops `steward-catalog` importing `steward-agents`). It is biased toward treating anything
+   unmatched as a *result*, which is the safe direction — but prefer a **typed** failure or an
+   explicit result category. Malformed output, invalid evidence and threshold misses must be
+   structurally incapable of entering the retry path, not merely unlikely to match a string.
+
+2. **`test_card_number`'s expected label contradicts the shipped prompt.** The fixture expects it to
+   be *not sensitive* ("synthetic data: 5 distinct values in a column named `test_`"). The prompt
+   artifact says the opposite, in as many words:
+
+   > **Test and synthetic data.** Values that are obviously placeholder do not make a column
+   > non-sensitive. The column will hold real values in production; label what it is for.
+
+   As it stands B2 would score a model that **correctly follows Steward's own prompt** as a false
+   positive, depressing precision and penalising the right behaviour. Resolve it as a product policy
+   before running: either the fixture's expectation changes to `["financial", "pii"]`, or the prompt's
+   rule changes — and whichever it is, the column's `why` must state the policy so the next reader
+   does not have to rediscover the conflict. **This is a fixture-correctness bug, not a model
+   problem.**
+
+### Then, in order
+
+1. Three preflight runs to prove the harness executes. **Label the artifacts non-release** — Ollama
+   is a plumbing preflight and its scores characterise a model no deployment runs.
+2. Inspect coverage, metrics, evidence validation, the disagreement output and retry behaviour.
+3. Run against pinned LiteLLM → **vLLM**. vLLM is not an interchangeable backend: its chat template,
+   tool parser, streamed frames, usage reporting and model revision are what the release evidence
+   validates.
+4. Require pinned provenance and **independently** passing thresholds on all three runs — recall
+   ≥ 0.95, precision ≥ 0.90, evidence validity 100%, exact coverage, no infrastructure error. No
+   averaging, no majority vote.
+5. Commit the evidence of record, and only then close #50.
+
+**#84** (authenticate the rest of the API surface) is a release blocker before external exposure, and
+is deliberately not a prerequisite for B2. **#85** (a failed checkpoint save replaces the agent
+failure that caused it) was found while running a real classification and is filed separately.
 
 ## How this project works — the rules that matter
 
