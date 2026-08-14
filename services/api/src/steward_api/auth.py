@@ -123,8 +123,40 @@ class ApiKeyRegistry:
     """
 
     def __init__(self, principals: Mapping[str, str]) -> None:
-        """`principals` maps a principal id to that principal's secret."""
-        self._secrets: tuple[tuple[str, str], ...] = tuple(principals.items())
+        """`principals` maps a principal id to that principal's secret.
+
+        Encoding happens **here**, once, and an unencodable value is refused
+        rather than stored. That is the whole reason this is not a one-line
+        assignment: a secret encoded inside the request loop can raise there, and
+        `os.environ` on Unix decodes an undecodable byte with `surrogateescape`
+        (`os.fsdecode(b"secret\xff")` is `"secret\udcff"`), which UTF-8 then
+        refuses to encode. A registry that accepted one would raise mid-loop on
+        *every* request — the 500-instead-of-401, the aborted exhaustive loop and
+        the behaviour-depends-on-configuration oracle, all three back, this time
+        entering through the operand nobody presented.
+
+        So both operands are validated before any request is served, and
+        `principal` compares bytes to bytes with nothing left that can raise.
+        """
+        secrets: list[tuple[str, bytes]] = []
+        for identifier, secret in principals.items():
+            try:
+                identifier.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                # Deliberately not quoted: an id that cannot be encoded cannot be
+                # written to the log this message is going to either.
+                raise MalformedApiKeys(
+                    f"a principal id in {API_KEYS_ENV} is not encodable and cannot "
+                    "name the author of a decision"
+                ) from exc
+            try:
+                secrets.append((identifier, secret.encode("utf-8")))
+            except UnicodeEncodeError as exc:
+                raise MalformedApiKeys(
+                    f"the secret configured for principal {identifier!r} is not encodable "
+                    "(the value is not repeated here because it is a secret)"
+                ) from exc
+        self._secrets: tuple[tuple[str, bytes], ...] = tuple(secrets)
 
     @classmethod
     def from_env(cls, raw: str | None) -> ApiKeyRegistry:
@@ -195,11 +227,16 @@ class ApiKeyRegistry:
         as latin-1, so `latin-1` recovers exactly what the client sent, while a
         configured secret came from the environment as UTF-8. For an all-ASCII
         credential — every realistic one — both produce identical bytes.
+
+        **Nothing in this loop can raise.** The configured side was encoded and
+        validated in `__init__`, the presented side by `_as_wire_bytes` above, so
+        what remains is `compare_digest` on two byte strings. An encode call left
+        in here is not a smaller version of the same bug; it is the same bug.
         """
         candidate, usable = _as_wire_bytes(presented)
         matched: str | None = None
         for identifier, secret in self._secrets:
-            if hmac.compare_digest(candidate, secret.encode("utf-8")):
+            if hmac.compare_digest(candidate, secret):
                 matched = identifier
         if matched is None or not usable:
             raise unauthenticated(
