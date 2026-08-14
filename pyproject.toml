@@ -202,6 +202,11 @@ testpaths = ["packages", "services"]
 markers = [
     "invariants: generic harnesses that hold for every registered component (I7, I8, I12)",
     "acceptance: functional acceptance scenarios against milestone exit criteria (SPEC.md §12)",
+    # The one test that calls a real model over the real route (#50). Skips loudly
+    # without a gateway and *fails* under STEWARD_EVALS_REQUIRED=1, so it is
+    # harmless in the ordinary credential-free suite and mandatory in the release
+    # job. Not `acceptance`: H11 runs on every commit and must never need a model.
+    "live_gateway: the live LiteLLM -> vLLM smoke test (issue #50 amendment)",
 ]
 addopts = "--import-mode=importlib"
 asyncio_mode = "auto"
