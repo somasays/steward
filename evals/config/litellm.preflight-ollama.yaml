@@ -1,0 +1,95 @@
+# A **developer preflight** gateway config. Not the eval of record (#50).
+#
+# What this is for, and the boundary is the point: Steward's enforced production
+# architecture is LiteLLM -> vLLM (`litellm.production.yaml` binds every alias to
+# `hosted_vllm/...`). This file binds Ollama instead, on a laptop, so the
+# streaming tool-call path can be debugged with fast feedback — the transform
+# chain from `LLMClient` through the proxy to a streamed `submit_result` is the
+# part most likely to break, and finding that out in twenty minutes is worth a
+# config nobody deploys.
+#
+# **A run against this file is not the live gateway proof and must never be
+# reported as one.** #50's smoke criterion is the real route end to end:
+#
+#   Classifier -> LLMClient -> LiteLLM proxy -> vLLM -> streamed tool call
+#               -> accounting/checkpoint -> pending_review
+#
+# Nor are B2 numbers from here the evaluated result: qwen2.5:14b on Ollama is not
+# what `steward-classify` binds in production, so its precision and recall
+# characterise a model no deployment runs. Both must be produced against a real
+# vLLM endpoint. Where one is unavailable the runner exits `EXIT_NO_ENDPOINT` and
+# the release job — which sets STEWARD_EVALS_REQUIRED=1 — turns that into a
+# failure rather than a skip.
+#
+# It stays in **production** mode even so. `STEWARD_DEPLOYMENT_MODE=development`
+# would skip the endpoint rules entirely (`steward_llm.config.validate_routing`
+# returns early), so a preflight there would not even prove the allowlist path
+# works. Instead the local endpoint is *approved*, via the override
+# approved_endpoints.yaml documents for a deployment whose service names differ:
+#
+#   STEWARD_LLM_APPROVED_ENDPOINTS=http://localhost:11434/v1
+#
+# Localhost is admissible because the deny layer refuses hosted provider APIs and
+# `openai/` is an accepted self-hosted prefix — models addressed by URL. Note the
+# prefix difference from production, which is `hosted_vllm/`: that is the two
+# servers' wire dialects, and it is one more reason this file is not that one.
+#
+# All four aliases are bound because production mode requires all four, and to
+# real models rather than whatever was already pulled: pointing steward-embed at
+# a chat model would satisfy the check while lying about what this can do.
+#
+# Decoding parameters are pinned here because nothing else can pin them —
+# `AgentSpec` carries name, alias, tools and limits, and neither it nor the LLM
+# client exposes temperature or seed. `temperature: 0` and a fixed `seed` are the
+# strongest determinism available and are not a guarantee, which is exactly why
+# #50 requires three runs each independently over threshold with per-column
+# disagreement reported rather than averaged.
+#
+# Prices are amortised-local, not invented hosted rates, and non-zero on purpose:
+# I12 needs a price to turn a token bound into a dollar bound, and #50's smoke
+# criterion requires non-zero cost accounting — a zero price makes both vacuously
+# true.
+
+model_list:
+  - model_name: steward-classify
+    litellm_params:
+      model: openai/qwen2.5:14b-instruct
+      api_base: http://localhost:11434/v1
+      api_key: os.environ/STEWARD_LOCAL_MODEL_KEY
+      temperature: 0
+      seed: 20260814
+    model_info:
+      input_cost_per_token: 0.00000002
+      output_cost_per_token: 0.00000006
+      chat_template_tokens_per_message: 8
+  - model_name: steward-reasoning
+    litellm_params:
+      model: openai/qwen2.5:14b-instruct
+      api_base: http://localhost:11434/v1
+      api_key: os.environ/STEWARD_LOCAL_MODEL_KEY
+      temperature: 0
+      seed: 20260814
+    model_info:
+      input_cost_per_token: 0.00000002
+      output_cost_per_token: 0.00000006
+      chat_template_tokens_per_message: 8
+  - model_name: steward-fast
+    litellm_params:
+      model: openai/qwen2.5:14b-instruct
+      api_base: http://localhost:11434/v1
+      api_key: os.environ/STEWARD_LOCAL_MODEL_KEY
+      temperature: 0
+      seed: 20260814
+    model_info:
+      input_cost_per_token: 0.00000002
+      output_cost_per_token: 0.00000006
+      chat_template_tokens_per_message: 8
+  - model_name: steward-embed
+    litellm_params:
+      model: openai/nomic-embed-text
+      api_base: http://localhost:11434/v1
+      api_key: os.environ/STEWARD_LOCAL_MODEL_KEY
+    model_info:
+      input_cost_per_token: 0.00000001
+      output_cost_per_token: 0.00000000
+      chat_template_tokens_per_message: 0
