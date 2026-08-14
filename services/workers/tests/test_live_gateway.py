@@ -69,6 +69,7 @@ from steward_queue import (
 from steward_schemas import (
     AssetType,
     ProposalStatus,
+    RunBudget,
     SemanticType,
     SourceCreate,
     SourceEngine,
@@ -96,7 +97,26 @@ SELECT used_tokens, used_cost_usd, status, budget_tokens, budget_cost_usd FROM r
 WHERE id = %(run_id)s
 """
 SELECT_CHECKPOINT_USAGE = """
-SELECT state FROM checkpoints WHERE task_id = %(task_id)s ORDER BY updated_at DESC LIMIT 1
+SELECT state FROM checkpoints WHERE task_id = %(task_id)s
+"""
+
+SELECT_TASK_LEDGER = """
+SELECT id, used_steps, used_tokens, used_cost_usd, used_wall_clock FROM tasks
+WHERE run_id = %(run_id)s
+"""
+SELECT_RUN_LEDGER = """
+SELECT used_steps, used_tokens, used_cost_usd, used_wall_clock FROM runs WHERE id = %(run_id)s
+"""
+
+LEDGER_COST_SCALE = Decimal("0.000001")
+"""What `numeric(14, 6)` can hold.
+
+The checkpoint keeps the cost the gateway computed at full precision
+(`0.00005572`); the ledger columns round it to six places (`0.000056`). Asserting
+raw equality between them fails on a *correct* run, so the comparison quantises
+the checkpoint's figure to the ledger's scale rather than loosening to
+"approximately equal" -- which would stop catching the thing this assertion is
+for.
 """
 
 def _required() -> bool:
@@ -307,7 +327,7 @@ def test_the_deployed_route_produces_an_accounted_proposal(
     assert used_tokens <= budget_tokens
     assert used_cost <= budget_cost
 
-    # --- accounting is persisted and non-zero -----------------------------
+    # --- accounting is persisted, non-zero, and charged exactly once ------
     tasks = conn.execute(SELECT_TASK_USAGE, {"run_id": run.id}).fetchall()
     conn.rollback()
     assert len(tasks) == 1
@@ -317,6 +337,7 @@ def test_the_deployed_route_produces_an_accounted_proposal(
     assert task_cost > 0, (
         "a real model call recorded no cost; a zero price makes every dollar bound vacuous"
     )
+    _assert_charged_once(conn, run.id)
 
     # --- exactly one proposal, pending review -----------------------------
     proposals = proposal_history(conn, asset_id)
@@ -381,6 +402,49 @@ async def _drain(dsn: str, run_id: UUID) -> bool:
         if not claimed:
             await asyncio.sleep(0.2)
     return False
+
+
+def _assert_charged_once(conn: QueueConnection, run_id: UUID) -> None:
+    """The checkpoint, the task ledger and the run ledger must agree exactly.
+
+    Non-zero on all three would be satisfied by a run charged **twice** — and by
+    one where the checkpoint recorded spend the ledger never debited. Equality
+    catches both, and this run is the case where equality is legitimate: one
+    task, one attempt, no retry, so there is nothing for the figures to
+    legitimately differ about.
+
+    `wall_clock` is the model latency the runtime recorded, carried through the
+    same three places. Cost is compared at the ledger's scale for the reason
+    `LEDGER_COST_SCALE` gives.
+    """
+    ledger = conn.execute(SELECT_TASK_LEDGER, {"run_id": run_id}).fetchall()
+    run_row = conn.execute(SELECT_RUN_LEDGER, {"run_id": run_id}).fetchone()
+    assert len(ledger) == 1 and run_row is not None
+    task_id, task_steps, task_tokens, task_cost, task_wall = ledger[0]
+    run_steps, run_tokens, run_cost, run_wall = run_row
+
+    states = conn.execute(SELECT_CHECKPOINT_USAGE, {"task_id": task_id}).fetchall()
+    conn.rollback()
+    assert len(states) == 1, (
+        f"expected one checkpoint for this task, found {len(states)}; "
+        "usage cannot be compared against an ambiguous record"
+    )
+    recorded = RunBudget.model_validate(states[0][0]["usage"])
+
+    assert (recorded.steps, recorded.tokens, recorded.wall_clock) == (
+        task_steps,
+        task_tokens,
+        task_wall,
+    ), "the checkpoint and the task ledger disagree about what this attempt spent"
+    assert task_cost == recorded.cost_usd.quantize(LEDGER_COST_SCALE), (
+        f"task ledger charged {task_cost}, checkpoint recorded {recorded.cost_usd}"
+    )
+    assert (run_steps, run_tokens, run_cost, run_wall) == (
+        task_steps,
+        task_tokens,
+        task_cost,
+        task_wall,
+    ), "the run ledger and its only task disagree; the run was charged twice or not at all"
 
 
 def _write_evidence(record: object, tokens: int, cost: Decimal) -> None:
