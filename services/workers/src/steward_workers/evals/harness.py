@@ -17,6 +17,7 @@ from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
+import httpx
 import pgserver
 from steward_catalog import ClassificationRequest, ClassificationRun, ClassifierFailed
 from steward_llm import GatewayConfig, proxy_config_from_env
@@ -26,8 +27,26 @@ from steward_schemas import ClassificationProposal, RunBudget, TableProfile, Tas
 from steward_telemetry import NoopTracer
 
 from steward_workers.classifier import AgentColumnClassifier
+from steward_workers.evals.classification import (
+    EvaluationInfrastructureError,
+    EvaluationResult,
+)
 
 __all__ = ["classify_once"]
+
+RETRYABLE = (httpx.TransportError, TimeoutError, ConnectionError)
+"""Failure *types* that mean "no working model was reached".
+
+`httpx.TransportError` covers connect, read, write and pool timeouts and every
+connection failure beneath them. Matching on types rather than on message text is
+the whole point: it is the difference between a rule and a coincidence.
+
+The chain is walked because the seam wraps them — `AgentColumnClassifier`
+converts a transport failure into `ClassifierFailed` so that `steward-catalog`
+never sees a `steward-agents` type (I4), and `raise ... from exc` keeps the
+original reachable on `__cause__`. Walking to find a typed cause is honest;
+grepping the rendered message is not.
+"""
 
 EVAL_BUDGET = RunBudget(
     steps=6,
@@ -68,7 +87,10 @@ def classify_once(gateway: GatewayConfig, profile: TableProfile) -> Classificati
             request = ClassificationRequest(
                 asset_id=asset_id, profile_version=1, profile=profile
             )
-            proposed = asyncio.run(classifier.classify(run, request))
+            try:
+                proposed = asyncio.run(classifier.classify(run, request))
+            except ClassifierFailed as exc:
+                raise _classify_failure(exc) from exc
             # The classifier returns columns and the provenance only it knows;
             # the *handler* is what turns that into a proposal about a specific
             # asset and profile version, and the scorer needs that shape. Built
@@ -82,6 +104,22 @@ def classify_once(gateway: GatewayConfig, profile: TableProfile) -> Classificati
             )
         finally:
             server.cleanup()
+
+
+def _classify_failure(exc: ClassifierFailed) -> Exception:
+    """Decide whether a failed classification is the network's or the model's.
+
+    Infrastructure only when a retryable *type* is found in the cause chain.
+    Anything else — a refusal, unparseable output, a citation that resolves to
+    nothing, a budget exhausted — is a completed run with an unusable answer and
+    must not be retried.
+    """
+    seen: Exception | BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, RETRYABLE):
+            return EvaluationInfrastructureError(f"{type(seen).__name__}: {seen}")
+        seen = seen.__cause__ or seen.__context__
+    return EvaluationResult(str(exc))
 
 
 def _claimed_task(dsn: str) -> ClassificationRun:

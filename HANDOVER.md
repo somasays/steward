@@ -126,29 +126,30 @@ Branch **`m1/50-b2-and-smoke`** (pushed, `make fitness` green on every commit) c
   **on a correct run**, intermittently. The scale is read from `information_schema` and ties are
   round-tripped through the real column, so a migration widening it fails loudly.
 
-### Two checks before running any model
+### Both pre-run checks are settled — two product decisions, now implemented
 
-1. **The infrastructure-retry rule matches on message text.** `INFRASTRUCTURE_SIGNATURES` in
-   `evals/classification.py` greps a `ClassifierFailed` message for "connection", "timeout", "503"
-   and friends, because the seam collapses transport failures and model failures into one type (I4
-   stops `steward-catalog` importing `steward-agents`). It is biased toward treating anything
-   unmatched as a *result*, which is the safe direction — but prefer a **typed** failure or an
-   explicit result category. Malformed output, invalid evidence and threshold misses must be
-   structurally incapable of entering the retry path, not merely unlikely to match a string.
+1. **The retry boundary is typed, not textual.** `EvaluationInfrastructureError` is the only
+   retryable failure and is raised by the gateway harness alone, from failure *types*
+   (`httpx.TransportError`, `TimeoutError`, `ConnectionError`) found by walking the `__cause__`
+   chain — the seam wraps them in `ClassifierFailed` so `steward-catalog` never sees a
+   `steward-agents` type (I4), and `raise ... from` keeps the original reachable. Everything else is
+   `EvaluationResult`: a completed run with an unusable answer, never retried. Unknown exceptions
+   fail immediately rather than being guessed at. The scorer produces results only.
 
-2. **`test_card_number`'s expected label contradicts the shipped prompt.** The fixture expects it to
-   be *not sensitive* ("synthetic data: 5 distinct values in a column named `test_`"). The prompt
-   artifact says the opposite, in as many words:
+   The old rule grepped the message, which made "a threshold miss is never retried" depend on
+   wording. Two tests pin the difference: a model failure whose text *contains* "connection" and one
+   containing "timeout" must both be results. Reverting to message matching fails exactly those two
+   plus the wrapped-transport case.
 
-   > **Test and synthetic data.** Values that are obviously placeholder do not make a column
-   > non-sensitive. The column will hold real values in production; label what it is for.
+2. **`test_card_number` is `financial`.** Steward classifies what a column is *for*, not whether
+   today's sample is synthetic — which is what the prompt already says, so the prompt is unchanged
+   and the fixture was the thing that was wrong. It is not `pii`: a fixture card is tied to no
+   cardholder, which is what separates it from `card_number`. The synthetic hard negative it used to
+   provide is now `synthetic_row_id` — a surrogate identifier with no meaning outside the dataset,
+   expected `none`, testing the prompt's actual rule ("a surrogate key with no meaning outside this
+   database is not pii") instead of one it contradicts.
 
-   As it stands B2 would score a model that **correctly follows Steward's own prompt** as a false
-   positive, depressing precision and penalising the right behaviour. Resolve it as a product policy
-   before running: either the fixture's expectation changes to `["financial", "pii"]`, or the prompt's
-   rule changes — and whichever it is, the column's `why` must state the policy so the next reader
-   does not have to rediscover the conflict. **This is a fixture-correctness bug, not a model
-   problem.**
+   Fixture is now 15 columns: 7 sensitive, 8 negative, 6 hard negatives.
 
 ### Then, in order
 

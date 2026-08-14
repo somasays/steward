@@ -176,3 +176,55 @@ def test_an_undefined_metric_is_none_and_never_a_perfect_score() -> None:
     precision 1.0."""
     assert ratio(0, 0) is None
     assert ratio(3, 4) == Decimal("0.7500")
+
+
+class TestRetryBoundary:
+    """Only a typed transport failure may be retried (#50).
+
+    The rule this replaces matched on message text, which made "a threshold miss
+    is never retried" depend on how an exception happened to be worded. These
+    assert on *types*, including through the wrapping the I4 seam imposes.
+    """
+
+    def test_a_transport_failure_under_the_seam_is_retryable(self) -> None:
+        """`ClassifierFailed` is what the catalog seam allows through; the
+        original transport error stays reachable on `__cause__`."""
+        import httpx
+        from steward_catalog import ClassifierFailed
+        from steward_workers.evals.classification import EvaluationInfrastructureError
+        from steward_workers.evals.harness import _classify_failure
+
+        wrapped = ClassifierFailed("the gateway would not answer")
+        wrapped.__cause__ = httpx.ConnectError("connection refused")
+
+        assert isinstance(_classify_failure(wrapped), EvaluationInfrastructureError)
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "the agent stopped without calling 'submit_result'",
+            "email: masked_sample evidence cites 'nope', which profile version 1 does not contain",
+            "connection to the truth was lost",  # names a signature, is not one
+            "request timeout policy violated by the model's answer",
+        ],
+        ids=["malformed", "invalid-evidence", "says-connection", "says-timeout"],
+    )
+    def test_a_model_failure_is_a_result_however_it_is_worded(self, message: str) -> None:
+        """The last two are the point: under message matching they would have
+        been retried, because their text contains 'connection' and 'timeout'."""
+        from steward_catalog import ClassifierFailed
+        from steward_workers.evals.classification import EvaluationResult
+        from steward_workers.evals.harness import _classify_failure
+
+        assert isinstance(_classify_failure(ClassifierFailed(message)), EvaluationResult)
+
+    def test_an_exhausted_budget_is_a_result_not_infrastructure(self) -> None:
+        """A cap is the product working, and re-rolling it would spend the next
+        cap too."""
+        from steward_catalog import ClassifierBudgetExceeded
+        from steward_workers.evals.classification import EvaluationResult
+        from steward_workers.evals.harness import _classify_failure
+
+        assert isinstance(
+            _classify_failure(ClassifierBudgetExceeded("out of tokens")), EvaluationResult
+        )
