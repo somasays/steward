@@ -32,7 +32,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from steward_workers.evals import EXIT_FAILED, EXIT_NO_ENDPOINT, EXIT_OK
+from steward_workers.evals import EXIT_FAILED, EXIT_NO_ENDPOINT, EXIT_OK, classification
 from steward_workers.evals.__main__ import main
 from steward_workers.evals.classification import AFFECTING_PATHS, CLASSIFICATION_SUITE
 
@@ -91,30 +91,52 @@ def test_only_an_explicit_1_makes_evidence_required(
     assert main(["evals", "run", "classification"]) == EXIT_NO_ENDPOINT
 
 
-def test_an_endpoint_without_a_fixture_fails_and_is_never_skipped(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("required", ["0", "1"])
+def test_an_absent_fixture_fails_and_is_never_skipped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, required: str
 ) -> None:
     """The anti-vacuity rule: an absent fixture cannot report PASS (#50).
 
-    A gateway *is* configured here, so this is past the endpoint check — which is
-    what makes it a statement about the fixture and not about the machine.
+    The absence is *created* here rather than borrowed from a repository that
+    happens to have no fixture — which is what this test relied on before one was
+    written, and would have silently stopped testing anything the moment it was.
+
+    A gateway is configured, so this is past the endpoint check: a statement
+    about the repository, not the machine. `REQUIRED` is parametrised because it
+    escalates "could not run" and must not soften "there is nothing to run
+    against".
     """
     monkeypatch.setenv("STEWARD_LITELLM_CONFIG", PREFLIGHT_CONFIG)
     monkeypatch.setenv("STEWARD_LLM_APPROVED_ENDPOINTS", LOCAL_ENDPOINT)
+    monkeypatch.setenv("STEWARD_EVALS_REQUIRED", required)
+    monkeypatch.setattr(classification, "FIXTURE_DIR", tmp_path / "absent")
 
     assert main(["evals", "run", "classification"]) == EXIT_FAILED
 
 
-def test_an_absent_fixture_fails_even_when_evidence_is_not_required(
-    monkeypatch: pytest.MonkeyPatch,
+def test_an_empty_fixture_fails_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """REQUIRED escalates "could not run"; it does not soften "there is nothing
-    to run against"."""
+    """A file that exists and declares nothing is the more dangerous shape: it
+    looks like a fixture and scores nothing."""
     monkeypatch.setenv("STEWARD_LITELLM_CONFIG", PREFLIGHT_CONFIG)
     monkeypatch.setenv("STEWARD_LLM_APPROVED_ENDPOINTS", LOCAL_ENDPOINT)
-    monkeypatch.setenv("STEWARD_EVALS_REQUIRED", "0")
+    (tmp_path / "fixture.v1.json").write_text(
+        '{"version": "v", "description": "d", "tables": []}'
+    )
+    monkeypatch.setattr(classification, "FIXTURE_DIR", tmp_path)
 
     assert main(["evals", "run", "classification"]) == EXIT_FAILED
+
+
+def test_the_committed_fixture_loads_and_is_not_empty() -> None:
+    """The positive case beside them: the fixture this repository ships is
+    real, parses, and carries labelled columns."""
+    tables = classification.load_fixture()
+
+    assert tables
+    assert all(table.columns for table in tables)
+    assert any(column.expected for table in tables for column in table.columns)
 
 
 def test_a_change_affecting_nothing_runs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
