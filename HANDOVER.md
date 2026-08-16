@@ -151,19 +151,46 @@ Filed **#86**: the runtime asserts prose that did not exist, and a completed res
 content, no tool calls and non-zero usage deserves its own message. The #85 shape — a later, less
 informative failure replacing the real one. It cost this session an hour.
 
-### The gap that remains, and it is the important one
+### It is the `encounters` table, not the model — two models, two parsers, same table
 
-**The harness's success path has still never executed.** `score_table` over real output, `_report`,
-`_disagreements`, threshold evaluation and `_persist` with real runs have never run. Leaving it there
-would be this repository's signature pathology wearing a new coat: a gate whose green path is
-untested. Closing that gap needs a local model that clears `encounters` — a pull of
-`llama3.1:8b` was in flight when this session ended (different chat template and tool parser, so a
-better chance of dodging whatever Ollama's qwen2.5 path does). If it clears the table, point
-`litellm.preflight-ollama.yaml` at it, say in the commit why, and run the three-run gate to
-completion. **Even a quality FAIL is the goal here** — the point is that scoring, disagreement
-reporting and the artifact all execute. This is an environment change to a file that already
-declares itself not the evidence of record; the **fixture and the prompt stay untouched** (step 4
-below).
+`llama3.1:8b` was pulled to get past it. It does not, and **how it fails is the finding**:
+
+| table | qwen2.5:14b-instruct | llama3.1:8b |
+|---|---|---|
+| `customers` | valid tool call, exact coverage | valid tool call |
+| `payments` | valid tool call, exact coverage | (not separately probed) |
+| `encounters` | **empty** — no content, no tool call, 240–480 tokens billed | **prose** — the tool call emitted *as text*, `columns` a stringified array |
+
+Two different chat templates and two different tool parsers, failing on the same table and only that
+table — and it is the *smallest* of the three (4 columns against 5 and 6), so it is not a length
+effect. That points at the table's content, or at how the prompt and the `ProposedColumns` schema
+interact on clinical multi-label columns, rather than at one flaky model.
+
+**Do not "fix" this by editing the fixture.** That is step 4 below, and `encounters` is where the
+multi-label `phi`+`pii` case and the sparse-evidence hard negative live — the rows most worth
+measuring. If the eventual vLLM run also degrades there, that is a product finding about the prompt
+and deserves a recorded decision, not a quieter fixture.
+
+### What has now executed against a real model, and what still has not
+
+`score_table` and `evidence_problems` **have** now run on live output, over the two tables that
+work (one run, `encounters` skipped — **not a B2 result**, and the numbers below are not quotable
+as one):
+
+```
+customers  missing=() invented=() evidence_failures=()   5/5 correct
+payments   missing=() invented=() evidence_failures=()   5/6 correct
+  MISS card_number  expected=[financial, pii]  predicted=[financial]
+PII over 11 columns: tp=2 fp=0 fn=1  recall=0.6667 precision=1.0000
+```
+
+Worth knowing: **every citation resolved** through the production `evidence_problems`, coverage was
+exact by name on both tables, and all six hard negatives were correct. The one miss is the
+multi-label `card_number` — the case the fixture was built to catch.
+
+Still never executed against a model: `_report`, `_disagreements` across three runs, the threshold
+gate, and `_persist` on real runs. Those are unit-tested but have not seen live output, and a gate
+whose green path is untested is this repository's signature pathology wearing a new coat.
 
 Branch **`m1/50-b2-and-smoke`** (pushed, `make fitness` green on every commit) carries:
 
@@ -249,9 +276,7 @@ failures from the real transport path; an approximate server fixture answers a d
 
 ### Then, in order
 
-1. **Get one preflight pass all the way through scoring** — see "the gap that remains" above. Two
-   passes have run and both died before scoring; the remaining blocker is a local model that clears
-   `encounters`, not the harness.
+1. **Get one preflight pass all the way through scoring.** The blocker is `encounters` (above), not the harness — `score_table` and `evidence_problems` are now proven on live output. Reaching `_report`/`_disagreements`/`_persist` needs a model that answers that table; the honest next move is the vLLM run rather than a third local model, since two have now failed the same way.
 2. ~~Confirm every artifact is explicitly non-release.~~ **Done** — `release_evidence` is computed
    from the pins plus `STEWARD_EVALS_REQUIRED=1`, and the note says so in words. Still worth reading
    the first artifact a real run produces: that code path has not executed against real runs either.
