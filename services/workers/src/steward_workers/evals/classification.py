@@ -28,7 +28,9 @@ runs it looking for a missing file.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from decimal import Decimal
@@ -46,6 +48,7 @@ from steward_schemas import (
     ValueFrequency,
 )
 
+from steward_workers.evals import REQUIRED_ENV
 from steward_workers.evals.scoring import TableScore, confusion, ratio, score_table
 
 __all__ = [
@@ -212,15 +215,15 @@ def run_classification(gateway: GatewayConfig | None, *, artifacts: str | None =
     """
     _require_gateway(gateway)
     assert gateway is not None  # `_require_gateway` refuses None
-    tables = load_fixture()
-    requests = tuple(_request(table) for table in tables)
+    fixture = load_fixture()
+    requests = tuple(_request(table) for table in fixture.tables)
 
     runs: list[RunOutcome] = []
     for index in range(1, RUNS + 1):
         runs.append(_one_run(gateway, requests, index=index))
     report = _report(runs, requests)
     if artifacts is not None:
-        _persist(runs, artifacts)
+        _persist(runs, artifacts, fixture_version=fixture.version)
     return report
 
 
@@ -401,12 +404,72 @@ def _disagreements(runs: tuple[RunOutcome, ...] | list[RunOutcome]) -> tuple[str
     return tuple(lines)
 
 
-def _persist(runs: tuple[RunOutcome, ...] | list[RunOutcome], target: str) -> None:
+PROXY_IMAGE_ENV = "STEWARD_SMOKE_PROXY_IMAGE"
+MODEL_REVISION_ENV = "STEWARD_SMOKE_MODEL_REVISION"
+"""The same two names the live gateway smoke reads, deliberately.
+
+One run of a release job pins one stack, and two different variable names for
+"which proxy image" and "which model revision" is how the smoke and the eval end
+up describing different ones while both look pinned.
+"""
+
+
+def _provenance(fixture_version: str) -> dict[str, object]:
+    """What produced these numbers, and whether they may be quoted.
+
+    An eval result is only readable next to the stack that produced it: the same
+    prompt against a different model revision is a different measurement. The
+    fields mirror the live gateway smoke's artifact (`test_live_gateway`), and
+    the gateway config is hashed rather than copied because it carries an
+    `api_key` reference.
+
+    `release_evidence` is the field that matters most and it is computed, never
+    asserted. Unless the stack is pinned *and* the run was required, this is a
+    developer preflight — Ollama scores characterise a model no deployment runs
+    (`litellm.preflight-ollama.yaml`), and an artifact that did not say so would
+    eventually be read as if it were the release result. #50's evidence of record
+    is LiteLLM -> vLLM with both pinned.
+    """
+    config_path = os.environ.get("STEWARD_LITELLM_CONFIG", "")
+    digest = (
+        hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+        if config_path and Path(config_path).exists()
+        else None
+    )
+    proxy_image = os.environ.get(PROXY_IMAGE_ENV) or None
+    model_revision = os.environ.get(MODEL_REVISION_ENV) or None
+    required = os.environ.get(REQUIRED_ENV, "").strip() == "1"
+    pinned = bool(proxy_image and model_revision)
+    return {
+        "fixture": fixture_version,
+        "model_alias": CLASSIFY_ALIAS,
+        "gateway_config_sha256": digest,
+        "proxy_image": proxy_image or "unpinned (preflight)",
+        "model_revision": model_revision or "unpinned (preflight)",
+        "required": required,
+        "release_evidence": pinned and required,
+        "note": (
+            "Release evidence: pinned proxy image and model revision, run with "
+            f"{REQUIRED_ENV}=1."
+            if pinned and required
+            else "NOT release evidence — a developer preflight. These scores "
+            "characterise whatever this machine routed to and must not be quoted "
+            "as B2's result (#50)."
+        ),
+    }
+
+
+def _persist(
+    runs: tuple[RunOutcome, ...] | list[RunOutcome],
+    target: str,
+    *,
+    fixture_version: str,
+) -> None:
     """Write per-run results so a CI job can keep them as artifacts (#50)."""
     directory = Path(target)
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
-        "fixture": "classification-fixture@v1",
+        **_provenance(fixture_version),
         "runs": [
             {
                 "index": run.index,
@@ -434,13 +497,19 @@ def _persist(runs: tuple[RunOutcome, ...] | list[RunOutcome], target: str) -> No
     )
 
 
-def load_fixture() -> tuple[FixtureTableSpec, ...]:
+def load_fixture() -> Fixture:
     """The labelled fixture, refused rather than defaulted when it is not there.
 
     Three ways this could be vacuous and each is an error: the file missing, the
     file holding no tables, and a table holding no columns. The last two are the
     model's (`min_length=1`); this raises `NoFixture` for all of them, because
     #50 requires that an absent or empty fixture cannot report PASS.
+
+    Returns the whole `Fixture` rather than its tables so `version` reaches the
+    artifact from the file that was actually read. It used to be a literal in
+    `_persist`, which would have gone on claiming `@v1` after the fixture was
+    revised — evidence naming the wrong dataset is worse than evidence naming
+    none, because it looks answerable.
     """
     path = FIXTURE_DIR / "fixture.v1.json"
     if not path.exists():
@@ -449,7 +518,7 @@ def load_fixture() -> tuple[FixtureTableSpec, ...]:
         fixture = Fixture.model_validate_json(path.read_text())
     except ValidationError as exc:
         raise NoFixture(f"{path} is not a usable fixture: {exc}") from exc
-    return fixture.tables
+    return fixture
 
 
 def _require_gateway(gateway: GatewayConfig | None) -> None:

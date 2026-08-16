@@ -28,3 +28,7 @@ fitness-report.json
 # Local agent-harness runtime artifacts (not project files)
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+
+# Eval results. Written by whoever ran the suite; a preflight score committed by
+# accident is a number that reads like release evidence (#50).
+evals/artifacts/

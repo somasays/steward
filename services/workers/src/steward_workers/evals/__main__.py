@@ -40,6 +40,18 @@ _logger = logging.getLogger(__name__)
 SUITES = (CLASSIFICATION_SUITE,)
 """The suites that exist. B1/B3–B5 land with their milestones (GUARDRAILS.md)."""
 
+DEFAULT_ARTIFACTS = "evals/artifacts"
+"""Where per-run results go unless a caller says otherwise.
+
+The help text has always named this path while the default was `None`, so no
+invocation of the gate ever wrote one: a suite whose per-column verdicts and
+per-run disagreement existed only in a terminal that has since scrolled. #50 asks
+for those results as artifacts, and the run that produces them is expensive
+enough that not keeping them is the wrong default. Ignored by git — an artifact
+is written by whoever ran it, and one committed by accident is a preflight score
+in the repository looking like a release result.
+"""
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="steward", description="Steward developer commands.")
@@ -61,8 +73,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--artifacts",
-        default=None,
-        help="directory to write per-run results into (default: evals/artifacts)",
+        default=DEFAULT_ARTIFACTS,
+        help=f"directory to write per-run results into (default: {DEFAULT_ARTIFACTS})",
     )
     return parser
 
