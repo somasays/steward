@@ -24,9 +24,16 @@ from __future__ import annotations
 
 from datetime import timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
+from uuid import uuid4
 
 import pytest
-from steward_queue import LEDGER_COST_SCALE, create_run, ledger_cost
+from steward_queue import (
+    LEDGER_COST_SCALE,
+    RunBudgetBreached,
+    create_run,
+    ledger_cost,
+    record_step_usage,
+)
 from steward_queue.db import QueueConnection
 from steward_schemas import RunBudget
 
@@ -133,3 +140,116 @@ def test_a_cost_that_needs_no_rounding_is_unchanged() -> None:
     exact = Decimal("0.000056")
 
     assert ledger_cost(exact) == exact
+
+
+# --- the comparison `ledger_cost` governs -------------------------------------
+#
+# `record_step_usage` differences the charge against the delta the ledger stored,
+# and that delta comes back at the column's scale. Comparing the gateway's
+# unrounded figure against it made the seventh decimal place a budget breach: the
+# first live classification run failed all three attempts on a $0.000075 step
+# against a $0.50 cap, with steps and tokens applied unclamped.
+#
+# The direction is what makes it insidious. A cost rounding *up* leaves the
+# applied delta larger than the charge, `remaining` floors at zero, and no breach
+# is reported; a cost rounding *down* reports one. So a correct run passed or
+# failed on the seventh decimal place of whatever the model happened to charge.
+
+AMPLE = RunBudget(
+    steps=100, tokens=1_000_000, cost_usd=Decimal("0.500000"), wall_clock=timedelta(minutes=10)
+)
+
+ROUNDS_DOWN = ["0.00007528", "0.00007924", "0.00007542", "0.0000004", "0.1234561"]
+"""Costs whose seventh decimal is below a half, so the ledger stores less than
+the gateway computed. The first three are the three figures the live preflight
+failed on, kept verbatim."""
+
+
+@pytest.mark.parametrize("raw", ROUNDS_DOWN)
+def test_a_charge_the_ledger_rounds_down_is_not_a_breach(
+    conn: QueueConnection, raw: str
+) -> None:
+    """The regression. Nothing here is near a cap: the run may spend $0.50 and
+    this step spends a fraction of a cent, so the only difference between what
+    was charged and what was stored is the column's resolution."""
+    run = create_run(conn, goal="rounding", budget=AMPLE)
+    amount = RunBudget(
+        steps=1, tokens=3096, cost_usd=Decimal(raw), wall_clock=timedelta(seconds=2)
+    )
+
+    breach = record_step_usage(conn, run_id=run.id, task_id=uuid4(), amount=amount)
+    conn.rollback()
+
+    assert breach is None, f"a {raw} step against a {AMPLE.cost_usd} cap was called a breach"
+
+
+@pytest.mark.parametrize("raw", ROUNDS_DOWN)
+def test_the_stored_delta_is_the_charge_at_the_ledgers_scale(
+    conn: QueueConnection, raw: str
+) -> None:
+    """Why the test above is allowed to expect no breach, asserted rather than
+    assumed: with nothing clamped, what the column stored *is* `ledger_cost` of
+    what was charged, so any residue is quantization and not a cap."""
+    run = create_run(conn, goal="rounding", budget=AMPLE)
+    amount = RunBudget(
+        steps=1, tokens=3096, cost_usd=Decimal(raw), wall_clock=timedelta(seconds=2)
+    )
+
+    record_step_usage(conn, run_id=run.id, task_id=uuid4(), amount=amount)
+    stored = conn.execute(
+        "SELECT used_cost_usd FROM runs WHERE id = %(id)s", {"id": run.id}
+    ).fetchone()
+    conn.rollback()
+
+    assert stored is not None
+    assert stored[0] == ledger_cost(Decimal(raw))
+
+
+def test_a_charge_the_run_cannot_fund_is_still_a_breach(conn: QueueConnection) -> None:
+    """The other direction, and the reason the tests above cannot be satisfied by
+    a function that returns `None` unconditionally — the negative-only-guard
+    shape this repository has shipped before (#82).
+
+    A cap of `0.000100` against a charge of `0.000500`: the clamp is four hundred
+    micro-dollars, far above the scale, so it is a breach under any rounding rule.
+    """
+    tight = RunBudget(
+        steps=100, tokens=1_000_000, cost_usd=Decimal("0.000100"), wall_clock=timedelta(minutes=10)
+    )
+    run = create_run(conn, goal="rounding", budget=tight)
+    amount = RunBudget(
+        steps=1, tokens=10, cost_usd=Decimal("0.00050028"), wall_clock=timedelta(seconds=2)
+    )
+
+    breach = record_step_usage(conn, run_id=run.id, task_id=uuid4(), amount=amount)
+    conn.rollback()
+
+    assert isinstance(breach, RunBudgetBreached)
+    assert breach.overspend.cost_usd == Decimal("0.000400")
+
+
+def test_the_audit_row_keeps_the_computed_cost_and_the_decided_overspend(
+    conn: QueueConnection,
+) -> None:
+    """Both figures survive, and they are different figures.
+
+    `requested` is what the gateway charged, at full precision — the fact the
+    audit trail exists to preserve. `overspend` is what the run declined to
+    record, decided at the ledger's scale. Folding either into the other would
+    lose one of the two questions an operator asks.
+    """
+    run = create_run(conn, goal="rounding", budget=AMPLE)
+    amount = RunBudget(
+        steps=1, tokens=3096, cost_usd=Decimal("0.00007528"), wall_clock=timedelta(seconds=2)
+    )
+
+    record_step_usage(conn, run_id=run.id, task_id=uuid4(), amount=amount)
+    row = conn.execute(
+        "SELECT after FROM audit_log WHERE action = 'run.usage_recorded' AND entity_id = %(id)s",
+        {"id": str(run.id)},
+    ).fetchone()
+    conn.rollback()
+
+    assert row is not None
+    assert row[0]["requested"]["cost_usd"] == "0.00007528"
+    assert Decimal(row[0]["overspend"]["cost_usd"]) == 0
