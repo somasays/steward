@@ -18,8 +18,8 @@
 # what `steward-classify` binds in production, so its precision and recall
 # characterise a model no deployment runs. Both must be produced against a real
 # vLLM endpoint. Where one is unavailable the runner exits `EXIT_NO_ENDPOINT` and
-# the release job — which sets STEWARD_EVALS_REQUIRED=1 — turns that into a
-# failure rather than a skip.
+# a release job — which would set STEWARD_EVALS_REQUIRED=1, and which does not
+# exist yet (#88) — would turn that into a failure rather than a skip.
 #
 # It stays in **production** mode even so. `STEWARD_DEPLOYMENT_MODE=development`
 # would skip the endpoint rules entirely (`steward_llm.config.validate_routing`
