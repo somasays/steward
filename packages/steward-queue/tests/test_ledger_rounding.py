@@ -58,7 +58,7 @@ ORDINARY = ["0", "0.000001", "0.0000004", "0.00005572", "1.9999994", "12.3456789
 @pytest.mark.parametrize("raw", TIES + ORDINARY)
 def test_the_helper_agrees_with_the_column(conn: QueueConnection, raw: str) -> None:
     """One source of truth for how a cost is stored: the column itself."""
-    stored = conn.execute(f"SELECT {raw}::numeric(14,6)").fetchone()
+    stored = conn.execute("SELECT %(raw)s::numeric(14,6)", {"raw": Decimal(raw)}).fetchone()
     conn.rollback()
     assert stored is not None
 

@@ -22,7 +22,15 @@ import pgserver
 from steward_catalog import ClassificationRequest, ClassificationRun, ClassifierFailed
 from steward_llm import GatewayConfig, proxy_config_from_env
 from steward_llm.proxy import LiteLLMProxyTransport
-from steward_queue import SYSTEM_ACTOR, connect, create_run, enqueue, upgrade_to_head
+from steward_queue import (
+    SYSTEM_ACTOR,
+    claim,
+    connect,
+    create_run,
+    enqueue,
+    mark_running,
+    upgrade_to_head,
+)
 from steward_schemas import ClassificationProposal, RunBudget, TableProfile, TaskSpec
 from steward_telemetry import NoopTracer
 
@@ -70,7 +78,9 @@ EVAL_BUDGET = RunBudget(
 """`classify_asset`'s own budget. The eval must run under the cap production
 runs under, or it measures a classifier nobody deploys."""
 
-CLAIM_TASK = "UPDATE tasks SET state = 'running', claimed_by = %(who)s, attempts = 1 WHERE id = %(id)s"
+EVAL_WORKER = "b2-eval"
+"""Who the eval claims as. A real worker id, because it lands in `claimed_by`
+and in the audit trail like any other."""
 
 
 def classify_once(gateway: GatewayConfig, profile: TableProfile) -> ClassificationProposal:
@@ -144,7 +154,17 @@ def _classify_failure(exc: ClassifierFailed) -> Exception:
 def _claimed_task(dsn: str) -> ClassificationRun:
     """A real run and a claimed task, so checkpoint writes have a row to fence
     against. Without one the store raises `StaleClaim` and masks whatever the
-    model actually did (#85)."""
+    model actually did (#85).
+
+    Claimed through `claim` and `mark_running` rather than an `UPDATE tasks SET
+    state = 'running'` of its own. The raw statement skipped `claimed` in the
+    state machine and wrote no `task.claimed`/`task.started` audit rows, which is
+    I7 — and it was invisible to H5, whose audit-completeness sweep runs over the
+    repository registry and cannot see a service issuing its own SQL. It also
+    duplicated knowledge of the queue's schema outside the queue. The fencing
+    pair the classifier needs (`claimed_by`, `attempts`) comes back on
+    `ClaimedTask`, so nothing is lost by asking properly.
+    """
     with connect(dsn) as conn:
         created = create_run(conn, goal="classify_asset", budget=EVAL_BUDGET, actor=SYSTEM_ACTOR)
         spec = TaskSpec(
@@ -156,13 +176,17 @@ def _claimed_task(dsn: str) -> ClassificationRun:
             max_attempts=1,
         )
         enqueue(conn, spec, actor=SYSTEM_ACTOR)
-        conn.execute(CLAIM_TASK, {"who": "b2-eval", "id": spec.task_id})
+        claimed = claim(conn, worker_id=EVAL_WORKER, task_types=("classify_asset",))
+        if not claimed:  # pragma: no cover -- the task was enqueued in this transaction
+            raise ClassifierFailed("the eval enqueued a task the queue would not claim")
+        task = claimed[0]
+        mark_running(conn, task.spec.task_id, claimed_by=EVAL_WORKER)
         conn.commit()
     return ClassificationRun(
         run_id=created.id,
-        task_id=spec.task_id,
-        trace_id="0" * 32,
-        claimed_by="b2-eval",
-        attempts=1,
+        task_id=task.spec.task_id,
+        trace_id=task.trace_id,
+        claimed_by=EVAL_WORKER,
+        attempts=task.attempts,
         budget=EVAL_BUDGET,
     )

@@ -18,7 +18,13 @@ from steward_schemas import (
     SensitivityLabel,
     TableProfile,
 )
-from steward_workers.evals.scoring import ColumnOutcome, confusion, ratio, score_table
+from steward_workers.evals import classification
+from steward_workers.evals.classification import (
+    PII_PRECISION_FLOOR,
+    PII_RECALL_FLOOR,
+    RunOutcome,
+)
+from steward_workers.evals.scoring import ColumnOutcome, TableScore, confusion, ratio, score_table
 
 pytestmark = pytest.mark.invariants
 
@@ -246,3 +252,177 @@ class TestRetryBoundary:
         assert isinstance(
             _classify_failure(ClassifierBudgetExceeded("out of tokens")), EvaluationResult
         )
+
+
+class TestTheVerdict:
+    """B2's PASS/FAIL, which nothing exercised.
+
+    The scorer was tested and the artifact was tested; the code that turns
+    scores into a verdict was not. Measured by mutation: zeroing both thresholds,
+    setting `RUNS = 1` and changing `all(...)` to `any(...)` in `_report` left
+    **285 tests passing**. Every claim GUARDRAILS' B2 row makes — the 0.95 recall
+    floor, the 0.90 precision floor, "three pinned runs, each independently over
+    threshold" — could be deleted and this repository stayed green, in the gate
+    this branch exists to build.
+
+    None of it needs a model, which is the eval package's own argument for where
+    the line falls: "the gate's own behaviour is testable where the thing it
+    gates is not".
+    """
+
+    def outcome(
+        self,
+        name: str,
+        expected: tuple[SensitivityLabel, ...],
+        predicted: tuple[SensitivityLabel, ...],
+        *,
+        cited: tuple[str, ...] = (),
+        confidence: str = "0.9",
+    ) -> ColumnOutcome:
+        return ColumnOutcome(
+            column=name,
+            expected=frozenset(expected),
+            predicted=frozenset(predicted),
+            confidence=Decimal(confidence),
+            evidence=cited,
+        )
+
+    def scored(
+        self,
+        *outcomes: ColumnOutcome,
+        table: str = "t",
+        missing: tuple[str, ...] = (),
+        invented: tuple[str, ...] = (),
+        evidence_failures: tuple[str, ...] = (),
+    ) -> TableScore:
+        return TableScore(
+            table=table,
+            outcomes=outcomes,
+            missing_columns=missing,
+            invented_columns=invented,
+            evidence_failures=evidence_failures,
+        )
+
+    def perfect(self) -> TableScore:
+        """Four PII columns all found, one negative correctly left alone."""
+        return self.scored(
+            *(self.outcome(f"p{i}", (PII,), (PII,), cited=("column_name=p",)) for i in range(4)),
+            self.outcome("n0", (), ()),
+        )
+
+    def test_a_clean_run_passes(self) -> None:
+        """The positive case first: without it every assertion below is
+        satisfied by a verdict that fails everything."""
+        assert RunOutcome(index=1, scores=(self.perfect(),)).passed is True
+
+    def test_a_missed_pii_column_fails_on_recall(self) -> None:
+        """Three of four found is 0.75, and the floor is 0.95."""
+        scores = self.scored(
+            *(self.outcome(f"p{i}", (PII,), (PII,), cited=("column_name=p",)) for i in range(3)),
+            self.outcome("p3", (PII,), ()),
+        )
+        run = RunOutcome(index=1, scores=(scores,))
+
+        assert run.passed is False
+        assert any("pii recall" in reason for reason in run.reasons), run.reasons
+
+    def test_a_false_positive_fails_on_precision(self) -> None:
+        """All four found plus one column wrongly called PII is 4/5 = 0.8,
+        under the 0.90 floor — and recall is a perfect 1.0, so this can only
+        fail through precision."""
+        scores = self.scored(
+            *(self.outcome(f"p{i}", (PII,), (PII,), cited=("column_name=p",)) for i in range(4)),
+            self.outcome("n0", (), (PII,), cited=("column_name=n0",)),
+        )
+        run = RunOutcome(index=1, scores=(scores,))
+
+        assert run.passed is False
+        assert any("pii precision" in reason for reason in run.reasons), run.reasons
+
+    def test_the_floors_are_the_published_ones(self) -> None:
+        """GUARDRAILS' B2 row quotes these two numbers. A test that only
+        compared against the constants would follow them down to zero."""
+        assert (PII_RECALL_FLOOR, PII_PRECISION_FLOOR) == (Decimal("0.95"), Decimal("0.90"))
+
+    def test_a_dropped_or_invented_column_fails_the_run(self) -> None:
+        """Coverage is part of the verdict, not just of the score: an asset that
+        reads as classified with a column nobody assessed is the defect the
+        handler's guard exists for."""
+        run = RunOutcome(
+            index=1, scores=(self.scored(*self.perfect().outcomes, missing=("m",), invented=("i",)),)
+        )
+
+        assert run.passed is False
+        assert any("missing ('m',)" in reason for reason in run.reasons), run.reasons
+
+    def test_an_unresolvable_citation_fails_the_run(self) -> None:
+        """A correct label with an unsupported citation still fails (#50)."""
+        run = RunOutcome(
+            index=1,
+            scores=(self.scored(*self.perfect().outcomes, evidence_failures=("bad locator",)),),
+        )
+
+        assert run.passed is False
+        assert any("unresolvable" in reason for reason in run.reasons), run.reasons
+
+    def test_one_failing_run_of_three_fails_the_report(self) -> None:
+        """**The averaging rule, as code.** #50 requires three runs *each
+        independently* over threshold, because a model scoring 0.96 then 0.93
+        has not met a 0.95 bar. Changing `all` to `any` in `_report` passes this
+        set and fails only here."""
+        good = RunOutcome(index=1, scores=(self.perfect(),))
+        bad = RunOutcome(index=2, scores=(), result_error="unparseable submission")
+
+        report = classification._report([good, bad, good], ())
+
+        assert report.passed is False
+        assert "NOT retried" in report.detail
+
+    def test_three_clean_runs_pass(self) -> None:
+        """The pair to the above, so it cannot be met by a report that always
+        fails."""
+        runs = [RunOutcome(index=i, scores=(self.perfect(),)) for i in (1, 2, 3)]
+
+        assert classification._report(runs, ()).passed is True
+
+    def test_no_runs_at_all_is_not_a_pass(self) -> None:
+        """`all([])` is True. An empty run list must not report PASS — the
+        purest form of this repository's signature defect."""
+        assert classification._report([], ()).passed is False
+
+    def test_the_report_names_the_column_the_runs_disagreed_on(self) -> None:
+        """"The runs disagreed on 2 columns" tells a reader nothing; naming the
+        column and what each run said is the reason #50 asks for three."""
+        agree = self.outcome("stable", (PII,), (PII,), cited=("column_name=stable",))
+        runs = [
+            RunOutcome(index=1, scores=(self.scored(agree, self.outcome("wobbly", (), (PII,))),)),
+            RunOutcome(index=2, scores=(self.scored(agree, self.outcome("wobbly", (), ())),)),
+        ]
+
+        detail = classification._report(runs, ()).detail
+
+        assert "t.wobbly" in detail
+        assert "t.stable" not in detail
+
+    def test_runs_that_agree_report_no_disagreement(self) -> None:
+        """Otherwise the test above is satisfied by naming every column."""
+        runs = [RunOutcome(index=i, scores=(self.perfect(),)) for i in (1, 2)]
+
+        assert classification._disagreements(runs) == ()
+
+    def test_the_suite_runs_three_times(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`RUNS = 3` is a published claim, and the loop has to honour it.
+        Asserting the constant alone would pass a loop that ran once."""
+        calls: list[int] = []
+
+        def fake_one_run(gateway: object, requests: object, *, index: int) -> RunOutcome:
+            calls.append(index)
+            return RunOutcome(index=index, scores=(self.perfect(),))
+
+        monkeypatch.setattr(classification, "_require_gateway", lambda gateway: None)
+        monkeypatch.setattr(classification, "_one_run", fake_one_run)
+
+        report = classification.run_classification(object())  # type: ignore[arg-type]
+
+        assert calls == [1, 2, 3] == list(range(1, classification.RUNS + 1))
+        assert report.passed is True
