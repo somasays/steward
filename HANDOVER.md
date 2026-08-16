@@ -32,7 +32,7 @@ gates SKIP until M2.
 **#69, #48 and #74 are closed.** PR #81 merged the classification schemas, migration `0006`, the
 repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
-### Open: #50, #84, #85, #86 — and see "what the two preflight passes found" below
+### Open: #50, #84, #85, #86, #88, #89 — and see the two review sections below
 
 **PR #83 merged at `1be2a02`** (rebase, linear history, branch kept — the style #81 and #82 used). It
 landed **#50 steps 7–8**. It went through **five review rounds**, and rounds 3, 4 and 5 each found a
@@ -150,6 +150,45 @@ tool-call path works and found where it does not.
 Filed **#86**: the runtime asserts prose that did not exist, and a completed response with no
 content, no tool calls and non-zero usage deserves its own message. The #85 shape — a later, less
 informative failure replacing the real one. It cost this session an hour.
+
+### What an independent review of PR #87 found — four merge blockers, all real, all fixed
+
+Verified against the code rather than accepted, then fixed in `29884c8`. Worth reading because two
+of them are the signature pathology again:
+
+1. **Suite selection failed open.** `_changed_paths` tested `diff.returncode != 0 **and**
+   working.returncode != 0`. The common case is one of the two: a clone with no `origin/main` fails
+   the diff with rc 128 while `git status` returns rc 0 and, on a clean worktree, nothing — so paths
+   came out empty, the suite was not selected, and the runner printed "no eval suite is affected by
+   this change" and exited 0. **A green B\* that measured nothing**, contradicting the docstring
+   directly above it, which already promised over-selection. Now `or`, with a positive case beside
+   the three failure cases so it cannot be satisfied by always selecting.
+2. **The selector was blind to what decides a B2 run.** It named prompts, the classifier, the
+   handler and the fixture — not the binding table, the transport, the agent loop or the ledger. A
+   change to the model `steward-classify` resolves to did not trigger classification evals. Now
+   includes `steward-llm/`, `steward-agents/`, and `steward_queue/runs.py` + `usage.py` — that last
+   pair on evidence, since the rounding defect above failed every B2 run without touching anything
+   the old list named.
+3. **A missing proxy escaped the tri-state.** `_require_gateway` checked bindings, not the proxy, and
+   `classify_once`'s `ClassifierFailed` is caught by nothing — `_one_run` handles only
+   `EvaluationInfrastructureError` and `EvaluationResult`. A valid gateway with no
+   `STEWARD_LLM_PROXY_URL` produced a traceback and exit 1 where the contract promises
+   `EXIT_NO_ENDPOINT`. The line carried `# pragma: no cover -- the caller checks first`; **no caller
+   did.** A pragma is a claim, and that one was false.
+4. **`release_evidence` was two unvalidated strings.** `litellm.production.yaml` falls
+   `steward-classify` back to `steward-fast` and `CompletionResult` carries the alias, not what
+   answered — so a run served entirely by the fallback was indistinguishable from one served by the
+   classifier model, and any non-empty pair of env vars turned the claim on. Now fails closed on
+   three conditions: immutable digests (a moving tag is rejected), `REQUIRED`, and the responding
+   model on record. The third is **#89** and is not satisfiable today, so the claim is refused.
+
+And the process one, which is why "the release job" now reads differently everywhere:
+
+> **A guardrail describing enforcement that does not exist is not a guardrail.** Six places said "the
+> designated release job sets `STEWARD_EVALS_REQUIRED=1`". `.github/workflows/ci.yml` has the fitness
+> gate and the secret scan; the flag appears nowhere in `.github/`. B\* is SKIP on every CI run and
+> the `live_gateway` marker is never selected — so **CI green on this branch means B2 skipped, not B2
+> passed.** Tracked as **#88**; every mention now says the job does not exist yet.
 
 ### It is the `encounters` table, not the model — two models, two parsers, same table
 
@@ -299,7 +338,7 @@ failures from the real transport path; an approximate server fixture answers a d
 **#84** (authenticate the rest of the API surface) is a release blocker before external exposure, and
 is deliberately not a prerequisite for B2. **#85** (a failed checkpoint save replaces the agent
 failure that caused it) and **#86** (an empty completion is reported as the model answering in prose)
-were both found while running a real classification and are filed separately.
+were both found while running a real classification. **#88** (no release job runs B2 or the live smoke) and **#89** (an artifact cannot say which model actually served a run) came out of PR #87's review. All four are filed separately.
 
 ## How this project works — the rules that matter
 
