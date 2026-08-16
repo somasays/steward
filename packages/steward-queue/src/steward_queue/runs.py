@@ -27,7 +27,7 @@ from steward_queue.audit import RUN_ENTITY, write_audit
 from steward_queue.db import QueueConnection
 from steward_queue.keys import digest
 from steward_queue.models import SYSTEM_ACTOR, Actor, RunRecord, RunStatus
-from steward_queue.usage import NOTHING_SPENT
+from steward_queue.usage import NOTHING_SPENT, ledger_cost
 
 __all__ = [
     "bind_idempotency_key",
@@ -64,6 +64,12 @@ class RunBudgetBreached(RuntimeError):
     a query rather than a guess. This exception is how the *task* learns, so it
     can end as `budget_exceeded` instead of succeeding on spend the run declined
     to record.
+
+    `requested` is the charge **at the ledger's scale** — what the run was asked
+    to absorb, in the precision it can hold. The gateway's unrounded figure is on
+    the audit row instead: this object exists to say a cap was crossed, and a
+    difference below `LEDGER_COST_SCALE` is the column's resolution rather than a
+    breach.
     """
 
     def __init__(self, run_id: UUID, requested: RunBudget, applied: RunBudget) -> None:
@@ -384,8 +390,9 @@ def record_step_usage(
     was done, the stored totals say was paid for.
 
     Returns the breach when the charge was larger than the run had left, and
-    `None` otherwise. A **return** rather than a raise, because the caller has
-    not committed yet: an exception here would roll back the clamp and the audit
+    `None` otherwise — where "larger" is decided at `LEDGER_COST_SCALE`, because
+    that is the precision the balance is kept in. A **return** rather than a
+    raise, because the caller has not committed yet: an exception here would roll back the clamp and the audit
     row along with everything else, and the evidence this function exists to
     preserve would be the first casualty of announcing it.
     """
@@ -401,7 +408,19 @@ def record_step_usage(
     conn.execute(_sql.ADD_TASK_USAGE, {"id": task_id, **amounts})
     was, now = _applied(row_values)
     applied = now.remaining(was)
-    overspend = amount.remaining(applied)
+    # Decided at the scale the ledger stores, not the scale the gateway computed.
+    # `used_cost_usd` is `numeric(14, 6)`, and `was` is already an exact multiple
+    # of that scale, so the delta read back is `ledger_cost(amount.cost_usd)`
+    # exactly whenever nothing was clamped. Differencing the *unrounded* figure
+    # against it reports the seventh decimal place as an overspend -- which is
+    # the column's resolution, not a breach, and which lands on a correct run
+    # whenever the cost happens to round down. The first live classification run
+    # failed all three attempts that way: a $0.000075 step against a $0.50 cap,
+    # with steps and tokens applied unclamped. `LEDGER_COST_SCALE` states the
+    # rule ("anything comparing a computed figure against a stored one has to
+    # round the same way first"); this is the comparison it governs.
+    charged = amount.model_copy(update={"cost_usd": ledger_cost(amount.cost_usd)})
+    overspend = charged.remaining(applied)
     write_audit(
         conn,
         actor=actor,
@@ -414,7 +433,11 @@ def record_step_usage(
             "task_id": str(task_id),
             "step": True,
             # Durable, and the reason clamping does not lose the truth: the
-            # balance is capped, the *fact* is not.
+            # balance is capped, the *fact* is not. Recorded at full precision
+            # while `overspend` is decided at the ledger's scale, so the trail
+            # keeps both what the gateway charged and what the run declined to
+            # record. The gap between them is quantization, and it is visible
+            # here rather than folded into either figure.
             "requested": _usage_fields(amount),
             "applied": _usage_fields(applied),
             "overspend": _usage_fields(overspend),
@@ -427,7 +450,7 @@ def record_step_usage(
     # row that *are* the evidence -- so the exception meant to announce the
     # breach would destroy the record of it. The caller commits, then decides
     # what to do about the return value (SPEC.md §13 D13).
-    return RunBudgetBreached(run_id, amount, applied)
+    return RunBudgetBreached(run_id, charged, applied)
 
 
 def record_usage(conn: QueueConnection, run_id: UUID, result: TaskResult, *, actor: Actor) -> None:
