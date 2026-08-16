@@ -11,7 +11,7 @@ so the engineering process is part of the product: every claim is backed by a re
    matrix, the enforcement status, and the amendment process in §7.
 3. `SPEC.md` — component design, roadmap M0–M6, and the decision records **D1–D15** in §13.
 4. `CLAUDE.md` — the development workflow. Follow it exactly; it encodes rules this project paid for.
-5. `PROOFS.md` — 117 rows, each a claim plus the command that reproduces it.
+5. `PROOFS.md` — 146 rows, each a claim plus the command that reproduces it.
 
 If they conflict: ARCHITECTURE > GUARDRAILS > SPEC > CLAUDE.md. **SPEC also outranks anything I tell a
 subagent in a dispatch brief** — if SPEC says something is permitted, an agent will believe it over the
