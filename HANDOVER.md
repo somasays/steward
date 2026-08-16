@@ -32,7 +32,7 @@ gates SKIP until M2.
 **#69, #48 and #74 are closed.** PR #81 merged the classification schemas, migration `0006`, the
 repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
-### Nothing is open
+### Open: #50, #84, #85, #86 — and see "what the two preflight passes found" below
 
 **PR #83 merged at `1be2a02`** (rebase, linear history, branch kept — the style #81 and #82 used). It
 landed **#50 steps 7–8**. It went through **five review rounds**, and rounds 3, 4 and 5 each found a
@@ -98,13 +98,81 @@ Resolved by splitting the workflow from the capability:
 Rejected, with reasons in D15: a `packages/steward-classifier`, and teaching the goal registry about
 entry-point-provided task types.
 
-## What to do next: finish B2 — but read these two checks first
+## What to do next: finish B2
 
-**#50 is open and must stay open.** B2 has a fixture, a scorer and a three-run gate; it has
-**never executed against a model**, so there are no B2 quality results. Do not quote a number that
-does not exist, and do not close #50 on the machinery being present.
+**#50 is open and must stay open.** The harness has now **executed against a model twice** and
+**neither pass reached scoring** — both died on defects. So there are still **no B2 quality
+results**. Do not quote a number that does not exist, and do not close #50 on the machinery
+being present.
+
+### What the two preflight passes found (2026-08-16)
+
+**Pass 1 — a production accounting defect, now fixed.** All three runs failed identically:
+
+```
+result: run 4d73dcab... had less left than this step spent:
+        requested 1 steps / 3096 tokens / 0.00007528, applied 1 / 3096 / 0.000075
+```
+
+Not a budget breach — the **seventh decimal place**. `record_step_usage` differenced the gateway's
+unrounded cost against the delta the ledger stored, and `used_cost_usd` is `numeric(14, 6)`. Steps
+and tokens applied unclamped, against a $0.50 cap on a $0.000075 step. Direction decides it: a cost
+rounding *up* floors to no breach, one rounding *down* reports one, so a **correct run failed or
+passed on what the model happened to charge**. `LEDGER_COST_SCALE` already stated the rule this code
+broke. Fixed in `fix(queue): a cost below the ledger's resolution is not a budget breach (#50)`;
+`budget_cost_usd` is at the same scale, so both operands of "did this exceed what is left" now agree,
+and the SQL clamp — which is what I12 actually rests on — was never involved.
+
+It reached `DurableCheckpointStore` on every agent step, so **every real classification run tripped
+it**, and the live gateway smoke test would have too. Neither had ever run against a model, which is
+why nobody had seen it.
+
+**Pass 2 — the preflight model, not Steward.** Every run then died on `encounters`, one of the three
+fixture tables, reported as "the agent stopped without calling `submit_result` ... never as prose".
+It produced no prose. It produced **nothing**: `finish_reason: stop`, empty content, no tool call,
+240–480 billed completion tokens. Narrowed a layer at a time with the byte-identical body from
+`steward_llm.wire.request_body`:
+
+| layer | result |
+|---|---|
+| eval → runtime → transport → LiteLLM → Ollama | empty, `stop`, 479 tokens |
+| raw SSE from LiteLLM (streaming) | empty content, no tool call, 479 tokens |
+| same body non-streaming through LiteLLM | empty content, 479 tokens |
+| **direct to Ollama, bypassing LiteLLM** | **empty content, 479 tokens** |
+
+Not the streaming path, not LiteLLM, not Steward's transport — the transport parsed exactly what
+arrived. Not a decoding parameter either: `{temperature:0,seed:N}`, `{temperature:0}`, `{seed:N}`
+and `{}` all reproduce it; one earlier call did return a valid tool call, so it is stochastic and
+mostly failing. `customers` and `payments` produce valid submissions with **exact column coverage on
+every attempt**, so the preflight did the job its own config claims — it proved the streaming
+tool-call path works and found where it does not.
+
+Filed **#86**: the runtime asserts prose that did not exist, and a completed response with no
+content, no tool calls and non-zero usage deserves its own message. The #85 shape — a later, less
+informative failure replacing the real one. It cost this session an hour.
+
+### The gap that remains, and it is the important one
+
+**The harness's success path has still never executed.** `score_table` over real output, `_report`,
+`_disagreements`, threshold evaluation and `_persist` with real runs have never run. Leaving it there
+would be this repository's signature pathology wearing a new coat: a gate whose green path is
+untested. Closing that gap needs a local model that clears `encounters` — a pull of
+`llama3.1:8b` was in flight when this session ended (different chat template and tool parser, so a
+better chance of dodging whatever Ollama's qwen2.5 path does). If it clears the table, point
+`litellm.preflight-ollama.yaml` at it, say in the commit why, and run the three-run gate to
+completion. **Even a quality FAIL is the goal here** — the point is that scoring, disagreement
+reporting and the artifact all execute. This is an environment change to a file that already
+declares itself not the evidence of record; the **fixture and the prompt stay untouched** (step 4
+below).
 
 Branch **`m1/50-b2-and-smoke`** (pushed, `make fitness` green on every commit) carries:
+
+- **The artifact now says what produced it and whether it may be quoted.** `--artifacts` documented a
+  default of `evals/artifacts` while defaulting to `None`, so no invocation of the gate had ever
+  written one. It writes by default (git-ignored) with the fixture version *read from the file* rather
+  than a literal, the model alias, a digest of the gateway config, and the proxy image and model
+  revision where pinned. `release_evidence` is **computed** from those pins plus
+  `STEWARD_EVALS_REQUIRED=1`, never asserted.
 
 - `evidence_problems()` — one definition of "this citation resolves", shared by the repository and
   the scorer, so the eval cannot pass what production refuses.
@@ -181,10 +249,12 @@ failures from the real transport path; an approximate server fixture answers a d
 
 ### Then, in order
 
-1. **Run the three preflight evaluations** (`uv run steward evals run classification` against the
-   pinned LiteLLM → Ollama preflight). The harness has never executed end to end — expect defects.
-2. **Confirm every artifact is explicitly non-release.** Ollama scores characterise a model no
-   deployment runs; an artifact that does not say so will eventually be read as if it did.
+1. **Get one preflight pass all the way through scoring** — see "the gap that remains" above. Two
+   passes have run and both died before scoring; the remaining blocker is a local model that clears
+   `encounters`, not the harness.
+2. ~~Confirm every artifact is explicitly non-release.~~ **Done** — `release_evidence` is computed
+   from the pins plus `STEWARD_EVALS_REQUIRED=1`, and the note says so in words. Still worth reading
+   the first artifact a real run produces: that code path has not executed against real runs either.
 3. **Inspect each independent verdict**, coverage, evidence validity, metrics, retries and
    column-level disagreements. Read the disagreement output specifically: it is the part no single
    run can show, and the reason #50 asks for three.
@@ -203,7 +273,8 @@ failures from the real transport path; an approximate server fixture answers a d
 
 **#84** (authenticate the rest of the API surface) is a release blocker before external exposure, and
 is deliberately not a prerequisite for B2. **#85** (a failed checkpoint save replaces the agent
-failure that caused it) was found while running a real classification and is filed separately.
+failure that caused it) and **#86** (an empty completion is reported as the model answering in prose)
+were both found while running a real classification and are filed separately.
 
 ## How this project works — the rules that matter
 
@@ -315,6 +386,26 @@ And one that is not a hollow check but a contradiction worth naming:
 > one. No output satisfies both, so a cooperative classifier burned a model call and its one correction
 > before failing as `classifier-failed` — an error naming the classifier for a property of the asset. When
 > two constraints cannot both hold, refuse before the expensive step, not after.
+
+**The first two live B2 passes added three, and the first two are about code that had never run:**
+
+> **A check nothing has ever executed is not a check.** The accounting defect in `record_step_usage`
+> failed *every* real agent step and sat in `main` unnoticed, because the only things that exercise it
+> — B2 and the live gateway smoke — had never been run against a model. Twenty green fitness functions
+> did not touch it. When a component's only real exercise is gated behind "no endpoint is reachable",
+> the SKIP is not neutral: it is the untested half of the system, and it grows.
+
+> **Two numbers compared at different precisions is a coin flip, not a check.** The unrounded cost from
+> the gateway against the six-decimal figure the ledger stored: rounding down reported an overspend,
+> rounding up reported none. Right answer roughly half the time, on a *correct* run, decided by the
+> seventh decimal place of whatever the model charged. The helper that fixes it (`ledger_cost`) already
+> existed on the same branch, for the same reason, applied to a different comparison — so the lesson is
+> not "round consistently" but **when you write a rounding helper, find every comparison it governs.**
+
+> **An error message that names a behaviour is a claim, and it can be false.** "stopped without calling
+> `submit_result` ... never as prose" asserts prose. There was none — the model returned nothing at all
+> while billing 479 tokens. An hour went into looking for a chatty model. When you write the message for
+> a failure branch, check it is true of *every* state that reaches it, not the one you had in mind (#86).
 
 Guard the **pathology** (baseline == HEAD, 0 bytes scanned, 0 rows, 0 entry points enumerated, 0 columns
 covered), never an allowlist of known-safe cases. Treat a count offered as evidence as suspect: on the

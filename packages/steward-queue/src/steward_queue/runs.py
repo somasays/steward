@@ -392,9 +392,10 @@ def record_step_usage(
     Returns the breach when the charge was larger than the run had left, and
     `None` otherwise — where "larger" is decided at `LEDGER_COST_SCALE`, because
     that is the precision the balance is kept in. A **return** rather than a
-    raise, because the caller has not committed yet: an exception here would roll back the clamp and the audit
-    row along with everything else, and the evidence this function exists to
-    preserve would be the first casualty of announcing it.
+    raise, because the caller has not committed yet: an exception here would
+    roll back the clamp and the audit row along with everything else, and the
+    evidence this function exists to preserve would be the first casualty of
+    announcing it.
     """
     amounts = {
         "steps": amount.steps,
