@@ -233,10 +233,21 @@ GUARDRAILS still describe a Dockerized fixture warehouse and Langfuse datasets),
 (`pgserver`/`httpx` imported in `src/` undeclared), **#94** (the runner ignores which suite was
 selected), **#95** (the live smoke can pass its provenance check writing no evidence file).
 
-One gap left open on purpose: **~2,600 of the branch's inserted lines have an evidence row in
-neither `PROOFS.md` nor the PR body.** That is not the single-writer rule — those claims are in no
-ledger at all. The `evidence_problems`-is-one-definition claim and the scorer's anti-vacuity rules
-are cheap to prove and currently unproven.
+That gap is now closed: PR #87's body carries a second proof table for the earlier harness — the
+shared evidence resolver, the tri-state gate, the typed retry boundary, the fixture and scorer, the
+three-run verdict and the state-machine claim — with every command re-run against the tip. It also
+says plainly what is **not** proven, because it does not exist: no B2 quality result and no
+live-vLLM proof.
+
+A third review round asked for the one thing missing from the I7 fix, and it is worth carrying:
+
+> **A fix verified by hand is not a fix with a test.** `_claimed_task` was corrected and checked
+> against a real database in the session that changed it — and nothing was committed, so restoring
+> the raw `UPDATE` stayed green. `test_eval_claim.py` pins it now. Note which assertion does the
+> work: the fencing-pair test passes against the defect too, because the raw UPDATE also produced
+> `running`/`b2-eval`/attempts=1. Only `task.claimed` preceding `task.started` in the audit log, and
+> the real trace id, actually catch it. **When a fix restores something invisible, assert the
+> invisible thing.**
 
 ### It is the `encounters` table, not the model — two models, two parsers, same table
 
