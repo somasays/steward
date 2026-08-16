@@ -237,8 +237,10 @@ Branch **`m1/50-b2-and-smoke`** (pushed, `make fitness` green on every commit) c
   default of `evals/artifacts` while defaulting to `None`, so no invocation of the gate had ever
   written one. It writes by default (git-ignored) with the fixture version *read from the file* rather
   than a literal, the model alias, a digest of the gateway config, and the proxy image and model
-  revision where pinned. `release_evidence` is **computed** from those pins plus
-  `STEWARD_EVALS_REQUIRED=1`, never asserted.
+  revision where pinned. `release_evidence` is **computed and fails closed** on three
+  conditions — immutably pinned digests (a moving tag is rejected), `STEWARD_EVALS_REQUIRED=1`,
+  and the responding model on record. The third is #89 and is not satisfiable today, so the
+  claim is currently refused however the run is configured, and the note names what is missing.
 
 - `evidence_problems()` — one definition of "this citation resolves", shared by the repository and
   the scorer, so the eval cannot pass what production refuses.
@@ -316,9 +318,11 @@ failures from the real transport path; an approximate server fixture answers a d
 ### Then, in order
 
 1. **Get one preflight pass all the way through scoring.** The blocker is `encounters` (above), not the harness — `score_table` and `evidence_problems` are now proven on live output. Reaching `_report`/`_disagreements`/`_persist` needs a model that answers that table; the honest next move is the vLLM run rather than a third local model, since two have now failed the same way.
-2. ~~Confirm every artifact is explicitly non-release.~~ **Done** — `release_evidence` is computed
-   from the pins plus `STEWARD_EVALS_REQUIRED=1`, and the note says so in words. Still worth reading
-   the first artifact a real run produces: that code path has not executed against real runs either.
+2. ~~Confirm every artifact is explicitly non-release.~~ **Done, and it now fails closed** —
+   `release_evidence` requires immutable digests, `STEWARD_EVALS_REQUIRED=1` **and** the responding
+   model on record; the third is #89, so the claim is refused today and the note names every missing
+   condition. Landing #89 is what makes a true `release_evidence` reachable at all. Still worth
+   reading the first artifact a real run produces: that path has not executed against real runs.
 3. **Inspect each independent verdict**, coverage, evidence validity, metrics, retries and
    column-level disagreements. Read the disagreement output specifically: it is the part no single
    run can show, and the reason #50 asks for three.
