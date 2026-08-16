@@ -32,7 +32,7 @@ gates SKIP until M2.
 **#69, #48 and #74 are closed.** PR #81 merged the classification schemas, migration `0006`, the
 repository and the review lifecycle. **PR #82** merged #50 steps 1–6.
 
-### Open: #50, #84, #85, #86, #88, #89 — and see the two review sections below
+### Open: #50, #84, #85, #86, #88–#95 — and see the two review sections below
 
 **PR #83 merged at `1be2a02`** (rebase, linear history, branch kept — the style #81 and #82 used). It
 landed **#50 steps 7–8**. It went through **five review rounds**, and rounds 3, 4 and 5 each found a
@@ -189,6 +189,54 @@ And the process one, which is why "the release job" now reads differently everyw
 > gate and the secret scan; the flag appears nowhere in `.github/`. B\* is SKIP on every CI run and
 > the `live_gateway` marker is never selected — so **CI green on this branch means B2 skipped, not B2
 > passed.** Tracked as **#88**; every mention now says the job does not exist yet.
+
+### What the independent architecture-guardian pass found — the gate did not gate
+
+Two reviewers over the full `main...HEAD` diff, one invariant-led and one hunting hollow checks.
+**Both returned FAIL.** Every violation was re-verified against the code before being acted on; all
+are fixed in `75ba2c1`. The headline is the worst shape this repository has produced yet:
+
+> **B2's verdict had no tests.** Zeroing `PII_RECALL_FLOOR` *and* `PII_PRECISION_FLOOR`, setting
+> `RUNS = 1`, and changing `all(...)` to `any(...)` in `_report` left **285 tests passing**. Every
+> claim GUARDRAILS' B2 row makes — both floors, and "three pinned runs, each independently over
+> threshold" — could be deleted and the whole repository stayed green. The scorer was covered and the
+> artifact was covered; the code that turns scores into PASS/FAIL was not. `all([])` is `True`, so an
+> empty run list reported PASS as well. **The gate this branch exists to build did not gate.**
+
+`TestTheVerdict` in `test_eval_scoring.py` closes it — 13 tests, no model, because the eval package's
+own argument is that "the gate's own behaviour is testable where the thing it gates is not". Each of
+the four mutations now fails. Re-run them before touching thresholds or the run loop.
+
+Three invariant violations, all in the fitness suite's known blind spots — which is the lesson:
+
+- **I5** — `conn.execute(f"SELECT {raw}::numeric(14,6)")`. S608 cannot see it (no `FROM`/`WHERE` for
+  its regex), and it was the only `conn.execute(f"` in the repo. Parameterised.
+- **I7** — `harness.py` mutated `tasks` with its own `UPDATE ... SET state = 'running'`, skipping
+  `claimed` in the state machine and writing no audit rows. Invisible to H5, which sweeps the
+  repository registry and cannot see a service issuing raw SQL. Now `claim` + `mark_running`;
+  verified against a real database, the trail gains `task.claimed`, `task.started` and
+  `run.status_changed`, and the run carries a real trace id where the old code hardcoded `"0" * 32`.
+- **I4** — `test_live_gateway.py` imports `steward_orchestration`, undeclared in
+  `services/workers/pyproject.toml`. S1's `root_packages` are the `src/` trees, so a `tests/` import
+  is outside every contract — the third time this exact blind spot has bitten. Declared.
+
+**Read this if you take one thing from the pass:** all four findings sat where a green suite cannot
+look. Twenty fitness functions were green over a gate that measured nothing and three invariant
+breaches. A self-review by the working session had already passed over the same diff and found none
+of them.
+
+Filed rather than fixed: **#90** (B* prints PASS both when a suite passed and when none was
+selected — the same two-states-one-code shape `EXIT_NO_ENDPOINT` exists to prevent), **#91** (at 4
+PII columns "recall ≥ 0.95" is really "miss nothing" and "precision ≥ 0.90" is "zero false
+positives"; the quoted tolerance is not expressible at this fixture size), **#92** (SPEC and
+GUARDRAILS still describe a Dockerized fixture warehouse and Langfuse datasets), **#93**
+(`pgserver`/`httpx` imported in `src/` undeclared), **#94** (the runner ignores which suite was
+selected), **#95** (the live smoke can pass its provenance check writing no evidence file).
+
+One gap left open on purpose: **~2,600 of the branch's inserted lines have an evidence row in
+neither `PROOFS.md` nor the PR body.** That is not the single-writer rule — those claims are in no
+ledger at all. The `evidence_problems`-is-one-definition claim and the scorer's anti-vacuity rules
+are cheap to prove and currently unproven.
 
 ### It is the `encounters` table, not the model — two models, two parsers, same table
 
