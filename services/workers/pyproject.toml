@@ -35,6 +35,12 @@ dependencies = [
 [dependency-groups]
 dev = [
     "steward-api",
+    # Same shape, second edge: the live gateway smoke admits a run the way
+    # `steward_api.store` does internally -- `plan_run` plus the goal constant --
+    # rather than over HTTP, because a test tree may not import both services
+    # (I4). That import resolved only through `steward-api`'s own dependency on
+    # this package, i.e. the accident this block exists to stop being one.
+    "steward-orchestration",
 ]
 
 [project.scripts]
@@ -51,6 +57,7 @@ steward-catalog = { workspace = true }
 steward-llm = { workspace = true }
 steward-agents = { workspace = true }
 steward-api = { workspace = true }
+steward-orchestration = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

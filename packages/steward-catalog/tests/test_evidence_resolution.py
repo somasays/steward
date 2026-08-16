@@ -107,18 +107,19 @@ def test_a_citation_of_a_recorded_fact_has_no_problems() -> None:
     assert evidence_problems(a_proposal(sensitive(a_reference())), a_profile()) == ()
 
 
-@pytest.mark.parametrize(
-    ("kind", "locator"),
-    [
-        (EvidenceKind.COLUMN_NAME, "email"),
-        (EvidenceKind.DATA_TYPE, "text"),
-        (EvidenceKind.SEMANTIC_TYPE, "email"),
-        (EvidenceKind.NULL_RATIO, "0.000000"),
-        (EvidenceKind.DISTINCT_RATIO, "1.000000"),
-        (EvidenceKind.MASKED_SAMPLE, MASKED_EMAIL),
-    ],
-    ids=lambda value: str(value),
-)
+KIND_CASES = [
+    (EvidenceKind.COLUMN_NAME, "email"),
+    (EvidenceKind.DATA_TYPE, "text"),
+    (EvidenceKind.SEMANTIC_TYPE, "email"),
+    (EvidenceKind.NULL_RATIO, "0.000000"),
+    (EvidenceKind.DISTINCT_RATIO, "1.000000"),
+    (EvidenceKind.MASKED_SAMPLE, MASKED_EMAIL),
+]
+"""One locator per kind. Named so completeness can be asserted against the enum
+rather than trusted to whoever adds the next kind."""
+
+
+@pytest.mark.parametrize(("kind", "locator"), KIND_CASES, ids=lambda value: str(value))
 def test_every_kind_resolves_against_the_fact_it_names(
     kind: EvidenceKind, locator: str
 ) -> None:
@@ -127,6 +128,21 @@ def test_every_kind_resolves_against_the_fact_it_names(
     reference = a_reference(kind=kind, locator=locator)
 
     assert evidence_problems(a_proposal(sensitive(reference)), a_profile()) == ()
+
+
+def test_every_kind_has_a_case_above() -> None:
+    """The parametrize list is literals, so it cannot notice a kind nobody added
+    to it — the completeness check that only inspects what is present, which is
+    the shape this repository keeps shipping. A seventh `EvidenceKind` would
+    leave the test above green while `_resolve` raised on it in production.
+
+    Comparing the enum to the cases makes the enum the authority.
+    """
+    covered = {kind for kind, _ in KIND_CASES}
+
+    assert covered == set(EvidenceKind), (
+        f"no resolution case for {sorted(k.value for k in set(EvidenceKind) - covered)}"
+    )
 
 
 def test_a_locator_the_profile_does_not_hold_is_a_problem() -> None:

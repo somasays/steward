@@ -228,7 +228,8 @@ exact by name on both tables, and all six hard negatives were correct. The one m
 multi-label `card_number` — the case the fixture was built to catch.
 
 Still never executed against a model: `_report`, `_disagreements` across three runs, the threshold
-gate, and `_persist` on real runs. Those are unit-tested but have not seen live output, and a gate
+gate, and `_persist` on real runs. `_persist` is unit-tested; `_report`, `_disagreements` and the
+threshold comparison were **not tested at all** until PR #87's guardian pass found it — see below. A gate
 whose green path is untested is this repository's signature pathology wearing a new coat.
 
 Branch **`m1/50-b2-and-smoke`** (pushed, `make fitness` green on every commit) carries:

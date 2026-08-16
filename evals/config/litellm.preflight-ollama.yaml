@@ -27,7 +27,7 @@
 # works. Instead the local endpoint is *approved*, via the override
 # approved_endpoints.yaml documents for a deployment whose service names differ:
 #
-#   STEWARD_LLM_APPROVED_ENDPOINTS=http://localhost:11434/v1
+#   STEWARD_LLM_APPROVED_ENDPOINTS=http://host.docker.internal:11434/v1
 #
 # Localhost is admissible because the deny layer refuses hosted provider APIs and
 # `openai/` is an accepted self-hosted prefix — models addressed by URL. Note the
