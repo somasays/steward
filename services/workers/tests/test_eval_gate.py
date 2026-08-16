@@ -15,10 +15,11 @@ another is how a gate starts lying:
 * **selected, no endpoint** -> `EXIT_NO_ENDPOINT`, which the runner shows as SKIP
   with its reason. CI has no model and must not be permanently red; a laptop
   without one must not be either. **It is not a pass.**
-* **selected, no endpoint, REQUIRED** -> exit 1. The designated release job sets
-  `STEWARD_EVALS_REQUIRED=1`, and there "could not run" is a failure. That is
+* **selected, no endpoint, REQUIRED** -> exit 1. `STEWARD_EVALS_REQUIRED=1` is
+  what a release job would set, and there "could not run" is a failure. That is
   #50's "INCONCLUSIVE locally and a failure in the designated integration/release
-  job", as a flag rather than a convention.
+  job", as a flag rather than a convention. **No such job exists yet (#88)** — the
+  behaviour is pinned here, and unenforced in CI.
 * **selected, endpoint present, no fixture** -> exit 1, whatever REQUIRED says.
   An absent fixture is a fact about this repository, not this machine, and #50
   forbids it reporting PASS.
@@ -41,6 +42,12 @@ from steward_workers.evals.classification import AFFECTING_PATHS, CLASSIFICATION
 pytestmark = pytest.mark.invariants
 
 PREFLIGHT_CONFIG = "evals/config/litellm.preflight-ollama.yaml"
+PROXY_URL = "http://localhost:4000"
+PROXY_KEY = "not-a-secret"
+"""A reachable-looking proxy, for tests whose subject is *past* the endpoint
+check. A bound model with nothing to carry a request to it is INCONCLUSIVE like
+any other missing endpoint, so a test asserting a statement about the repository
+— an absent fixture — has to configure one or it asserts the machine instead."""
 LOCAL_ENDPOINT = "http://host.docker.internal:11434/v1"
 """Must equal the `api_base` in the preflight config — see the test below.
 
@@ -71,7 +78,7 @@ def test_a_selected_suite_with_no_endpoint_is_inconclusive_not_a_pass() -> None:
 def test_the_same_condition_is_a_failure_where_evidence_is_required(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`STEWARD_EVALS_REQUIRED=1` — what the release job sets.
+    """`STEWARD_EVALS_REQUIRED=1` — what a release job would set (#88: none does).
 
     Paired with the test above deliberately: one call, two environments, two exit
     codes. A runner that always returned 3, or always returned 1, would satisfy
@@ -110,6 +117,8 @@ def test_an_absent_fixture_fails_and_is_never_skipped(
     """
     monkeypatch.setenv("STEWARD_LITELLM_CONFIG", PREFLIGHT_CONFIG)
     monkeypatch.setenv("STEWARD_LLM_APPROVED_ENDPOINTS", LOCAL_ENDPOINT)
+    monkeypatch.setenv("STEWARD_LLM_PROXY_URL", PROXY_URL)
+    monkeypatch.setenv("STEWARD_LLM_PROXY_KEY", PROXY_KEY)
     monkeypatch.setenv("STEWARD_EVALS_REQUIRED", required)
     monkeypatch.setattr(classification, "FIXTURE_DIR", tmp_path / "absent")
 
@@ -123,6 +132,8 @@ def test_an_empty_fixture_fails_too(
     looks like a fixture and scores nothing."""
     monkeypatch.setenv("STEWARD_LITELLM_CONFIG", PREFLIGHT_CONFIG)
     monkeypatch.setenv("STEWARD_LLM_APPROVED_ENDPOINTS", LOCAL_ENDPOINT)
+    monkeypatch.setenv("STEWARD_LLM_PROXY_URL", PROXY_URL)
+    monkeypatch.setenv("STEWARD_LLM_PROXY_KEY", PROXY_KEY)
     (tmp_path / "fixture.v1.json").write_text(
         '{"version": "v", "description": "d", "tables": []}'
     )
@@ -230,39 +241,87 @@ class TestTheArtifact:
         assert payload["proxy_image"] == "unpinned (preflight)"
         assert payload["model_revision"] == "unpinned (preflight)"
 
-    def test_a_pinned_required_run_is_release_evidence(
+    DIGEST = "a" * 64
+    PINS = {
+        classification.PROXY_IMAGE_ENV: f"ghcr.io/berriai/litellm@sha256:{DIGEST}",
+        classification.MODEL_REVISION_ENV: f"sha256:{DIGEST}",
+    }
+
+    def test_a_fully_pinned_required_run_is_still_refused_while_89_is_open(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """The positive case beside it, so the assertion above cannot be
-        satisfied by a field hard-coded to False — the negative-only guard this
-        repository has shipped before (#82)."""
-        monkeypatch.setenv(classification.PROXY_IMAGE_ENV, "ghcr.io/berriai/litellm@sha256:abc")
-        monkeypatch.setenv(classification.MODEL_REVISION_ENV, "vllm@sha256:def")
+        """The claim fails **closed**.
+
+        `litellm.production.yaml` falls `steward-classify` back to
+        `steward-fast`, and nothing records which one answered, so a run served
+        entirely by the fallback looks identical to one served by the classifier
+        model. Quality numbers attributed to a model that never ran are worse
+        than none. The artifact says which condition is missing rather than going
+        quiet, and this test is what makes #89 land as a behaviour change.
+        """
+        for name, value in self.PINS.items():
+            monkeypatch.setenv(name, value)
         monkeypatch.setenv("STEWARD_EVALS_REQUIRED", "1")
 
         payload = self._payload(tmp_path)
 
-        assert payload["release_evidence"] is True
-        assert "NOT release evidence" not in str(payload["note"])
+        assert payload["release_evidence"] is False
+        assert "responding model is not recorded (#89)" in str(payload["note"])
+        assert payload["responding_model"] is None
+        assert payload["model_alias_requested"] == "steward-classify"
 
     @pytest.mark.parametrize(
-        ("pinned", "required"),
-        [(True, False), (False, True)],
+        ("value", "why"),
+        [
+            ("ghcr.io/berriai/litellm:main-stable", "a moving tag is not a pin"),
+            ("ghcr.io/berriai/litellm:latest", "nor is latest"),
+            ("sha256:tooshort", "nor is a malformed digest"),
+            ("", "nor is nothing"),
+        ],
     )
-    def test_half_a_pinning_is_not_release_evidence(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pinned: bool, required: bool
+    def test_a_mutable_tag_does_not_count_as_pinned(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str, why: str
     ) -> None:
-        """Both halves are needed. A pinned stack run without the flag is a
-        developer reproducing the release topology; a required run against an
-        unpinned one is a job that forgot to say what it ran against."""
-        for name in (classification.PROXY_IMAGE_ENV, classification.MODEL_REVISION_ENV):
-            monkeypatch.delenv(name, raising=False)
-        if pinned:
-            monkeypatch.setenv(classification.PROXY_IMAGE_ENV, "litellm@sha256:abc")
-            monkeypatch.setenv(classification.MODEL_REVISION_ENV, "vllm@sha256:def")
-        monkeypatch.setenv("STEWARD_EVALS_REQUIRED", "1" if required else "0")
+        """Two non-empty strings are not provenance. `main-stable` moves — the
+        compose file pins by digest for exactly this reason — and an artifact
+        naming a tag names a stack that may no longer exist."""
+        monkeypatch.setenv(classification.MODEL_REVISION_ENV, f"sha256:{self.DIGEST}")
+        monkeypatch.setenv(classification.PROXY_IMAGE_ENV, value)
+        monkeypatch.setenv("STEWARD_EVALS_REQUIRED", "1")
 
-        assert self._payload(tmp_path)["release_evidence"] is False
+        payload = self._payload(tmp_path)
+
+        assert "not pinned to immutable digests" in str(payload["note"]), why
+
+    def test_an_immutable_digest_does_count_as_pinned(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The positive case beside it, so the rejection above cannot be
+        satisfied by a rule that refuses everything — the negative-only guard
+        this repository has shipped before (#82). `pinned` is no longer visible
+        on the payload, so it is read through the blocker it stops producing."""
+        for name, value in self.PINS.items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.setenv("STEWARD_EVALS_REQUIRED", "1")
+
+        payload = self._payload(tmp_path)
+
+        assert "not pinned to immutable digests" not in str(payload["note"])
+
+    @pytest.mark.parametrize("required", ["0", "1"])
+    def test_an_unpinned_run_names_every_condition_it_misses(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, required: str
+    ) -> None:
+        """An artifact that said only "not release evidence" would send a reader
+        looking for one missing thing when there may be three."""
+        for name in self.PINS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("STEWARD_EVALS_REQUIRED", required)
+
+        note = str(self._payload(tmp_path)["note"])
+
+        assert "not pinned to immutable digests" in note
+        assert ("STEWARD_EVALS_REQUIRED is not 1" in note) is (required != "1")
 
     def test_the_fixture_version_is_the_one_that_was_read(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -302,6 +361,98 @@ class TestTheArtifact:
         root = Path(__file__).resolve().parents[3]
 
         assert "evals/artifacts/" in (root / ".gitignore").read_text()
+
+
+class TestSelectionFailsClosed:
+    """A baseline that cannot be resolved must over-select, never under-select.
+
+    `_changed_paths` promises in prose that "a failure to ask git is not an
+    answer: it returns everything-changed rather than nothing-changed, so a
+    broken invocation over-selects instead of quietly running no evals at all."
+    It tested `diff.returncode != 0 and working.returncode != 0` — **both** — and
+    the common case is one of the two: no `origin/main` fails the diff with rc
+    128 while `git status` returns rc 0 and, on a clean worktree, nothing. Empty
+    paths, suite not selected, "no eval suite is affected by this change", exit
+    0. A green B* that measured nothing, which is this repository's signature
+    defect.
+    """
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rcs: dict[str, int]) -> bool:
+        """Select against stubbed git commands with the given return codes."""
+
+        class _Result:
+            def __init__(self, returncode: int) -> None:
+                self.returncode = returncode
+                self.stdout = ""
+
+        def fake_run(cmd: list[str], **kwargs: object) -> _Result:
+            return _Result(rcs["diff" if cmd[1] == "diff" else "status"])
+
+        monkeypatch.setattr(classification.subprocess, "run", fake_run)
+        return CLASSIFICATION_SUITE.affected_by_working_tree()
+
+    @pytest.mark.parametrize(
+        ("rcs", "why"),
+        [
+            ({"diff": 128, "status": 0}, "no origin/main, clean worktree — the real case"),
+            ({"diff": 0, "status": 128}, "the mirror image"),
+            ({"diff": 128, "status": 128}, "both unavailable"),
+        ],
+    )
+    def test_a_git_failure_selects_the_suite(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rcs: dict[str, int], why: str
+    ) -> None:
+        assert self._run(monkeypatch, tmp_path, rcs) is True, why
+
+    def test_both_succeeding_on_a_clean_tree_still_selects_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The positive case beside them. Without it the three above are
+        satisfied by a function that always selects, which would mean the
+        pre-commit hook paying for three model runs on every commit."""
+        assert self._run(monkeypatch, tmp_path, {"diff": 0, "status": 0}) is False
+
+    def test_the_selector_covers_what_decides_a_b2_run(self) -> None:
+        """A path list is a dependency claim. These four are not speculative:
+        the model binding table and prices, the transport, the agent loop, and
+        the ledger seam whose rounding defect failed *every* B2 run on this
+        branch without touching a prompt, a fixture or a classifier."""
+        required = (
+            "packages/steward-llm/src/steward_llm/",
+            "packages/steward-agents/src/steward_agents/",
+            "packages/steward-queue/src/steward_queue/runs.py",
+            "packages/steward-queue/src/steward_queue/usage.py",
+        )
+
+        assert [path for path in required if path not in AFFECTING_PATHS] == []
+
+    def test_a_production_binding_change_selects_the_suite(self) -> None:
+        """The concrete case: changing the model `steward-classify` resolves to
+        is the most B2-relevant change there is, and none of the original paths
+        would have caught it."""
+        bindings = "packages/steward-llm/src/steward_llm/defaults/litellm.production.yaml"
+
+        assert bindings.startswith(AFFECTING_PATHS)
+
+
+def test_a_gateway_with_no_proxy_is_inconclusive_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound model and nothing to carry a request to it is still "this machine
+    cannot", not "this code is wrong".
+
+    `classify_once` refuses a missing proxy with `ClassifierFailed`, which
+    `_one_run` does not catch — it handles `EvaluationInfrastructureError` and
+    `EvaluationResult` only — so this escaped as a traceback and exit 1 where the
+    contract promises `EXIT_NO_ENDPOINT`. The line carried `# pragma: no cover --
+    the caller checks first`, and no caller did.
+    """
+    monkeypatch.setenv("STEWARD_LITELLM_CONFIG", PREFLIGHT_CONFIG)
+    monkeypatch.setenv("STEWARD_LLM_APPROVED_ENDPOINTS", LOCAL_ENDPOINT)
+    monkeypatch.delenv("STEWARD_LLM_PROXY_URL", raising=False)
+    monkeypatch.delenv("STEWARD_LLM_PROXY_KEY", raising=False)
+
+    assert main(["evals", "run", "classification"]) == EXIT_NO_ENDPOINT
 
 
 def test_the_declared_entry_point_is_the_one_the_gate_calls() -> None:

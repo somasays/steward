@@ -137,6 +137,10 @@ def configured() -> None:
     #50: missing proxy configuration is an explicit INCONCLUSIVE locally and a
     **failure** in the designated integration/release job. The same switch the
     eval runner uses, so one environment variable decides for both.
+
+    That job does not exist yet (#88): nothing in `.github/workflows` selects the
+    `live_gateway` marker or sets the flag, so this fixture's `fail` branch is
+    unreached in CI and this test skips on every run.
     """
     missing = _missing_configuration()
     if missing is None:

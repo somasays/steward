@@ -83,7 +83,13 @@ def classify_once(gateway: GatewayConfig, profile: TableProfile) -> Classificati
     laptop and in CI.
     """
     proxy = proxy_config_from_env(os.environ)
-    if proxy is None:  # pragma: no cover -- the caller checks first
+    if proxy is None:
+        # Belt and braces. `_require_gateway` now refuses a missing proxy up
+        # front, which is where the tri-state can still be honoured; reaching
+        # here means someone called this directly, so it stays a hard failure
+        # rather than a silent None. The pragma that used to sit on this line
+        # claimed "the caller checks first" before any caller did, so a real
+        # configuration escaped as a traceback and the line was never covered.
         raise ClassifierFailed("no proxy configured")
 
     with tempfile.TemporaryDirectory(prefix="steward-b2") as data_dir:

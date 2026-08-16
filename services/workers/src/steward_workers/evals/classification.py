@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from decimal import Decimal
@@ -38,7 +39,7 @@ from pathlib import Path
 
 from pydantic import Field, ValidationError
 from steward_catalog.models import CatalogModel
-from steward_llm import GatewayConfig
+from steward_llm import GatewayConfig, proxy_config_from_env
 from steward_schemas import (
     ColumnProfile,
     MaskedSample,
@@ -75,6 +76,20 @@ AFFECTING_PATHS = (
     "services/workers/src/steward_workers/evals/",
     "packages/steward-catalog/src/steward_catalog/classify_handler.py",
     "packages/steward-catalog/src/steward_catalog/classification.py",
+    # **What the model is, and how it is reached.** The binding table and the
+    # prices live in `defaults/`, the transport and the wire format beside them.
+    # A change to the model `steward-classify` resolves to is the single most
+    # B2-relevant change there is, and not one of the paths above would have
+    # selected the suite for it.
+    "packages/steward-llm/src/steward_llm/",
+    # The loop that drives the tool call, spends the budget and decides what a
+    # malformed submission earns.
+    "packages/steward-agents/src/steward_agents/",
+    # Where a step's spend is charged and a breach is decided. Not speculative:
+    # the ledger-scale defect fixed on this branch failed *every* B2 run without
+    # touching a prompt, a fixture, a handler or a classifier.
+    "packages/steward-queue/src/steward_queue/runs.py",
+    "packages/steward-queue/src/steward_queue/usage.py",
     "evals/",
 )
 """What makes the classification suite worth re-running.
@@ -414,6 +429,17 @@ up describing different ones while both look pinned.
 """
 
 
+IMMUTABLE_PIN = re.compile(r"(^|@)sha256:[0-9a-f]{64}$|^[0-9a-f]{40,64}$")
+"""What a pin has to look like to be one.
+
+A mutable tag is not a pin. `main-stable` and `latest` move, and an artifact
+recording one names a stack that no longer exists — which is worse than
+recording nothing, because it looks answerable. Accepts an image digest
+(`repo@sha256:...`, the form `docker-compose.preflight.yml` already uses) or a
+bare content hash, which is how a model revision is identified.
+"""
+
+
 def _provenance(fixture_version: str) -> dict[str, object]:
     """What produced these numbers, and whether they may be quoted.
 
@@ -423,12 +449,21 @@ def _provenance(fixture_version: str) -> dict[str, object]:
     the gateway config is hashed rather than copied because it carries an
     `api_key` reference.
 
-    `release_evidence` is the field that matters most and it is computed, never
-    asserted. Unless the stack is pinned *and* the run was required, this is a
-    developer preflight — Ollama scores characterise a model no deployment runs
-    (`litellm.preflight-ollama.yaml`), and an artifact that did not say so would
-    eventually be read as if it were the release result. #50's evidence of record
-    is LiteLLM -> vLLM with both pinned.
+    `release_evidence` is the field that matters most, so it is computed and it
+    **fails closed**. Three conditions, and the third cannot be met today:
+
+    * the stack is pinned, and pinned *immutably* — two non-empty environment
+      strings are not provenance, they are whatever the operator typed;
+    * the run was `REQUIRED` (nothing sets that in CI yet — #88);
+    * the responding model is recorded.
+
+    The third is #89. `litellm.production.yaml` routes `steward-classify` with a
+    fallback to `steward-fast`, `CompletionResult` carries the alias rather than
+    what answered, and the proxy echoes the alias back — so a run served entirely
+    by the fallback is indistinguishable from one served by the classifier model.
+    Attributing quality numbers to a model that never ran is worse than having
+    none, so until #89 lands this refuses the claim rather than making it. #50's
+    evidence of record is LiteLLM -> vLLM with all three satisfied.
     """
     config_path = os.environ.get("STEWARD_LITELLM_CONFIG", "")
     digest = (
@@ -439,20 +474,37 @@ def _provenance(fixture_version: str) -> dict[str, object]:
     proxy_image = os.environ.get(PROXY_IMAGE_ENV) or None
     model_revision = os.environ.get(MODEL_REVISION_ENV) or None
     required = os.environ.get(REQUIRED_ENV, "").strip() == "1"
-    pinned = bool(proxy_image and model_revision)
+    pinned = bool(
+        proxy_image
+        and model_revision
+        and IMMUTABLE_PIN.search(proxy_image)
+        and IMMUTABLE_PIN.search(model_revision)
+    )
+    # Not captured anywhere yet (#89). Named as a field rather than left out, so
+    # the artifact says which condition is missing instead of going quiet.
+    responding_model: str | None = None
+    blockers = [
+        reason
+        for reason, ok in (
+            ("the stack is not pinned to immutable digests", pinned),
+            (f"{REQUIRED_ENV} is not 1", required),
+            ("the responding model is not recorded (#89)", responding_model is not None),
+        )
+        if not ok
+    ]
     return {
         "fixture": fixture_version,
-        "model_alias": CLASSIFY_ALIAS,
+        "model_alias_requested": CLASSIFY_ALIAS,
+        "responding_model": responding_model,
         "gateway_config_sha256": digest,
         "proxy_image": proxy_image or "unpinned (preflight)",
         "model_revision": model_revision or "unpinned (preflight)",
         "required": required,
-        "release_evidence": pinned and required,
+        "release_evidence": not blockers,
         "note": (
-            "Release evidence: pinned proxy image and model revision, run with "
-            f"{REQUIRED_ENV}=1."
-            if pinned and required
-            else "NOT release evidence — a developer preflight. These scores "
+            "Release evidence."
+            if not blockers
+            else "NOT release evidence — " + "; ".join(blockers) + ". These scores "
             "characterise whatever this machine routed to and must not be quoted "
             "as B2's result (#50)."
         ),
@@ -524,9 +576,20 @@ def load_fixture() -> Fixture:
 def _require_gateway(gateway: GatewayConfig | None) -> None:
     """Refuse unless a model is actually reachable for `steward-classify`.
 
-    Three separate ways this can be unusable, and each gets its own sentence
+    Four separate ways this can be unusable, and each gets its own sentence
     because they send whoever reads it somewhere different: no gateway config at
-    all, a config that binds no classifier, and a binding with no endpoint.
+    all, a config that binds no classifier, a binding with no endpoint, and no
+    proxy to carry the request.
+
+    The proxy is checked **here**, with the others, because this is the function
+    whose refusal the CLI turns into `EXIT_NO_ENDPOINT`. `classify_once` also
+    refuses a missing proxy, but it does so with `ClassifierFailed` from inside
+    the run, where nothing catches it: `_one_run` handles only
+    `EvaluationInfrastructureError` and `EvaluationResult`, so a valid gateway
+    with no `STEWARD_LLM_PROXY_URL` escaped as a traceback and exit 1 — a
+    *failure* where the contract promises INCONCLUSIVE, and precisely the
+    collapse of the tri-state this module exists to prevent. Its `# pragma: no
+    cover -- the caller checks first` asserted this check existed before it did.
     """
     if gateway is None:
         raise NoGatewayConfigured(
@@ -541,6 +604,11 @@ def _require_gateway(gateway: GatewayConfig | None) -> None:
     if len(unreachable) == len(bindings):
         raise NoGatewayConfigured(
             f"every {CLASSIFY_ALIAS!r} binding declares no api_base, so none addresses a server"
+        )
+    if proxy_config_from_env(os.environ) is None:
+        raise NoGatewayConfigured(
+            "no proxy is configured (STEWARD_LLM_PROXY_URL / STEWARD_LLM_PROXY_KEY), "
+            "so nothing can carry a request to the bound model"
         )
 
 
@@ -566,7 +634,16 @@ def _changed_paths() -> tuple[str, ...]:
         )
     except OSError:
         return AFFECTING_PATHS
-    if diff.returncode != 0 and working.returncode != 0:
+    # **Either** failing makes the answer unknown, not both. This said `and`, and
+    # the common case is a failed diff beside a succeeding status: a clone with no
+    # `origin/main` (no remote, a shallow checkout, a differently-named default
+    # branch) fails the diff with rc 128 while `git status` cheerfully returns rc 0
+    # and, on a clean worktree, nothing. The paths list came out empty, the suite
+    # was not selected, and the runner reported "no eval suite is affected by this
+    # change" and exited 0 — a green B* that had measured nothing, on a machine
+    # where the baseline could not be resolved. The docstring above already
+    # promised the opposite; this is the code keeping that promise.
+    if diff.returncode != 0 or working.returncode != 0:
         return AFFECTING_PATHS
     paths = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
     paths.extend(line[3:].strip() for line in working.stdout.splitlines() if len(line) > 3)

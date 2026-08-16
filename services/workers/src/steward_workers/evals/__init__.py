@@ -29,8 +29,10 @@ collapse twice (`PROOFS.md` rows 21 and 23). So:
   for that; a laptop without Ollama running must not be either.
 * **FAIL** (exit 1) — the suite ran and missed a threshold, or was *required* and
   could not run. `STEWARD_EVALS_REQUIRED=1` promotes the middle state to this,
-  which is what the designated release job sets. That is #50's "INCONCLUSIVE
-  locally and a failure in the designated integration/release job", as a flag.
+  which is what a release job is meant to set. That is #50's "INCONCLUSIVE
+  locally and a failure in the designated integration/release job", as a flag —
+  and the job does not exist yet (#88), so this promotion is currently reachable
+  only by hand.
 
 The distinction that matters: **INCONCLUSIVE is about this machine, FAIL is about
 this code.** Issue #74 drew that line for the fitness runner and this is the same
@@ -59,7 +61,12 @@ error — a mistyped command must not read as a missing endpoint.
 REQUIRED_ENV = "STEWARD_EVALS_REQUIRED"
 """Set to `1` where an eval is not allowed to be inconclusive.
 
-The designated release job sets it. Nothing else should: a developer's laptop
-refusing to commit because Ollama is not running would make the gate something
-to work around rather than something to trust.
+**Nothing sets it yet — see #88.** A release job is meant to, and none exists:
+`.github/workflows/ci.yml` runs the fitness gate and the secret scan, B* is SKIP
+on every CI run, and the `live_gateway` marker is never selected. So the
+promotion below is implemented and tested here and enforced nowhere, and saying
+that plainly is the difference between a gate and a description of one.
+
+A developer's laptop must not set it either: refusing to commit because Ollama is
+not running would make the gate something to work around rather than trust.
 """
