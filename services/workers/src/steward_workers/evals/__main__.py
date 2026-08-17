@@ -25,7 +25,13 @@ from collections.abc import Sequence
 
 from steward_llm import gateway_config_from_env
 
-from steward_workers.evals import EXIT_FAILED, EXIT_NO_ENDPOINT, EXIT_OK, REQUIRED_ENV
+from steward_workers.evals import (
+    EXIT_FAILED,
+    EXIT_NO_ENDPOINT,
+    EXIT_NOTHING_SELECTED,
+    EXIT_OK,
+    REQUIRED_ENV,
+)
 from steward_workers.evals.classification import (
     CLASSIFICATION_SUITE,
     CLASSIFY_ALIAS,
@@ -83,8 +89,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Validate the gateway, select suites, run them, and report honestly.
 
     Returns rather than raises so the exit code is the whole contract: 0 ran and
-    passed (or nothing was selected), `EXIT_NO_ENDPOINT` selected but no model
-    reachable, 1 ran and failed a threshold.
+    passed, `EXIT_NOTHING_SELECTED` nothing to run, `EXIT_NO_ENDPOINT` selected
+    but no model reachable, 1 ran and failed a threshold. Four states, four
+    codes — 0 used to cover the first two (#90).
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -101,8 +108,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     selected = _selected(args)
     if not selected:
-        _logger.info("no eval suite is affected by this change")
-        return EXIT_OK
+        # Not `EXIT_OK` (#90). Nothing ran, so nothing passed, and the gate
+        # renders the code rather than this sentence.
+        _logger.info(
+            "no eval suite is affected by this change — nothing ran, so nothing passed"
+        )
+        return EXIT_NOTHING_SELECTED
 
     required = os.environ.get(REQUIRED_ENV, "").strip() == "1"
     outcomes: list[bool] = []
