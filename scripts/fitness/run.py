@@ -152,10 +152,16 @@ def main() -> int:
         # non-zero is a real failure. The release job sets
         # STEWARD_EVALS_REQUIRED=1, which makes the runner exit 1 instead, so
         # "no endpoint" cannot be skipped where the evidence is required.
+        # Exit 4 is "no suite is affected by this change" -- also not a pass, and
+        # the one that used to be exit 0. On `main` the merge-base is HEAD, so
+        # `--changed` selects nothing and this row printed PASS while no suite
+        # ran (#90).
         _tool_check("B*", "eval gates", ["uv", "run", "steward", "evals", "run", "--changed"],
                     "" if has_evals else "activates in M2 (no evals/ yet)",
                     skip_exits={3: "eval suite selected but no model endpoint is reachable "
-                                   "(not a pass -- see `uv run steward evals run --changed`)"}),
+                                   "(not a pass -- see `uv run steward evals run --changed`)",
+                                4: "no eval suite is affected by this change "
+                                   "(nothing ran, so nothing passed)"}),
         # Hygiene
         _tool_check("G1", "lint & format", ["uv", "run", "ruff", "check", "."], not_installed),
         _tool_check("G2", "strict types", ["uv", "run", "mypy", "--strict", "packages", "services"],
@@ -225,7 +231,30 @@ def _selftest() -> int:
         if actual != expected:
             print(f"selftest FAIL: {label} — expected {expected}, got {actual}")
             return 1
-    print(f"selftest PASS: {len(cases)} verdict cases")
+
+    # The exit-code mapping, on a real subprocess. This is where B* printed
+    # PASS for a run that did nothing (#90): the runner renders the code, so a
+    # state without its own code is a state without its own report. `exits`
+    # names the codes B* actually declares, so deleting one fails here.
+    exits = {3: "no endpoint", 4: "nothing selected"}
+    mapping = [
+        ("exit 0 is a pass", 0, exits, "PASS"),
+        ("a declared skip exit is a skip", 4, exits, "SKIP"),
+        ("the other declared skip exit is a skip", 3, exits, "SKIP"),
+        # The one that matters: 4 is not inherently a skip. It is a skip
+        # *because it is declared*, so a dropped mapping is a red gate rather
+        # than a quiet one.
+        ("an undeclared exit is a failure", 4, {3: "no endpoint"}, "FAIL"),
+        ("an ordinary failure is still a failure", 1, exits, "FAIL"),
+    ]
+    for label, code, declared, expected_status in mapping:
+        result = _tool_check("X9", "x", [sys.executable, "-c", f"raise SystemExit({code})"],
+                             skip_exits=declared)
+        if result.status != expected_status:
+            print(f"selftest FAIL: {label} — expected {expected_status}, got {result.status}")
+            return 1
+
+    print(f"selftest PASS: {len(cases)} verdict cases, {len(mapping)} exit-code cases")
     return 0
 
 

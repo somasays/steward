@@ -44,6 +44,7 @@ from __future__ import annotations
 __all__ = [
     "EXIT_FAILED",
     "EXIT_NO_ENDPOINT",
+    "EXIT_NOTHING_SELECTED",
     "EXIT_OK",
     "REQUIRED_ENV",
 ]
@@ -51,6 +52,27 @@ __all__ = [
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_NO_ENDPOINT = 3
+EXIT_NOTHING_SELECTED = 4
+"""Exit code for "no suite is affected by this change" (#90).
+
+Distinct from `EXIT_OK` because they are different statements and the gate
+renders the code, not the reason: a run that met its thresholds and a run that
+did no work both exited 0, so `_tool_check` printed
+
+    B*   eval gates   PASS   uv run steward evals run --changed
+
+for a change that touched nothing an eval measures. On `main`, where the
+merge-base is HEAD itself and `--changed` therefore selects nothing, that PASS is
+what the headline gate output says while no suite ran, no model was reached and
+no fixture was scored — beside S6, which handles the identical "no divergence to
+compare" condition honestly with a SKIP.
+
+This module invented `EXIT_NO_ENDPOINT` so "this machine cannot" would not share
+a code with "this passed", then let "there was nothing to do" share one with it.
+Four states, four codes.
+
+Not 2, which argparse uses for a usage error.
+"""
 """Exit code for "a suite was selected and no gateway is configured".
 
 Distinct from 1 so the fitness runner can tell "this machine cannot" from "this

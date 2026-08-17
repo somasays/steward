@@ -35,7 +35,13 @@ import json
 from pathlib import Path
 
 import pytest
-from steward_workers.evals import EXIT_FAILED, EXIT_NO_ENDPOINT, EXIT_OK, classification
+from steward_workers.evals import (
+    EXIT_FAILED,
+    EXIT_NO_ENDPOINT,
+    EXIT_NOTHING_SELECTED,
+    EXIT_OK,
+    classification,
+)
 from steward_workers.evals.__main__ import main
 from steward_workers.evals.classification import AFFECTING_PATHS, CLASSIFICATION_SUITE
 
@@ -153,8 +159,15 @@ def test_the_committed_fixture_loads_and_is_not_empty() -> None:
     assert fixture.version
 
 
-def test_a_change_affecting_nothing_runs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exit 0 without touching a model — what keeps the pre-commit hook usable.
+def test_a_change_affecting_nothing_is_not_reported_as_a_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`EXIT_NOTHING_SELECTED`, not `EXIT_OK` (#90).
+
+    Nothing ran, so nothing passed. These shared exit 0 until the gate on `main`
+    printed `B* eval gates PASS` for a tree where `--changed` selects nothing —
+    the merge-base being HEAD itself — while no suite ran, no model was reached
+    and no fixture was scored.
 
     The selection is stubbed rather than depending on what this working tree
     happens to contain: a test whose answer changes with the branch it runs on
@@ -162,7 +175,17 @@ def test_a_change_affecting_nothing_runs_nothing(monkeypatch: pytest.MonkeyPatch
     """
     monkeypatch.setattr(type(CLASSIFICATION_SUITE), "affected_by_working_tree", lambda self: False)
 
-    assert main(["evals", "run", "--changed"]) == EXIT_OK
+    assert main(["evals", "run", "--changed"]) == EXIT_NOTHING_SELECTED
+
+
+def test_the_four_states_have_four_codes() -> None:
+    """Each exists because collapsing it into another is how a gate starts
+    lying, and two of them shared a code until #90. Stated as one assertion so
+    a future collapse fails here rather than in whatever it made green."""
+    codes = (EXIT_OK, EXIT_FAILED, EXIT_NO_ENDPOINT, EXIT_NOTHING_SELECTED)
+
+    assert len(set(codes)) == 4
+    assert 2 not in codes, "argparse uses 2 for a usage error"
 
 
 def test_a_change_touching_the_prompt_selects_the_suite(
